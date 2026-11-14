@@ -1,12 +1,65 @@
-* { box-sizing: border-box; }
-body { margin: 0; background: #f6f7fa; }
-.brand-preview { width: min(100% - 32px, 680px); margin: 64px auto; color: #161920; }
-.brand-preview header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 28px; border-bottom: 1px solid #dce0e8; }
-.brand-preview header a { display: inline-flex; align-items: center; gap: 8px; color: inherit; text-decoration: none; font-size: 23px; }
-.brand-preview header > span { color: #747e8f; font-size: 11px; }
-.brand-preview-feature { padding-top: 40px; }
-.brand-preview-caption { margin: 20px 0 0; color: #475060; font-size: 12px; line-height: 1.6; text-align: center; }
-.brand-assets { display: flex; justify-content: center; gap: 20px; margin-top: 32px; }
-.brand-assets a { color: #1d47b8; text-underline-offset: 4px; font-size: 11px; }
-.gold-preview { width: min(100% - 32px, 480px); margin: 32px auto; }
-@media (max-width: 480px) { .brand-preview { margin-top: 32px; } .brand-preview-feature { padding-top: 24px; } }
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: #f6f7fa;
+}
+.brand-preview {
+  width: min(100% - 32px, 680px);
+  margin: 64px auto;
+  color: #161920;
+}
+.brand-preview header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 28px;
+  border-bottom: 1px solid #dce0e8;
+}
+.brand-preview header a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: inherit;
+  text-decoration: none;
+  font-size: 23px;
+}
+.brand-preview header > span {
+  color: #747e8f;
+  font-size: 11px;
+}
+.brand-preview-feature {
+  padding-top: 40px;
+}
+.brand-preview-caption {
+  margin: 20px 0 0;
+  color: #475060;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+.brand-assets {
+  display: flex;
+  justify-content: center;
+  gap: 20px;
+  margin-top: 32px;
+}
+.brand-assets a {
+  color: #1d47b8;
+  text-underline-offset: 4px;
+  font-size: 11px;
+}
+.gold-preview {
+  width: min(100% - 32px, 480px);
+  margin: 32px auto;
+}
+@media (max-width: 480px) {
+  .brand-preview {
+    margin-top: 32px;
+  }
+  .brand-preview-feature {
+    padding-top: 24px;
+  }
+}

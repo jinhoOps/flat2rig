@@ -38,3 +38,11 @@ artifacts/
 # Local illustration references and generated Tauri schemas
 /sutteang/
 /src-tauri/gen/
+models/*.onnx
+models/*.dll
+models/*.pt
+models/*.safetensors
+tools/**/.venv/
+tools/**/cache/
+**/__pycache__/
+*.pyc

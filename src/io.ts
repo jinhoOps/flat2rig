@@ -1,7 +1,14 @@
 import { zip, unzipSync, strToU8, strFromU8, type Zippable } from "fflate";
 import { writePsdUint8Array, readPsd } from "ag-psd";
-import { PART_DEFS, PARAM_DEFS, type Project, type Part } from "./types";
-import { bounds } from "./engine";
+import {
+  HAIR_ROLE_META,
+  PART_DEFS,
+  PARAM_DEFS,
+  type HairRole,
+  type Project,
+  type Part,
+} from "./types";
+import { bounds, effectiveMask } from "./engine";
 import { canvas, partCanvases, pngBytes } from "./images";
 import { buildRig } from "./native";
 
@@ -17,10 +24,20 @@ export function pack(files: Zippable): Promise<Uint8Array> {
 export async function saveProject(project: Project) {
   const files: Zippable = {};
   const { parts, ...meta } = project;
+  const serializedParts = parts.map(({ mask: _, fillMask: __, ...p }) => p);
   files["project.json"] = strToU8(
-    JSON.stringify({ ...meta, parts: parts.map(({ mask: _, ...p }) => p) }),
+    JSON.stringify({
+      ...meta,
+      schemaVersion: 2,
+      parts: serializedParts,
+    }),
   );
-  for (const p of parts) files[`masks/${p.id}.bin`] = p.mask;
+  for (const p of parts) {
+    files[`masks/${p.id}.bin`] = p.mask;
+    if (p.fillMask) {
+      files[`masks/${p.id}.fill.bin`] = p.fillMask;
+    }
+  }
   return pack(files);
 }
 function validDataURL(v: unknown): v is string {
@@ -28,6 +45,47 @@ function validDataURL(v: unknown): v is string {
     typeof v === "string" &&
     /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(v)
   );
+}
+function migrateV1ToV2(p: Record<string, unknown>, parts: Part[]): Project {
+  const landmarks = p.landmarks as Project["landmarks"];
+  return {
+    schemaVersion: 2,
+    name: p.name as string,
+    width: p.width as number,
+    height: p.height as number,
+    originalWidth: (p.originalWidth as number) || (p.width as number),
+    originalHeight: (p.originalHeight as number) || (p.height as number),
+    source: p.source as string,
+    original: p.original as string,
+    workToOriginalTransform: {
+      matrix2: [
+        ((p.originalWidth as number) || (p.width as number)) / (p.width as number),
+        0,
+        0,
+        ((p.originalHeight as number) || (p.height as number)) / (p.height as number),
+        ],
+      translation: [0, 0],
+    },
+    landmarks,
+    landmarkProvenance: {
+      eyeL: "manual",
+      eyeR: "manual",
+      mouth: "manual",
+      chin: "manual",
+      crown: "manual",
+    },
+    parts: parts.map((part, index) => ({
+      ...part,
+      provenance: part.provenance ?? "geometry",
+      fillKind: part.fillKind ?? (part.generated ? "neighbor" : "none"),
+      compositeOrder: part.compositeOrder ?? index,
+    })),
+    revision: 0,
+    provider: (p.provider as string) || "migrated-v1",
+    modelHash: typeof p.modelHash === "string" ? p.modelHash : undefined,
+    analysisStatus: "idle",
+    createdAt: (p.createdAt as string) || new Date().toISOString(),
+  };
 }
 export function loadProject(bytes: Uint8Array): Project {
   if (bytes.length > 160 * 1024 * 1024)
@@ -44,7 +102,7 @@ export function loadProject(bytes: Uint8Array): Project {
   if (!files["project.json"]) throw new Error("flat2rig 프로젝트가 아닙니다.");
   const p = JSON.parse(strFromU8(files["project.json"]));
   if (
-    p.schemaVersion !== 1 ||
+    (p.schemaVersion !== 1 && p.schemaVersion !== 2) ||
     !Number.isInteger(p.width) ||
     !Number.isInteger(p.height) ||
     p.width < 1 ||
@@ -63,7 +121,10 @@ export function loadProject(bytes: Uint8Array): Project {
   )
     throw new Error("잘못된 프로젝트 정보입니다.");
   const ids = new Set<string>();
-  for (const part of p.parts) {
+  const validProvenances = ["model", "prompted", "geometry", "manual"];
+  const validFillKinds = ["none", "neighbor", "external"];
+  for (let idx = 0; idx < p.parts.length; idx++) {
+    const part = p.parts[idx];
     if (
       typeof part.id !== "string" ||
       !/^[\w-]{1,80}$/.test(part.id) ||
@@ -73,7 +134,9 @@ export function loadProject(bytes: Uint8Array): Project {
       !/^#[0-9a-f]{6}$/i.test(part.color) ||
       !["draft", "approved", "missing"].includes(part.status) ||
       typeof part.visible !== "boolean" ||
-      (part.texture && !validDataURL(part.texture))
+      (part.texture && !validDataURL(part.texture)) ||
+      (part.provenance && !validProvenances.includes(part.provenance)) ||
+      (part.fillKind && !validFillKinds.includes(part.fillKind))
     )
       throw new Error("잘못된 파츠 정보입니다.");
     ids.add(part.id);
@@ -81,6 +144,15 @@ export function loadProject(bytes: Uint8Array): Project {
     if (!mask || mask.length !== p.width * p.height)
       throw new Error("파츠 마스크 크기가 일치하지 않습니다.");
     part.mask = mask;
+    const fillMask = files[`masks/${part.id}.fill.bin`];
+    if (fillMask) {
+      if (fillMask.length !== p.width * p.height)
+        throw new Error("가림 보완 마스크 크기가 일치하지 않습니다.");
+      part.fillMask = fillMask;
+    }
+    if (part.compositeOrder === undefined) {
+      part.compositeOrder = idx;
+    }
   }
   for (const id of ["eyeL", "eyeR", "mouth", "chin", "crown"]) {
     const pt = p.landmarks?.[id];
@@ -94,6 +166,9 @@ export function loadProject(bytes: Uint8Array): Project {
       pt.y >= p.height
     )
       throw new Error("잘못된 랜드마크입니다.");
+  }
+  if (p.schemaVersion === 1) {
+    return migrateV1ToV2(p, p.parts as Part[]);
   }
   p.revision = 0;
   return p as Project;
@@ -235,6 +310,26 @@ export function cubismCsv(template: CsvTemplate) {
     [headers, ...rows].map((row) => row.map(quote).join(",")).join("\r\n")
   );
 }
+function orderedEntries(parts: Part[]) {
+  return parts
+    .map((part, index) => ({ part, index }))
+    .sort(
+      (a, b) =>
+        (a.part.compositeOrder ?? a.index) - (b.part.compositeOrder ?? b.index),
+    );
+}
+
+async function maskPng(mask: Uint8Array, w: number, h: number) {
+  const m = canvas(w, h);
+  const d = m.getContext("2d")!.createImageData(w, h);
+  for (let j = 0; j < mask.length; j++) {
+    d.data[j * 4] = d.data[j * 4 + 1] = d.data[j * 4 + 2] = mask[j];
+    d.data[j * 4 + 3] = 255;
+  }
+  m.getContext("2d")!.putImageData(d, 0, 0);
+  return pngBytes(m);
+}
+
 export async function exportPsd(
   project: Project,
   canvases?: HTMLCanvasElement[],
@@ -242,11 +337,12 @@ export async function exportPsd(
   const images = canvases ?? (await partCanvases(project)),
     composite = canvas(project.width, project.height),
     ctx = composite.getContext("2d")!;
-  // Visibility is a viewport aid. Export all non-missing approved/draft parts visibly.
-  const children = project.parts.flatMap((p, i) => {
+  // Visibility is a viewport aid. Export all non-missing approved/draft parts visibly in compositeOrder.
+  const children = orderedEntries(project.parts).flatMap(({ part: p, index: i }) => {
+    const eff = effectiveMask(p);
     if (
       p.status === "missing" ||
-      !bounds(p.mask, project.width, project.height)
+      !bounds(eff, project.width, project.height)
     )
       return [];
     ctx.drawImage(images[i], 0, 0);
@@ -286,7 +382,13 @@ export async function exportPsd(
 }
 export function handoff(project: Project, csv: boolean) {
   const unresolved = project.parts.filter((p) => p.status !== "approved");
-  return `# ${project.name} — Cubism 작업 인계\n\n- 캔버스: ${project.width} × ${project.height}px (원본 ${project.originalWidth} × ${project.originalHeight})\n- 생성 경로: ${project.provider}\n- 모델 SHA-256: ${project.modelHash || "사용하지 않음"}\n- 좌표: 원본 작업 캔버스 좌상단 (0,0), X 오른쪽, Y 아래. 좌우는 캐릭터 기준.\n- 미확인 파츠: ${unresolved.map((p) => p.id + " (" + p.status + ")").join(", ") || "없음"}\n\n## 가져오기\n1. character_import.psd를 Cubism Editor에서 열어 새 모델을 만듭니다. 레이어 순서와 알파를 확인합니다.\n2. ${csv ? "parameters.csv는 불러온 Cubism CSV 샘플의 형식으로 생성했습니다. 백업 후 파라미터 일괄 설정에서 UTF-8로 가져오고, 전체 삭제 옵션은 끕니다. 실제 버전 호환성은 확인이 필요합니다." : "parameters-reference.csv는 참고용 목록입니다. 공식 가져오기 파일이 아닙니다. Cubism에서 파라미터를 수동 생성하거나 flat2rig에 Editor의 CSV 샘플을 불러오세요."}\n3. guides/landmarks.png와 rig-draft.json을 참고하여 ArtMesh와 디포머를 정리합니다. 자체 JSON은 Editor로 직접 가져오지 않습니다.\n4. 목을 피벗으로 HeadRotation → HeadXY → Eyes/Mouth/Hair 디포머를 구성합니다. 눈 흰자를 클리핑 대상으로 활용하되 원화에 맞게 조정합니다.\n5. 눈 개폐 0/1, 입 개폐 0/1, 머리 X/Y -10/0/10, Z -15/0/15의 변형 키를 수동으로 작성합니다. 전체 -30~30 품질은 보장하지 않습니다.\n6. 작은 조합 입력부터 구멍, 눈꺼풀 경계, 입 안 노출을 확인하고 가림 영역을 보완합니다.\n7. 머리카락 흔들림 변형 키를 먼저 만든 뒤 Cubism에서 물리를 설정하고 .cmo3로 저장합니다.\n\n## 알려진 한계\n- 파츠 분리는 랜드마크 기반 기하 초안이며 파츠 의미 인식 AI가 아닙니다.\n- 국소 채우기는 인접색 확장입니다. 생성형 복원이 아니며 얼굴이나 입 안을 올바르게 복원하지 못할 수 있습니다.\n- PSD는 이미지만 전달합니다. 메쉬, 키폼, 클리핑, 물리는 자동 적용되지 않습니다.\n- 레이어 숨김/솔로는 편집기 표시 보조입니다. 내보내기는 미해당 파츠를 제외한 전체 파츠를 표시합니다.\n- 자동 PSD 재읽기는 통과했으나 실제 Cubism Editor에서의 가져오기는 별도 검증해야 합니다.\n\n## 파츠\n${project.parts.map((p, i) => `${i}. ${p.id} — ${p.name} [${p.status}]${p.generated ? " / 보완 이미지 포함" : ""}`).join("\n")}\n\n공식 참고: https://docs.live2d.com/en/cubism-editor-manual/psd-import/\n`;
+  const modelHashesText =
+    project.modelHashes && Object.keys(project.modelHashes).length
+      ? Object.entries(project.modelHashes)
+          .map(([k, v]) => `${k}=${v.slice(0, 12)}`)
+          .join(", ")
+      : project.modelHash || "사용하지 않음";
+  return `# ${project.name} — Cubism 작업 인계\n\n- 캔버스: ${project.width} × ${project.height}px (원본 ${project.originalWidth} × ${project.originalHeight})\n- 생성 경로: ${project.provider}\n- 모델 SHA-256: ${modelHashesText}\n- 좌표: 원본 작업 캔버스 좌상단 (0,0), X 오른쪽, Y 아래. 좌우는 캐릭터 기준.\n- 미확인 파츠: ${unresolved.map((p) => p.id + " (" + p.status + ")").join(", ") || "없음"}\n\n## 가져오기\n1. character_import.psd를 Cubism Editor에서 열어 새 모델을 만듭니다. 레이어 순서와 알파를 확인합니다.\n2. ${csv ? "parameters.csv는 불러온 Cubism CSV 샘플의 형식으로 생성했습니다. 백업 후 파라미터 일괄 설정에서 UTF-8로 가져오고, 전체 삭제 옵션은 끕니다. 실제 버전 호환성은 확인이 필요합니다." : "parameters-reference.csv는 참고용 목록입니다. 공식 가져오기 파일이 아닙니다. Cubism에서 파라미터를 수동 생성하거나 flat2rig에 Editor의 CSV 샘플을 불러오세요."}\n3. guides/landmarks.png와 rig-draft.json을 참고하여 ArtMesh와 디포머를 정리합니다. 자체 JSON은 Editor로 직접 가져오지 않습니다.\n4. 목을 피벗으로 HeadRotation → HeadXY → Eyes/Mouth/Hair 디포머를 구성합니다. 눈 흰자를 클리핑 대상으로 활용하되 원화에 맞게 조정합니다.\n5. 눈 개폐 0/1, 입 개폐 0/1, 머리 X/Y -10/0/10, Z -15/0/15의 변형 키를 수동으로 작성합니다. 전체 -30~30 품질은 보장하지 않습니다.\n6. 작은 조합 입력부터 구멍, 눈꺼풀 경계, 입 안 노출을 확인하고 가림 영역을 보완합니다.\n7. 머리카락 흔들림 변형 키를 먼저 만든 뒤 Cubism에서 물리를 설정하고 .cmo3로 저장합니다.\n\n## 알려진 한계\n- 얼굴 검출(YOLOv3)·28점 랜드마크(HRNetV2)에서 crown 좌표는 기하 추정값입니다.\n- 파츠 분리는 MobileSAM + 랜드마크 하이브리드 분할 또는 기하 폴백이며, 수동 보정(브러시·클릭 프롬프트) 및 검토 상태(status)와 출처(provenance)를 분리해 기록합니다.\n- 가림 보완(neighbor)은 가시 마스크와 분리 저장되는 경계 픽셀 외삽으로, 생성형 인페인팅이 아니며 가려진 눈·입·머리카락 내부 디테일은 복원되지 않습니다.\n- PSD는 이미지만 전달합니다. 메쉬, 키폼, 클리핑, 물리는 자동 적용되지 않습니다.\n- 레이어 숨김/솔로는 편집기 표시 보조입니다. 내보내기는 미해당 파츠를 제외한 전체 파츠를 표시합니다.\n- 자동 PSD 재읽기는 통과했으나 실제 Cubism Editor에서의 가져오기는 별도 검증해야 합니다.\n\n## 파츠\n${orderedEntries(project.parts).map(({ part: p }, i) => `${i}. ${p.id} — ${p.name} [검토:${p.status}, 출처:${p.provenance ?? "geometry"}, 보완:${p.fillKind ?? "none"}]`).join("\n")}\n\n공식 참고: https://docs.live2d.com/en/cubism-editor-manual/psd-import/\n`;
 }
 export async function exportBundle(
   project: Project,
@@ -299,6 +401,7 @@ export async function exportBundle(
       project.height,
       project.landmarks,
     );
+  const ordered = orderedEntries(project.parts);
   const files: Zippable = {
     "character_import.psd": await exportPsd(project, images),
     "project.flat2rig": await saveProject(project),
@@ -309,8 +412,8 @@ export async function exportBundle(
   };
   const guide = canvas(project.width, project.height),
     ctx = guide.getContext("2d")!;
-  images.forEach((img, i) => {
-    if (project.parts[i].status !== "missing") ctx.drawImage(img, 0, 0);
+  ordered.forEach(({ part, index }) => {
+    if (part.status !== "missing") ctx.drawImage(images[index], 0, 0);
   });
   for (const [name, p] of Object.entries(project.landmarks)) {
     ctx.fillStyle = "#39d6b0";
@@ -327,16 +430,16 @@ export async function exportBundle(
   for (let i = 0; i < project.parts.length; i++) {
     const p = project.parts[i];
     files[`parts/${p.id}.png`] = await pngBytes(images[i]);
-    const m = canvas(project.width, project.height);
-    const d = m
-      .getContext("2d")!
-      .createImageData(project.width, project.height);
-    for (let j = 0; j < p.mask.length; j++) {
-      d.data[j * 4] = d.data[j * 4 + 1] = d.data[j * 4 + 2] = p.mask[j];
-      d.data[j * 4 + 3] = 255;
+    const visiblePng = await maskPng(p.mask, project.width, project.height);
+    files[`masks/${p.id}.png`] = visiblePng;
+    if (p.fillMask?.some((v) => v > 0)) {
+      files[`masks/${p.id}.visible.png`] = visiblePng;
+      files[`masks/${p.id}.fill.png`] = await maskPng(
+        p.fillMask,
+        project.width,
+        project.height,
+      );
     }
-    m.getContext("2d")!.putImageData(d, 0, 0);
-    files[`masks/${p.id}.png`] = await pngBytes(m);
   }
   files["rig-draft.json"] = strToU8(
     JSON.stringify(
@@ -362,6 +465,31 @@ export async function exportBundle(
       2,
     ),
   );
+  const provenanceSummary = project.parts.reduce(
+    (acc, p) => {
+      const k = p.provenance ?? "geometry";
+      acc[k] = (acc[k] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
+  const occlusionSummary = project.parts
+    .filter(
+      (p) =>
+        p.fillMask?.some((v) => v > 0) ||
+        (p.fillKind && p.fillKind !== "none"),
+    )
+    .map((p) => ({
+      id: p.id,
+      fillKind: p.fillKind ?? "neighbor",
+      filledPixels: p.fillMask ? p.fillMask.filter((v) => v > 0).length : 0,
+    }));
+  const meshWarnings = rig.flatMap((p) => {
+    const warns: string[] = [];
+    if (p.mesh.triangles.length === 0) warns.push(`${p.id}: no triangles`);
+    if (p.quality?.warnings?.length) warns.push(...p.quality.warnings);
+    return warns;
+  });
   files["validation.json"] = strToU8(
     JSON.stringify(
       {
@@ -381,9 +509,11 @@ export async function exportBundle(
           ? "typescript-browser-fallback"
           : "rust-ort-delaunator-glam",
         sourceModelHash: project.modelHash,
-        meshWarnings: rig
-          .filter((p) => p.mesh.triangles.length === 0)
-          .map((p) => `${p.id}: no triangles`),
+        modelHashes: project.modelHashes ?? {},
+        postprocessVersions: project.postprocessVersions ?? {},
+        provenanceSummary,
+        occlusionSummary,
+        meshWarnings,
       },
       null,
       2,
@@ -398,8 +528,57 @@ export function newPart(w: number, h: number): Part {
     name: "새 파츠",
     group,
     color,
+    role: "other",
     visible: true,
     status: "draft",
     mask: new Uint8Array(w * h),
   };
+}
+
+export function newHairPart(
+  role: HairRole,
+  existingParts: Part[],
+  w: number,
+  h: number,
+): Part {
+  const existingIds = new Set(existingParts.map((p) => p.id));
+  let idx = role === "hair_front" || role === "hair_back" ? 2 : 1;
+  let id = idx === 1 ? role : `${role}_${idx}`;
+  while (existingIds.has(id)) {
+    idx++;
+    id = `${role}_${idx}`;
+  }
+  const meta = HAIR_ROLE_META[role];
+  const label = idx === 1 ? meta.name : `${meta.name} ${idx}`;
+  return {
+    id,
+    name: label,
+    group: meta.group,
+    color: meta.color,
+    role,
+    visible: true,
+    status: "draft",
+    provenance: "manual",
+    mask: new Uint8Array(w * h),
+  };
+}
+
+export function insertHairPartInOrder(parts: Part[], added: Part): Part[] {
+  const role = added.role;
+  const list = [...parts];
+  let insertAt = list.length;
+  if (role === "hair_back") {
+    let lastBack = -1;
+    list.forEach((p, i) => {
+      if (p.id.startsWith("hair_back") || p.role === "hair_back") lastBack = i;
+    });
+    insertAt = lastBack >= 0 ? lastBack + 1 : 0;
+  } else if (role === "hair_side_L" || role === "hair_side_R") {
+    const firstFront = list.findIndex(
+      (p) => p.id.startsWith("hair_front") || p.role === "hair_front",
+    );
+    insertAt = firstFront >= 0 ? firstFront : list.length;
+  }
+  list.splice(insertAt, 0, added);
+  return list.map((p, idx) => ({ ...p, compositeOrder: idx }));
 }

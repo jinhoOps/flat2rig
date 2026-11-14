@@ -1,5 +1,5 @@
 import type { Project } from "./types";
-import { defaultLandmarks, maskedPixels } from "./engine";
+import { defaultLandmarks, effectiveMask, maskedPixels } from "./engine";
 export function canvas(w: number, h: number) {
   const c = document.createElement("canvas");
   c.width = w;
@@ -54,7 +54,7 @@ export async function readImage(file: File): Promise<Project> {
   const c = canvas(w, h);
   c.getContext("2d")!.drawImage(img, 0, 0, w, h);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     name: file.name.replace(/\.[^.]+$/, ""),
     width: w,
     height: h,
@@ -62,10 +62,22 @@ export async function readImage(file: File): Promise<Project> {
     originalHeight: img.height,
     source: c.toDataURL("image/png"),
     original,
+    workToOriginalTransform: {
+      matrix2: [img.width / w, 0, 0, img.height / h],
+      translation: [0, 0],
+    },
     landmarks: defaultLandmarks(w, h),
+    landmarkProvenance: {
+      eyeL: "estimated",
+      eyeR: "estimated",
+      mouth: "estimated",
+      chin: "estimated",
+      crown: "estimated",
+    },
     parts: [],
     revision: 0,
     provider: "manual",
+    analysisStatus: "idle",
     createdAt: new Date().toISOString(),
   };
 }
@@ -78,7 +90,7 @@ export async function partCanvases(project: Project) {
         ? pixels(await loadImage(p.texture), project.width, project.height)
         : source;
       return pixelsCanvas(
-        maskedPixels(data, p.mask),
+        maskedPixels(data, effectiveMask(p)),
         project.width,
         project.height,
       );

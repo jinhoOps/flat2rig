@@ -1,6 +1,8 @@
 import Delaunator from "delaunator";
 import {
   PART_DEFS,
+  inferPartRole,
+  isHairPart,
   type Landmarks,
   type Mesh,
   type Parameters,
@@ -252,6 +254,18 @@ export function bounds(mask: Uint8Array, w: number, h: number) {
     ? null
     : { left, top, width: right - left + 1, height: bottom - top + 1 };
 }
+export function effectiveMask(part: {
+  mask: Uint8Array;
+  fillMask?: Uint8Array;
+}): Uint8Array {
+  if (!part.fillMask || part.fillMask.length !== part.mask.length)
+    return part.mask;
+  const out = new Uint8Array(part.mask.length);
+  for (let i = 0; i < out.length; i++)
+    out[i] = Math.max(part.mask[i], part.fillMask[i]);
+  return out;
+}
+
 export function maskedPixels(
   source: Uint8ClampedArray,
   mask: Uint8Array,
@@ -266,36 +280,67 @@ export function maskedPixels(
   }
   return out;
 }
-/** Validate triangle interiors against the mask, including all crossed edges. */
+
+/** Contour- and landmark-aware Delaunay mesh matching Rust `core::mesh_for_with_anchors`. */
 export function meshFor(
   mask: Uint8Array,
   w: number,
   h: number,
   density = 14,
+  anchors: Point[] = [],
 ): Mesh {
   const box = bounds(mask, w, h);
   if (!box) return { vertices: [], triangles: [], uv: [] };
-  const spacing = Math.max(3, Math.max(box.width, box.height) / density),
+  const span = Math.max(box.width, box.height),
+    step = Math.max(3, span / clamp(density, 6, 32)),
+    contourMinSq = Math.max(2, step * 0.45) ** 2,
+    gridMinSq = Math.max(1.5, step * 0.35) ** 2,
     points: Point[] = [];
-  const valid = (x: number, y: number) =>
-    x >= 0 &&
-    y >= 0 &&
-    x < w &&
-    y < h &&
-    mask[Math.floor(y) * w + Math.floor(x)] > 8;
-  for (let y = box.top; y < box.top + box.height; y += spacing)
-    for (let x = box.left; x < box.left + box.width; x += spacing) {
-      if (valid(x, y)) points.push({ x, y });
-      else {
-        // Boundary samples keep narrow contours from disappearing at low density.
-        for (const [dx, dy] of [
-          [spacing * 0.5, 0],
-          [0, spacing * 0.5],
-          [spacing * 0.5, spacing * 0.5],
-        ])
-          if (valid(x + dx, y + dy)) points.push({ x: x + dx, y: y + dy });
-      }
+  const valid = (x: number, y: number) => {
+    const px = x + 1e-6,
+      py = y + 1e-6;
+    return (
+      px >= 0 &&
+      py >= 0 &&
+      Math.floor(px) < w &&
+      Math.floor(py) < h &&
+      mask[Math.floor(py) * w + Math.floor(px)] > 8
+    );
+  };
+  const pushIfFar = (candX: number, candY: number, minSq: number) => {
+    if (!valid(candX, candY)) return;
+    for (const v of points) {
+      const dx = v.x - candX,
+        dy = v.y - candY;
+      if (dx * dx + dy * dy < minSq) return;
     }
+    points.push({ x: candX, y: candY });
+  };
+  const right = box.left + box.width - 1,
+    bottom = box.top + box.height - 1;
+  // 1. Sample contour boundary pixels first.
+  for (let y = box.top; y <= bottom; y++) {
+    const row = y * w;
+    for (let x = box.left; x <= right; x++) {
+      if (mask[row + x] <= 8) continue;
+      const isBoundary =
+        x === 0 ||
+        y === 0 ||
+        x + 1 >= w ||
+        y + 1 >= h ||
+        mask[row + x - 1] <= 8 ||
+        mask[row + x + 1] <= 8 ||
+        mask[(y - 1) * w + x] <= 8 ||
+        mask[(y + 1) * w + x] <= 8;
+      if (isBoundary) pushIfFar(x, y, contourMinSq);
+    }
+  }
+  // 2. Inject interior landmark anchors strictly inside active mask.
+  for (const a of anchors) pushIfFar(a.x, a.y, contourMinSq * 0.5);
+  // 3. Fill interior uniform grid points.
+  for (let y = box.top; y <= bottom; y += step)
+    for (let x = box.left; x <= right; x += step)
+      pushIfFar(x, y, gridMinSq);
   if (points.length < 3)
     return {
       vertices: points,
@@ -339,14 +384,179 @@ export function meshFor(
     uv: points.map((p) => ({ x: p.x / w, y: p.y / h })),
   };
 }
+
+export function meshForPart(
+  mask: Uint8Array,
+  w: number,
+  h: number,
+  density = 14,
+  lm?: Landmarks,
+): Mesh {
+  return meshFor(
+    mask,
+    w,
+    h,
+    density,
+    lm ? [lm.eyeL, lm.eyeR, lm.mouth, lm.chin, lm.crown] : [],
+  );
+}
+
+export interface MeshQualityReport {
+  partId: string;
+  triangleCount: number;
+  holeCrossings: number;
+  longTriangles: number;
+  flippedAtExtremes: number;
+  extremePosesTested: number;
+  warnings: string[];
+}
+
+function triCross(a: Point, b: Point, c: Point): number {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+export function checkMeshQuality(
+  mesh: Mesh,
+  mask: Uint8Array,
+  w: number,
+  h: number,
+  part: Pick<Part, "id">,
+  lm: Landmarks,
+): MeshQualityReport {
+  const triCount = Math.floor(mesh.triangles.length / 3);
+  const hasPixels = mask.some((a) => a > 8);
+  if (!triCount || !mesh.vertices.length) {
+    return {
+      partId: part.id,
+      triangleCount: 0,
+      holeCrossings: 0,
+      longTriangles: 0,
+      flippedAtExtremes: 0,
+      extremePosesTested: 0,
+      warnings: hasPixels
+        ? [`${part.id}: 유효한 메쉬 삼각형이 생성되지 않았습니다.`]
+        : [],
+    };
+  }
+  const validPx = (x: number, y: number) => {
+    const px = x + 1e-6,
+      py = y + 1e-6;
+    return (
+      px >= 0 &&
+      py >= 0 &&
+      Math.floor(px) < w &&
+      Math.floor(py) < h &&
+      mask[Math.floor(py) * w + Math.floor(px)] > 8
+    );
+  };
+  const maxEdges: number[] = [],
+    restCrosses: number[] = [];
+  let holeCrossings = 0;
+  for (let t = 0; t < triCount; t++) {
+    const a = mesh.vertices[mesh.triangles[t * 3]],
+      b = mesh.vertices[mesh.triangles[t * 3 + 1]],
+      c = mesh.vertices[mesh.triangles[t * 3 + 2]];
+    maxEdges.push(
+      Math.max(
+        Math.hypot(a.x - b.x, a.y - b.y),
+        Math.hypot(a.x - c.x, a.y - c.y),
+        Math.hypot(b.x - c.x, b.y - c.y),
+      ),
+    );
+    restCrosses.push(triCross(a, b, c));
+    const cx = (a.x + b.x + c.x) / 3,
+      cy = (a.y + b.y + c.y) / 3;
+    const ok =
+      validPx(cx, cy) &&
+      validPx(a.x * 0.5 + b.x * 0.25 + c.x * 0.25, a.y * 0.5 + b.y * 0.25 + c.y * 0.25) &&
+      validPx(a.x * 0.25 + b.x * 0.5 + c.x * 0.25, a.y * 0.25 + b.y * 0.5 + c.y * 0.25) &&
+      validPx(a.x * 0.25 + b.x * 0.25 + c.x * 0.5, a.y * 0.25 + b.y * 0.25 + c.y * 0.5);
+    if (!ok) holeCrossings++;
+  }
+  const sorted = [...maxEdges].sort((x, y) => x - y);
+  const longThreshold = Math.max(48, sorted[Math.floor(sorted.length / 2)] * 3.2);
+  const longTriangles = maxEdges.filter((e) => e > longThreshold).length;
+  const zero: Parameters = {
+    angleX: 0,
+    angleY: 0,
+    angleZ: 0,
+    eyeL: 1,
+    eyeR: 1,
+    mouth: 0,
+    hair: 0,
+  };
+  const extremePoses: Parameters[] = [
+    { ...zero, angleX: -30, angleY: -30, angleZ: -30 },
+    { ...zero, angleX: 30, angleY: 30, angleZ: 30 },
+    { ...zero, angleX: -30, angleY: 30, angleZ: 15 },
+    { ...zero, angleX: 30, angleY: -30, angleZ: -15 },
+    { ...zero, eyeL: 0, eyeR: 0 },
+    { ...zero, eyeL: 1.2, eyeR: 1.2 },
+    { ...zero, mouth: 0 },
+    { ...zero, mouth: 1 },
+    { ...zero, hair: -1 },
+    { ...zero, hair: 1 },
+    { ...zero, angleX: 30, angleY: -30, angleZ: 30, eyeL: 0, eyeR: 0, mouth: 1, hair: -1 },
+    { ...zero, angleX: -30, angleY: 30, angleZ: -30, eyeL: 0, eyeR: 0, mouth: 1, hair: 1 },
+  ];
+  const flipped = new Uint8Array(triCount);
+  for (const pose of extremePoses) {
+    const deformed = mesh.vertices.map((v) => deform(v, part, lm, pose));
+    for (let t = 0; t < triCount; t++) {
+      if (flipped[t] || Math.abs(restCrosses[t]) < 1e-6) continue;
+      const pc = triCross(
+        deformed[mesh.triangles[t * 3]],
+        deformed[mesh.triangles[t * 3 + 1]],
+        deformed[mesh.triangles[t * 3 + 2]],
+      );
+      if (pc * restCrosses[t] <= 0) flipped[t] = 1;
+    }
+  }
+  const flippedAtExtremes = flipped.reduce((s, b) => s + b, 0);
+  const warnings: string[] = [];
+  if (holeCrossings > 0)
+    warnings.push(`${part.id}: 빈 구멍(hole) 횡단 삼각형 ${holeCrossings}개`);
+  if (longTriangles > 0)
+    warnings.push(`${part.id}: 과도하게 긴 삼각형 ${longTriangles}개`);
+  if (flippedAtExtremes > 0)
+    warnings.push(`${part.id}: 극단 포즈에서 뒤집히는 삼각형 ${flippedAtExtremes}개`);
+  return {
+    partId: part.id,
+    triangleCount: triCount,
+    holeCrossings,
+    longTriangles,
+    flippedAtExtremes,
+    extremePosesTested: extremePoses.length,
+    warnings,
+  };
+}
+function hairSwayProfile(part: Pick<Part, "id" | "role">): [number, number] {
+  const role = inferPartRole(part.id, part.role);
+  const match = /_(\d+)$/.exec(part.id);
+  const strandIdx = Math.max(1, match ? Number(match[1]) : 1);
+  const strandBoost = 1 + Math.min(4, Math.max(0, strandIdx - 1)) * 0.1;
+  if (role === "hair_side_L" || role === "hair_side_R") {
+    return [1.22 * strandBoost, 0.15];
+  }
+  if (role === "hair_back") {
+    return [0.85 * strandBoost, 0.1];
+  }
+  return [1.0 * strandBoost, 0.0];
+}
+
 export function deform(
   p: Point,
-  part: Part,
+  part: Pick<Part, "id" | "role">,
   lm: Landmarks,
   params: Parameters,
 ): Point {
   let { x, y } = p;
-  if (part.id === "body") return { x, y };
+  if (
+    part.id === "body" ||
+    part.role === "clothes" ||
+    part.id.startsWith("clothes")
+  )
+    return { x, y };
   const cx = (lm.eyeL.x + lm.eyeR.x) / 2,
     headH = Math.max(1, lm.chin.y - lm.crown.y);
   if (part.id.startsWith("eye")) {
@@ -372,8 +582,16 @@ export function deform(
     weight *
     (1 - Math.abs(y - lm.eyeL.y) / (headH * 2));
   y += params.angleY * headH * 0.0018 * weight;
-  if (part.id.startsWith("hair"))
-    x += params.hair * headH * 0.04 * clamp((y - lm.crown.y) / headH, 0, 1.8);
+  if (isHairPart(part)) {
+    const [amp, rootOffset] = hairSwayProfile(part);
+    const rootY = lm.crown.y + headH * rootOffset;
+    x +=
+      params.hair *
+      headH *
+      0.04 *
+      amp *
+      clamp((y - rootY) / headH, 0, 1.8);
+  }
   const angle = ((params.angleZ * Math.PI) / 180) * weight,
     dx = x - cx,
     dy = y - lm.chin.y;
@@ -382,30 +600,119 @@ export function deform(
     y: lm.chin.y + dx * Math.sin(angle) + dy * Math.cos(angle),
   };
 }
-/** Local color diffusion only; provides small hidden-area drafts, not generative inpainting. */
-export function expandFill(
+/** Local neighbor pixel expansion keeping `visibleMask` separated from `fillMask`.
+ * Erodes 2px inward before sampling colors so outermost lineart/hair shadows do not bleed outward. */
+export function expandFillSeparated(
   source: Uint8ClampedArray,
-  mask: Uint8Array,
+  visibleMask: Uint8Array,
   w: number,
   h: number,
   radius: number,
+  partId?: string,
 ) {
-  const out = source.slice(),
-    expanded = mask.slice(),
-    n = w * h;
-  let frontier: number[] = [];
-  for (let i = 0; i < n; i++)
-    if (mask[i]) {
+  const n = w * h,
+    out = source.slice(),
+    fillMask = new Uint8Array(n),
+    combinedMask = visibleMask.slice();
+  let filledPixels = 0;
+
+  // 1. Inward boundary depth (0 = outer rim touching unowned pixel)
+  const depth = new Uint8Array(n);
+  depth.fill(255);
+  const erodeQ: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (visibleMask[i] > 0) {
       const x = i % w;
       if (
-        (x > 0 && !mask[i - 1]) ||
-        (x + 1 < w && !mask[i + 1]) ||
-        (i >= w && !mask[i - w]) ||
-        (i < n - w && !mask[i + w])
+        (x > 0 && visibleMask[i - 1] === 0) ||
+        (x + 1 < w && visibleMask[i + 1] === 0) ||
+        (i >= w && visibleMask[i - w] === 0) ||
+        (i < n - w && visibleMask[i + w] === 0)
+      ) {
+        depth[i] = 0;
+        erodeQ.push(i);
+      }
+    }
+  }
+  for (let head = 0; head < erodeQ.length; head++) {
+    const i = erodeQ[head];
+    const nextD = depth[i] + 1;
+    if (nextD > 2) continue;
+    const x = i % w;
+    for (const j of [
+      x > 0 ? i - 1 : -1,
+      x + 1 < w ? i + 1 : -1,
+      i >= w ? i - w : -1,
+      i + w < n ? i + w : -1,
+    ]) {
+      if (j >= 0 && visibleMask[j] > 0 && depth[j] === 255) {
+        depth[j] = nextD;
+        erodeQ.push(j);
+      }
+    }
+  }
+
+  // 2. Pick deepest available interior (>=2 -> >=1 -> >=0) and propagate clean RGB to visible rim
+  let minSeedDepth = 0;
+  for (const candidate of [2, 1, 0]) {
+    let found = false;
+    for (let i = 0; i < n; i++) {
+      if (visibleMask[i] > 0 && depth[i] >= candidate) {
+        found = true;
+        break;
+      }
+    }
+    if (found) {
+      minSeedDepth = candidate;
+      break;
+    }
+  }
+  const sampleRgb = new Uint8Array(n * 3);
+  const seedReady = new Uint8Array(n);
+  const seedQ: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (visibleMask[i] > 0 && depth[i] >= minSeedDepth) {
+      sampleRgb[i * 3] = source[i * 4];
+      sampleRgb[i * 3 + 1] = source[i * 4 + 1];
+      sampleRgb[i * 3 + 2] = source[i * 4 + 2];
+      seedReady[i] = 1;
+      seedQ.push(i);
+    }
+  }
+  for (let head = 0; head < seedQ.length; head++) {
+    const i = seedQ[head];
+    const x = i % w;
+    for (const j of [
+      x > 0 ? i - 1 : -1,
+      x + 1 < w ? i + 1 : -1,
+      i >= w ? i - w : -1,
+      i + w < n ? i + w : -1,
+    ]) {
+      if (j >= 0 && visibleMask[j] > 0 && !seedReady[j]) {
+        sampleRgb[j * 3] = sampleRgb[i * 3];
+        sampleRgb[j * 3 + 1] = sampleRgb[i * 3 + 1];
+        sampleRgb[j * 3 + 2] = sampleRgb[i * 3 + 2];
+        seedReady[j] = 1;
+        seedQ.push(j);
+      }
+    }
+  }
+
+  // 3. BFS outward from visible rim into fillMask using clean interior sampleRgb
+  let frontier: number[] = [];
+  for (let i = 0; i < n; i++)
+    if (visibleMask[i]) {
+      const x = i % w;
+      if (
+        (x > 0 && !visibleMask[i - 1]) ||
+        (x + 1 < w && !visibleMask[i + 1]) ||
+        (i >= w && !visibleMask[i - w]) ||
+        (i < n - w && !visibleMask[i + w])
       )
         frontier.push(i);
     }
-  for (let r = 0; r < radius; r++) {
+  const maxR = Math.min(128, Math.max(0, radius));
+  for (let r = 0; r < maxR; r++) {
     const next: number[] = [];
     for (const i of frontier)
       for (const j of [
@@ -414,15 +721,87 @@ export function expandFill(
         i - w,
         i + w,
       ]) {
-        if (j < 0 || j >= n || expanded[j]) continue;
-        expanded[j] = 255;
-        out[j * 4] = out[i * 4];
-        out[j * 4 + 1] = out[i * 4 + 1];
-        out[j * 4 + 2] = out[i * 4 + 2];
+        if (j < 0 || j >= n || combinedMask[j]) continue;
+        combinedMask[j] = 255;
+        fillMask[j] = 255;
+        filledPixels++;
+        let sr = 0,
+          sg = 0,
+          sb = 0,
+          cnt = 0;
+        for (const nb of [
+          j % w > 0 ? j - 1 : -1,
+          j % w < w - 1 ? j + 1 : -1,
+          j - w,
+          j + w,
+        ]) {
+          if (nb < 0 || nb >= n || nb === j) continue;
+          if (visibleMask[nb] > 0 || (fillMask[nb] > 0 && out[nb * 4 + 3] > 0)) {
+            if (seedReady[nb]) {
+              sr += sampleRgb[nb * 3];
+              sg += sampleRgb[nb * 3 + 1];
+              sb += sampleRgb[nb * 3 + 2];
+            } else {
+              sr += out[nb * 4];
+              sg += out[nb * 4 + 1];
+              sb += out[nb * 4 + 2];
+            }
+            cnt++;
+          }
+        }
+        const pr = cnt
+          ? (sr / cnt) | 0
+          : seedReady[i]
+            ? sampleRgb[i * 3]
+            : out[i * 4];
+        const pg = cnt
+          ? (sg / cnt) | 0
+          : seedReady[i]
+            ? sampleRgb[i * 3 + 1]
+            : out[i * 4 + 1];
+        const pb = cnt
+          ? (sb / cnt) | 0
+          : seedReady[i]
+            ? sampleRgb[i * 3 + 2]
+            : out[i * 4 + 2];
+        sampleRgb[j * 3] = pr;
+        sampleRgb[j * 3 + 1] = pg;
+        sampleRgb[j * 3 + 2] = pb;
+        seedReady[j] = 1;
+        out[j * 4] = pr;
+        out[j * 4 + 1] = pg;
+        out[j * 4 + 2] = pb;
         out[j * 4 + 3] = 255;
         next.push(j);
       }
+    if (!next.length) break;
     frontier = next;
   }
-  return { data: out, mask: expanded };
+  const hiddenFeature =
+    !!partId &&
+    (partId.startsWith("eye") ||
+      partId.startsWith("mouth") ||
+      partId.startsWith("hair"));
+  return {
+    data: out,
+    fillMask,
+    combinedMask,
+    filledPixels,
+    fillKind: "neighbor" as const,
+    warning: hiddenFeature
+      ? "경계 2px 침식 내삽(neighbor)으로 외곽선 번짐을 줄였으나 가려진 눈·입·머리카락 내부 디테일은 자동 복원되지 않습니다."
+      : undefined,
+  };
+}
+
+/** Local color diffusion only; provides small hidden-area drafts, not generative inpainting. */
+export function expandFill(
+  source: Uint8ClampedArray,
+  mask: Uint8Array,
+  w: number,
+  h: number,
+  radius: number,
+) {
+  const res = expandFillSeparated(source, mask, w, h, radius);
+  return { data: res.data, mask: res.combinedMask };
 }

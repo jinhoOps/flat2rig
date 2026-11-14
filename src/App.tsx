@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AlertCircle,
   ArrowDown,
   ArrowUp,
   Box,
@@ -7,6 +8,7 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleHelp,
+  Crosshair,
   Download,
   Eraser,
   Eye,
@@ -27,6 +29,7 @@ import {
   RefreshCw,
   Save,
   ScanFace,
+  Settings,
   SlidersHorizontal,
   Sparkles,
   Undo2,
@@ -37,29 +40,47 @@ import {
   ZoomOut,
 } from "lucide-react";
 import type {
+  FillKind,
+  HairRole,
   LandmarkId,
+  LandmarkProvenance,
   Mesh,
+  ModelStatusEntry,
   Parameters,
   Part,
+  PartProvenance,
   Point,
   Project,
+  PromptPoint,
   Tool,
 } from "./types";
-import { PARAM_DEFS, REST } from "./types";
+import { isHairPart, PARAM_DEFS, REST } from "./types";
 import { bounds, clamp, faceBoxLandmarks, paint } from "./engine";
 import { loadImage, pixels, pixelsCanvas, readImage } from "./images";
 import {
+  analyzeFace,
   buildRig,
-  chooseModel,
+  cancelAnalysis,
+  chooseOnnxModel,
   desktop,
-  fillNative,
+  detectLandmarksForFace,
+  downloadModel,
+  fillOcclusionNative,
+  getModelStatus,
+  proposeParts,
+  refinePartPrompt,
   saveFile,
-  separateNative,
+  setModelPath as setRegisteredModelPath,
+  type FaceAnalysisResponse,
+  type MeshQualityReport,
+  type RefinePromptResult,
 } from "./native";
 import {
   exportBundle,
   exportPsd,
+  insertHairPartInOrder,
   loadProject,
+  newHairPart,
   newPart,
   readCsvTemplate,
   safeName,
@@ -71,6 +92,30 @@ import { demoFile } from "./demo";
 import { BrandMark, BrandWordmark } from "./brand/Brand";
 import BrandLoop from "./brand/BrandLoop";
 
+const ROLE_LABELS: Record<string, string> = {
+  face_detector: "얼굴 검출 (YOLOv3)",
+  landmark_28: "28점 랜드마크 (HRNetV2)",
+  background: "배경 분리 (U2NetP)",
+  part_encoder: "파츠 인코더 (MobileSAM)",
+  part_decoder: "파츠 디코더 (MobileSAM)",
+};
+
+function partProvenanceLabel(p?: PartProvenance): string {
+  if (p === "model") return "모델";
+  if (p === "prompted") return "프롬프트";
+  if (p === "manual") return "수동";
+  return "기하";
+}
+
+function diagnosticLabel(d: string): string {
+  if (d === "empty") return "공백";
+  if (d === "lr_swapped") return "좌우반전";
+  if (d === "low_confidence") return "저신뢰";
+  if (d.startsWith("fragmented")) return "파편화";
+  if (d.startsWith("background_leak")) return "배경누출";
+  return d;
+}
+
 export default function App() {
   const [project, setProject] = useState<Project | null>(null),
     projectRef = useRef<Project | null>(null);
@@ -81,20 +126,42 @@ export default function App() {
     [radius, setRadius] = useState(18),
     [tolerance, setTolerance] = useState(32);
   const [overlay, setOverlay] = useState(true),
+    [fillOverlay, setFillOverlay] = useState(true),
+    [compareDiff, setCompareDiff] = useState(false),
     [wire, setWire] = useState(false),
     [original, setOriginal] = useState(false),
     [solo, setSolo] = useState(false);
+  const [detailMode, setDetailMode] = useState<"detail" | "parent">("detail");
+  const [hairSplit, setHairSplit] = useState(true);
+  const [subtractHairOnPrompt, setSubtractHairOnPrompt] = useState(true);
   const [parameters, setParameters] = useState<Parameters>({ ...REST }),
     [playing, setPlaying] = useState(false);
   const [meshes, setMeshes] = useState<Map<string, Mesh>>(new Map()),
+    [meshWarnings, setMeshWarnings] = useState<MeshQualityReport[]>([]),
     [meshing, setMeshing] = useState(false);
   const [modelPath, setModelPath] = useState<string | null>(null),
+    [modelStatus, setModelStatus] = useState<ModelStatusEntry[]>([]),
+    [modelBusyRole, setModelBusyRole] = useState<string | null>(null),
     [csv, setCsv] = useState<CsvTemplate | null>(null);
   const [busy, setBusy] = useState(""),
     [message, setMessage] = useState(""),
     [error, setError] = useState("");
+  const [promptResult, setPromptResult] = useState<RefinePromptResult | null>(
+    null,
+  );
+  const [promptCandidateIdx, setPromptCandidateIdx] = useState(0);
+  const [pendingReanalysis, setPendingReanalysis] = useState<{
+    response: FaceAnalysisResponse;
+    manualKeys: LandmarkId[];
+  } | null>(null);
+  const analysisJobSeq = useRef(0);
   const [dragging, setDragging] = useState(false);
   const dragDepth = useRef(0);
+  useEffect(() => {
+    if (desktop) {
+      void getModelStatus().then(setModelStatus).catch(() => {});
+    }
+  }, []);
   useEffect(() => {
     const clearDrag = () => {
       dragDepth.current = 0;
@@ -107,9 +174,9 @@ export default function App() {
       window.removeEventListener("blur", clearDrag);
     };
   }, []);
-  const [modal, setModal] = useState<"export" | "regenerate" | "help" | null>(
-      null,
-    ),
+  const [modal, setModal] = useState<
+    "export" | "regenerate" | "reanalysis" | "models" | "help" | null
+  >(null),
     [dirty, setDirty] = useState(false);
   const [historyCount, setHistoryCount] = useState([0, 0]);
   const history = useRef<Project[]>([]),
@@ -172,11 +239,16 @@ export default function App() {
     future.current = [];
     setHistoryCount([0, 0]);
     setMeshes(new Map());
+    setMeshWarnings([]);
+    setPromptResult(null);
+    setPromptCandidateIdx(0);
     setParameters({ ...REST });
     setPlaying(false);
     setZoom(1);
     setSolo(false);
     setOriginal(false);
+    setCompareDiff(false);
+    setDetailMode(p.detailMode ?? "detail");
     setTab("prepare");
     setTool(p.parts.length ? "select" : "face");
     setSelected(
@@ -185,6 +257,140 @@ export default function App() {
     setDirty(false);
     update(p);
   };
+  const applyAnalysisResponse = (
+    base: Project,
+    res: FaceAnalysisResponse,
+    preserveManual: boolean,
+  ): Project => {
+    const prevProv = base.landmarkProvenance ?? {
+      eyeL: "estimated",
+      eyeR: "estimated",
+      mouth: "estimated",
+      chin: "estimated",
+      crown: "estimated",
+    };
+    const nextLandmarks = { ...base.landmarks };
+    const nextProvenance: LandmarkProvenance = { ...prevProv };
+    if (res.rigLandmarks) {
+      for (const id of ["eyeL", "eyeR", "mouth", "chin", "crown"] as LandmarkId[]) {
+        if (preserveManual && prevProv[id] === "manual") continue;
+        nextLandmarks[id] = res.rigLandmarks[id];
+        nextProvenance[id] = res.rigProvenance?.[id] ?? "model";
+      }
+    }
+    return {
+      ...base,
+      imageHash: res.imageHash || base.imageHash,
+      faceCandidates: res.candidates.length
+        ? res.candidates
+        : base.faceCandidates,
+      selectedFaceId: res.selectedFaceId ?? base.selectedFaceId,
+      landmarks28: res.points28.length ? res.points28 : base.landmarks28,
+      landmarks: nextLandmarks,
+      landmarkProvenance: nextProvenance,
+      modelHashes: { ...base.modelHashes, ...res.modelHashes },
+      postprocessVersions: {
+        ...base.postprocessVersions,
+        ...res.postprocessVersions,
+      },
+      analysisStatus: res.status,
+      analysisNote: res.message,
+    };
+  };
+  const runFaceAnalysis = (
+    faceIndex: number | null = null,
+    bypassGuard = false,
+  ) => {
+    const snapshot = projectRef.current;
+    if (!snapshot) return;
+    const jobId = ++analysisJobSeq.current;
+    void task("얼굴 · 28점 랜드마크 자동 검출 중", async (signal) => {
+      const data = pixels(
+        await loadImage(snapshot.source),
+        snapshot.width,
+        snapshot.height,
+      );
+      const res = await analyzeFace(
+        data,
+        snapshot.width,
+        snapshot.height,
+        faceIndex,
+        jobId,
+        signal,
+      );
+      signal.throwIfAborted();
+      const current = projectRef.current;
+      if (
+        !current ||
+        jobId !== analysisJobSeq.current ||
+        current.source !== snapshot.source
+      )
+        return;
+      if (res.status !== "detected" || !res.rigLandmarks) {
+        update({
+          ...current,
+          imageHash: res.imageHash || current.imageHash,
+          faceCandidates: res.candidates,
+          modelHashes: { ...current.modelHashes, ...res.modelHashes },
+          postprocessVersions: {
+            ...current.postprocessVersions,
+            ...res.postprocessVersions,
+          },
+          analysisStatus: res.status,
+          analysisNote: res.message,
+        });
+        notify(res.message);
+        return;
+      }
+      const manualKeys = (
+        ["eyeL", "eyeR", "mouth", "chin", "crown"] as LandmarkId[]
+      ).filter((k) => current.landmarkProvenance?.[k] === "manual");
+      if (!bypassGuard && manualKeys.length > 0) {
+        setPendingReanalysis({ response: res, manualKeys });
+        setModal("reanalysis");
+        return;
+      }
+      commit(applyAnalysisResponse(current, res, false), current);
+      notify(res.message);
+    });
+  };
+  const selectFaceCandidate = (candidateIndex: number) => {
+    const current = projectRef.current;
+    const cand = current?.faceCandidates?.[candidateIndex];
+    if (!current || !cand) return;
+    const jobId = ++analysisJobSeq.current;
+    void task(`얼굴 후보 #${candidateIndex + 1} 랜드마크 추출 중`, async (signal) => {
+      const data = pixels(
+        await loadImage(current.source),
+        current.width,
+        current.height,
+      );
+      const res = await detectLandmarksForFace(
+        data,
+        current.width,
+        current.height,
+        cand.bbox,
+        cand.cropBbox,
+        candidateIndex,
+        jobId,
+        signal,
+      );
+      signal.throwIfAborted();
+      const latest = projectRef.current;
+      if (!latest || jobId !== analysisJobSeq.current || latest.source !== current.source)
+        return;
+      const manualKeys = (
+        ["eyeL", "eyeR", "mouth", "chin", "crown"] as LandmarkId[]
+      ).filter((k) => latest.landmarkProvenance?.[k] === "manual");
+      if (manualKeys.length > 0) {
+        setPendingReanalysis({ response: res, manualKeys });
+        setModal("reanalysis");
+        return;
+      }
+      commit(applyAnalysisResponse(latest, res, false), latest);
+      notify(res.message);
+    });
+  };
   const openImage = (file?: File) => {
     if (!file) return;
     if (
@@ -192,36 +398,71 @@ export default function App() {
       !confirm("저장하지 않은 변경 사항이 있습니다. 새 이미지를 여시겠습니까?")
     )
       return;
-    void task("이미지 준비 중", async (signal) => {
+    const jobId = ++analysisJobSeq.current;
+    void task("이미지 준비 · 얼굴 검출 중", async (signal) => {
       const p = await readImage(file);
       signal.throwIfAborted();
       reset(p);
-      notify(
-        `작업 캔버스 ${p.width} × ${p.height}px. 얼굴 영역을 드래그한 뒤 눈·입 위치를 맞추세요.`,
-      );
+      const data = pixels(await loadImage(p.source), p.width, p.height);
+      const res = await analyzeFace(data, p.width, p.height, null, jobId, signal);
+      signal.throwIfAborted();
+      const current = projectRef.current;
+      if (!current || jobId !== analysisJobSeq.current || current.source !== p.source)
+        return;
+      const updated = applyAnalysisResponse(current, res, false);
+      update(updated);
+      notify(res.message);
     });
   };
-  const generate = () => {
+  const generate = (overrideMode?: "detail" | "parent") => {
     const p = projectRef.current;
     if (!p) return;
+    const mode = overrideMode ?? detailMode;
     setModal(null);
+    setPromptResult(null);
+    const jobId = ++analysisJobSeq.current;
     void task("파츠 분리 초안 생성 중", async (signal) => {
       const data = pixels(await loadImage(p.source), p.width, p.height);
-      const result = await separateNative(
+      const faceCand = p.faceCandidates?.[p.selectedFaceId ?? 0];
+      const result = await proposeParts(
         data,
         p.width,
         p.height,
         p.landmarks,
         tolerance,
-        modelPath,
+        {
+          points28: p.landmarks28,
+          faceBbox: faceCand?.bbox ?? null,
+          modelPath,
+          detailMode: mode,
+          hairSplit,
+          jobId,
+        },
         signal,
       );
       signal.throwIfAborted();
-      commit({ ...p, ...result });
+      commit({
+        ...p,
+        parts: result.parts,
+        provider: result.provider,
+        detailMode: mode,
+        modelHash:
+          result.modelHashes.part_decoder ??
+          result.modelHashes.background ??
+          p.modelHash,
+        modelHashes: { ...p.modelHashes, ...result.modelHashes },
+        postprocessVersions: {
+          ...p.postprocessVersions,
+          parts: result.postprocessVersion,
+        },
+      });
+      if (!result.parts.some((t) => t.id === selected)) {
+        setSelected(result.parts[0]?.id ?? "face");
+      }
       setTool("select");
       setTab("prepare");
       notify(
-        "18개 파츠 초안이 준비됐습니다. 마스크 경계와 가림 영역을 확인하세요.",
+        `${result.parts.length}개 파츠 초안이 준비됐습니다 (${mode === "parent" ? "눈·입 통합 모드" : "세부 파츠 모드"}). 경계와 가림 영역을 확인하세요.`,
       );
     });
   };
@@ -285,6 +526,7 @@ export default function App() {
         v: "select",
         b: "add",
         e: "erase",
+        p: "prompt",
         l: "landmark",
         f: "face",
       };
@@ -320,7 +562,14 @@ export default function App() {
         project.landmarks,
       )
         .then((rig) => {
-          if (active) setMeshes(new Map(rig.map((r) => [r.id, r.mesh])));
+          if (active) {
+            setMeshes(new Map(rig.map((r) => [r.id, r.mesh])));
+            setMeshWarnings(
+              rig
+                .map((r) => r.quality)
+                .filter((q): q is MeshQualityReport => !!q && q.warnings.length > 0),
+            );
+          }
         })
         .catch((e) => {
           if (active) setError(String(e));
@@ -358,9 +607,138 @@ export default function App() {
     if (index < 0 || target < 0 || target >= project.parts.length) return;
     const parts = [...project.parts];
     [parts[index], parts[target]] = [parts[target], parts[index]];
-    commit({ ...project, parts });
+    const normalized = parts.map((item, idx) => ({
+      ...item,
+      compositeOrder: idx,
+    }));
+    commit({ ...project, parts: normalized });
   };
-  const start = (pt: Point) => {
+  const ensureProvenance = (p: Project): LandmarkProvenance =>
+    p.landmarkProvenance ?? {
+      eyeL: "estimated",
+      eyeR: "estimated",
+      mouth: "estimated",
+      chin: "estimated",
+      crown: "estimated",
+    };
+  const addHairLayer = (role: HairRole) => {
+    const p = projectRef.current;
+    if (!p) return;
+    const added = newHairPart(role, p.parts, p.width, p.height);
+    const nextParts = insertHairPartInOrder(p.parts, added);
+    commit({ ...p, parts: nextParts });
+    setSelected(added.id);
+    setTool(desktop ? "prompt" : "add");
+    notify(`${added.name} 레이어를 추가했습니다. ${desktop ? "클릭 보정(P)으로 머리카락 가닥을 클릭하세요." : "브러시로 영역을 칠하세요."}`);
+  };
+  const applyPromptMaskToParts = (
+    parts: Part[],
+    targetId: string,
+    mask: Uint8Array,
+    iouScore: number,
+    diagnostics: string[],
+    nextPrompts?: PromptPoint[],
+  ): Part[] => {
+    const targetPart = parts.find((t) => t.id === targetId);
+    const shouldSubtractHair =
+      subtractHairOnPrompt && !!targetPart && isHairPart(targetPart);
+    return parts.map((t) => {
+      if (t.id === targetId) {
+        return {
+          ...t,
+          mask,
+          provenance: "prompted",
+          status: "draft",
+          ...(nextPrompts ? { prompts: nextPrompts } : {}),
+          confidence: iouScore,
+          diagnostics,
+        };
+      }
+      if (shouldSubtractHair && isHairPart(t) && t.status !== "approved") {
+        let changed = false;
+        const trimmed = t.mask.slice();
+        for (let i = 0; i < trimmed.length; i++) {
+          if (mask[i] > 128 && trimmed[i] > 0) {
+            trimmed[i] = 0;
+            changed = true;
+          }
+        }
+        return changed ? { ...t, mask: trimmed } : t;
+      }
+      return t;
+    });
+  };
+  const runPromptRefine = (
+    p: Project,
+    part: Part,
+    nextPrompts: PromptPoint[],
+  ) => {
+    const jobId = ++analysisJobSeq.current;
+    void task("클릭 프롬프트로 마스크 보정 중", async (signal) => {
+      const data = pixels(await loadImage(p.source), p.width, p.height);
+      const res = await refinePartPrompt(
+        data,
+        p.width,
+        p.height,
+        p.landmarks,
+        part.id,
+        nextPrompts,
+        tolerance,
+        jobId,
+        signal,
+      );
+      signal.throwIfAborted();
+      const latest = projectRef.current;
+      if (!latest || jobId !== analysisJobSeq.current || latest.source !== p.source)
+        return;
+      const chosen = res.candidates[res.bestIndex] ?? res.candidates[0];
+      if (!chosen) return;
+      setPromptResult(res);
+      setPromptCandidateIdx(res.bestIndex);
+      commit(
+        {
+          ...latest,
+          parts: applyPromptMaskToParts(
+            latest.parts,
+            part.id,
+            chosen.mask,
+            chosen.iouScore,
+            chosen.diagnostics,
+            nextPrompts,
+          ),
+        },
+        p,
+      );
+      notify(
+        `${part.name} 클릭 보정 완료 (IoU ${(chosen.iouScore * 100).toFixed(0)}%, ${
+          res.usedFaceCrop ? "얼굴 고해상도 크롭" : "전체 캔버스"
+        })`,
+      );
+    });
+  };
+  const selectPromptCandidate = (idx: number) => {
+    const p = projectRef.current;
+    if (!p || !promptResult) return;
+    const cand = promptResult.candidates[idx];
+    if (!cand) return;
+    setPromptCandidateIdx(idx);
+    commit({
+      ...p,
+      parts: applyPromptMaskToParts(
+        p.parts,
+        promptResult.partId,
+        cand.mask,
+        cand.iouScore,
+        cand.diagnostics,
+      ),
+    });
+  };
+  const clearPartPrompts = () => {
+    setPromptResult(null);
+    setPromptCandidateIdx(0);
+    patchPart({ prompts: [] });
+  };
+  const start = (pt: Point, exclude = false) => {
     const p = projectRef.current;
     if (!p || busy) return;
     if (tool === "landmark") {
@@ -390,10 +768,18 @@ export default function App() {
     }
     const part = p.parts.find((t) => t.id === selected);
     if (!part) return;
+    if (tool === "prompt") {
+      const nextPrompts: PromptPoint[] = [
+        ...(part.prompts ?? []),
+        { x: pt.x, y: pt.y, label: exclude ? 0 : 1 },
+      ];
+      runPromptRefine(p, part, nextPrompts);
+      return;
+    }
     gesture.current = { before: p, part: selected, start: pt, last: pt };
     const parts = p.parts.map((t) =>
       t.id === selected
-        ? { ...t, status: "draft" as const, mask: t.mask.slice() }
+        ? { ...t, status: "draft" as const, provenance: "manual" as const, mask: t.mask.slice() }
         : t,
     );
     paint(
@@ -415,6 +801,10 @@ export default function App() {
       update({
         ...p,
         landmarks: { ...p.landmarks, [g.landmark]: pt },
+        landmarkProvenance: {
+          ...ensureProvenance(p),
+          [g.landmark]: "manual",
+        },
         revision: p.revision + 1,
       });
     else if (tool === "face") {
@@ -422,6 +812,13 @@ export default function App() {
         update({
           ...p,
           landmarks: faceBoxLandmarks(g.start, pt),
+          landmarkProvenance: {
+            eyeL: "manual",
+            eyeR: "manual",
+            mouth: "manual",
+            chin: "manual",
+            crown: "manual",
+          },
           revision: p.revision + 1,
         });
     } else if (g.part) {
@@ -449,17 +846,34 @@ export default function App() {
         );
     }
   };
+  const defaultFillRadius = (t: Part): number => {
+    if (t.id === "face" || t.id === "neck" || t.id.startsWith("hair_back")) {
+      return 36;
+    }
+    if (isHairPart(t)) {
+      return 20;
+    }
+    return 12;
+  };
   const fillPart = () => {
     const p = projectRef.current,
       part = p?.parts.find((t) => t.id === selected);
     if (!p || !part) return;
+    const fillRadius = defaultFillRadius(part);
     void task("선택 파츠의 가림 영역 보완 중", async (signal) => {
       const data = pixels(
         await loadImage(part.texture ?? p.source),
         p.width,
         p.height,
       );
-      const result = await fillNative(data, part.mask, p.width, p.height, 12);
+      const result = await fillOcclusionNative(
+        data,
+        part.mask,
+        p.width,
+        p.height,
+        fillRadius,
+        part.id,
+      );
       signal.throwIfAborted();
       const texture = pixelsCanvas(result.data, p.width, p.height).toDataURL(
         "image/png",
@@ -470,7 +884,8 @@ export default function App() {
           t.id === selected
             ? {
                 ...t,
-                mask: result.mask,
+                fillMask: result.fillMask,
+                fillKind: result.fillKind,
                 texture,
                 generated: true,
                 status: "draft",
@@ -478,10 +893,84 @@ export default function App() {
             : t,
         ),
       });
+      setFillOverlay(true);
       notify(
-        "경계에서 12px를 인접색으로 확장했습니다. 정밀 복원은 PNG 교체로 보완하세요.",
+        result.warning ??
+          `경계 2px 침식 내삽(${fillRadius}px, ${result.filledPixels}px)을 분리 보완 레이어에 저장했습니다.`,
       );
     });
+  };
+  const fillCriticalOcclusions = () => {
+    const p = projectRef.current;
+    if (!p) return;
+    const targets = p.parts.filter(
+      (t) =>
+        t.status !== "missing" &&
+        (t.id === "face" || t.id === "neck" || t.id.startsWith("hair_back")) &&
+        t.mask.some((v) => v > 0),
+    );
+    if (!targets.length) return;
+    void task("얼굴·목·뒷머리 가림 영역 일괄 보완 중", async (signal) => {
+      const updates = new Map<
+        string,
+        { fillMask: Uint8Array; fillKind: FillKind; texture: string }
+      >();
+      for (const target of targets) {
+        signal.throwIfAborted();
+        const data = pixels(
+          await loadImage(target.texture ?? p.source),
+          p.width,
+          p.height,
+        );
+        const result = await fillOcclusionNative(
+          data,
+          target.mask,
+          p.width,
+          p.height,
+          defaultFillRadius(target),
+          target.id,
+        );
+        const texture = pixelsCanvas(result.data, p.width, p.height).toDataURL(
+          "image/png",
+        );
+        updates.set(target.id, {
+          fillMask: result.fillMask,
+          fillKind: result.fillKind,
+          texture,
+        });
+      }
+      signal.throwIfAborted();
+      commit({
+        ...p,
+        parts: p.parts.map((t) => {
+          const u = updates.get(t.id);
+          return u
+            ? {
+                ...t,
+                fillMask: u.fillMask,
+                fillKind: u.fillKind,
+                texture: u.texture,
+                generated: true,
+                status: t.status === "approved" ? "approved" : "draft",
+              }
+            : t;
+        }),
+      });
+      setFillOverlay(true);
+      notify(
+        `${updates.size}개 주요 파츠(얼굴·목·뒷머리)의 가림 영역을 36px 침식 보완했습니다.`,
+      );
+    });
+  };
+  const clearFillMask = () => {
+    patchPart({
+      fillMask: undefined,
+      fillKind: "none",
+      texture: undefined,
+      generated: false,
+      status: "draft",
+    });
+    notify("분리된 가림 보완 영역을 제거했습니다.");
   };
   const replacePart = (file?: File) => {
     if (!file || !project) return;
@@ -500,12 +989,55 @@ export default function App() {
         );
       patchPart({
         mask,
+        fillMask: undefined,
+        fillKind: "external",
+        provenance: "manual",
         texture: replacement.source,
         generated: true,
         status: "draft",
       });
       notify("파츠 이미지를 교체했습니다.");
     });
+  };
+  const linkModelRole = async (role: string) => {
+    try {
+      const picked = await chooseOnnxModel(`${ROLE_LABELS[role] ?? role} 선택`);
+      if (typeof picked !== "string") return;
+      setModelBusyRole(role);
+      const next = await setRegisteredModelPath(role, picked);
+      setModelStatus(next);
+      if (role === "background") setModelPath(picked);
+      notify(`${ROLE_LABELS[role] ?? role} 모델을 연결했습니다.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setModelBusyRole(null);
+    }
+  };
+  const unlinkModelRole = async (role: string) => {
+    try {
+      setModelBusyRole(role);
+      const next = await setRegisteredModelPath(role, null);
+      setModelStatus(next);
+      if (role === "background") setModelPath(null);
+      notify(`${ROLE_LABELS[role] ?? role} 사용자 지정 연결을 해제했습니다.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setModelBusyRole(null);
+    }
+  };
+  const downloadModelRole = async (role: string) => {
+    try {
+      setModelBusyRole(role);
+      const next = await downloadModel(role);
+      setModelStatus(next);
+      notify(`${ROLE_LABELS[role] ?? role} 모델 다운로드 및 SHA-256 검증을 완료했습니다.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setModelBusyRole(null);
+    }
   };
   const output = (kind: "bundle" | "psd") => {
     if (!project) return;
@@ -675,6 +1207,17 @@ export default function App() {
             {desktop ? "로컬 처리" : "브라우저 미리보기"}
           </span>
           <button
+            disabled={!!busy}
+            onClick={() => {
+              if (desktop) void getModelStatus().then(setModelStatus).catch(() => {});
+              setModal("models");
+            }}
+            title="ONNX 모델 설치 · SHA-256 검증 설정"
+          >
+            <Settings size={15} />
+            모델 {modelStatus.length ? `${modelStatus.filter((m) => m.hashMatches).length}/${modelStatus.length}` : "관리"}
+          </button>
+          <button
             className="icon-button"
             aria-label="사용 가이드"
             onClick={() => setModal("help")}
@@ -738,6 +1281,28 @@ export default function App() {
               <Plus size={16} />
             </button>
           </div>
+          {total > 0 && (
+            <div className="candidate-pills" style={{ padding: "6px 10px 2px", gap: 4 }}>
+              {(
+                [
+                  ["hair_front", "+ 앞머리"],
+                  ["hair_side_R", "+ 오른옆"],
+                  ["hair_side_L", "+ 왼옆"],
+                  ["hair_back", "+ 뒷머리"],
+                ] as const
+              ).map(([role, label]) => (
+                <button
+                  key={role}
+                  className="compact-pill"
+                  disabled={!!busy}
+                  onClick={() => addHairLayer(role)}
+                  title="새 머리카락 가닥 레이어 추가"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="layer-list">
             {!total ? (
               <div className="layer-empty">
@@ -785,7 +1350,12 @@ export default function App() {
                   </span>
                   <span className="layer-label">
                     <strong>{p.name}</strong>
-                    <small>{p.id}</small>
+                    <small>
+                      {p.id} · {partProvenanceLabel(p.provenance)}
+                      {p.diagnostics?.length
+                        ? ` · ⚠${diagnosticLabel(p.diagnostics[0])}`
+                        : ""}
+                    </small>
                   </span>
                   <span
                     className={`status-dot ${p.status}`}
@@ -855,6 +1425,7 @@ export default function App() {
                   { key: "select", label: "선택 (V)", icon: MousePointer2 },
                   { key: "face", label: "얼굴 영역 지정 (F)", icon: ScanFace },
                   { key: "landmark", label: "랜드마크 이동 (L)", icon: Move },
+                  { key: "prompt", label: "클릭 보정 (P)", icon: Crosshair },
                   { key: "add", label: "마스크 추가 (B)", icon: Plus },
                   { key: "erase", label: "마스크 지우기 (E)", icon: Eraser },
                 ] as const
@@ -868,7 +1439,8 @@ export default function App() {
                     !project ||
                     preview ||
                     !!busy ||
-                    (!total && (t.key === "add" || t.key === "erase"))
+                    (!total &&
+                      (t.key === "add" || t.key === "erase" || t.key === "prompt"))
                   }
                   onClick={() => setTool(t.key)}
                 >
@@ -901,9 +1473,35 @@ export default function App() {
                   type="checkbox"
                   checked={original}
                   disabled={!project || preview}
-                  onChange={(e) => setOriginal(e.target.checked)}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setOriginal(checked);
+                    if (checked) setCompareDiff(false);
+                  }}
                 />
                 원본
+              </label>
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={fillOverlay}
+                  disabled={!total || preview}
+                  onChange={(e) => setFillOverlay(e.target.checked)}
+                />
+                보완
+              </label>
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={compareDiff}
+                  disabled={!total || preview}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setCompareDiff(checked);
+                    if (checked) setOriginal(false);
+                  }}
+                />
+                차이
               </label>
               <label className="toggle-label">
                 <input
@@ -947,6 +1545,8 @@ export default function App() {
                   zoom={zoom}
                   original={original}
                   overlay={overlay}
+                  fillOverlay={fillOverlay}
+                  compareDiff={compareDiff}
                   wire={wire}
                   solo={solo}
                   preview={preview}
@@ -965,9 +1565,11 @@ export default function App() {
                         ? "얼굴 피부 영역의 좌상단에서 우하단까지 드래그하세요"
                         : tool === "landmark"
                           ? "눈 · 입 · 턱 · 얼굴 상단의 점을 드래그하세요"
-                          : tool === "add" || tool === "erase"
-                            ? "드래그하여 선택 파츠의 마스크를 수정하세요"
-                            : "파츠를 선택하여 경계를 확인하세요"}
+                          : tool === "prompt"
+                            ? "좌클릭: 포함(+) · 우클릭/Alt/Shift+클릭: 제외(-) 영역 지정"
+                            : tool === "add" || tool === "erase"
+                              ? "드래그하여 선택 파츠의 마스크를 수정하세요"
+                              : "파츠를 선택하여 경계를 확인하세요"}
                   </span>
                   <div>
                     <button
@@ -1049,6 +1651,7 @@ export default function App() {
                   <button
                     onClick={() => {
                       controller.current?.abort();
+                      void cancelAnalysis();
                       setBusy("취소 요청됨 · 처리 결과 폐기 대기");
                     }}
                   >
@@ -1095,13 +1698,67 @@ export default function App() {
                 <section>
                   <div className="section-title">
                     <span>01</span>
-                    <h2>분리 초안 생성</h2>
+                    <h2>얼굴 · 파츠 초안</h2>
                   </div>
                   <p className="muted">
-                    얼굴 영역과 랜드마크를 먼저 맞추세요.
-                    <br />
-                    분리 결과는 직접 확인하고 보정합니다.
+                    자동 검출 후 수동 드래그로 눈·입·crown을 보정하세요.
                   </p>
+                  <button
+                    className="full"
+                    disabled={!project || !!busy}
+                    onClick={() => runFaceAnalysis(null, false)}
+                  >
+                    <ScanFace size={15} />
+                    얼굴 · 랜드마크 자동 검출
+                  </button>
+                  {project?.analysisNote && (
+                    <div
+                      className={`analysis-banner status-${project.analysisStatus ?? "idle"}`}
+                    >
+                      <span>{project.analysisNote}</span>
+                    </div>
+                  )}
+                  {project?.faceCandidates && project.faceCandidates.length > 1 && (
+                    <div className="candidate-list">
+                      <span className="field-label">
+                        검출된 얼굴 후보 ({project.faceCandidates.length})
+                      </span>
+                      <div className="candidate-pills">
+                        {project.faceCandidates.map((cand) => (
+                          <button
+                            key={cand.id}
+                            className={`compact-pill ${
+                              (project.selectedFaceId ?? 0) === cand.id
+                                ? "active"
+                                : ""
+                            }`}
+                            disabled={!!busy}
+                            onClick={() => selectFaceCandidate(cand.id)}
+                          >
+                            #{cand.id + 1} · {Math.round(cand.score * 100)}%
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {project?.landmarkProvenance && (
+                    <div className="provenance-row">
+                      {(["eyeR", "eyeL", "mouth", "chin", "crown"] as LandmarkId[]).map(
+                        (k) => {
+                          const src = project.landmarkProvenance![k];
+                          return (
+                            <span
+                              key={k}
+                              className={`prov-chip prov-${src}`}
+                              title={`${k}: ${src}`}
+                            >
+                              {k}·{src === "manual" ? "수동" : src === "estimated" ? "추정" : "모델"}
+                            </span>
+                          );
+                        },
+                      )}
+                    </div>
+                  )}
                   <label className="field-label">
                     배경 제거
                     <span>
@@ -1125,38 +1782,69 @@ export default function App() {
                     <span>유지</span>
                     <span>유사색 제거 {tolerance}</span>
                   </div>
+                  <div className="field-label">
+                    분할 단위
+                    <span>{detailMode === "parent" ? "통합(눈·입)" : "세부 18파츠"}</span>
+                  </div>
+                  <div className="two-buttons compact">
+                    <button
+                      className={detailMode === "detail" ? "active" : ""}
+                      disabled={!!busy}
+                      onClick={() => {
+                        if (detailMode !== "detail") {
+                          setDetailMode("detail");
+                          if (total > 0) setModal("regenerate");
+                        }
+                      }}
+                    >
+                      세부 18파츠
+                    </button>
+                    <button
+                      className={detailMode === "parent" ? "active" : ""}
+                      disabled={!!busy}
+                      onClick={() => {
+                        if (detailMode !== "parent") {
+                          setDetailMode("parent");
+                          if (total > 0) setModal("regenerate");
+                        }
+                      }}
+                    >
+                      눈·입 통합
+                    </button>
+                  </div>
+                  <div className="check-options">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={hairSplit}
+                        disabled={!!busy}
+                        onChange={(e) => {
+                          setHairSplit(e.target.checked);
+                          if (total > 0) setModal("regenerate");
+                        }}
+                      />
+                      다중 머리카락 분리 (앞·옆·뒷)
+                    </label>
+                  </div>
                   <button
                     className="model-button"
-                    disabled={!desktop || !!busy}
+                    disabled={!!busy}
                     onClick={() => {
-                      void chooseModel()
-                        .then((path) => {
-                          if (typeof path === "string") setModelPath(path);
-                        })
-                        .catch((e) => setError(String(e)));
+                      if (desktop) void getModelStatus().then(setModelStatus).catch(() => {});
+                      setModal("models");
                     }}
                   >
-                    <Box size={15} />
+                    <Settings size={15} />
                     <span>
-                      {modelPath
-                        ? modelPath.split(/[\\/]/).pop()
-                        : "U2Net ONNX 모델 연결"}
+                      ONNX 모델 관리 ({modelStatus.filter((m) => m.hashMatches).length}/{modelStatus.length || 5})
                       <small>
                         {desktop
-                          ? "배경 제거용 로컬 ONNX 모델"
-                          : "데스크톱 앱에서 사용 가능"}
+                          ? "MobileSAM · HRNet · YOLOv3 · U2NetP"
+                          : "데스크톱 앱에서 ONNX 연결/다운로드"}
                       </small>
                     </span>
                     <ChevronRight size={14} />
                   </button>
-                  {modelPath && (
-                    <button
-                      className="text-button small"
-                      onClick={() => setModelPath(null)}
-                    >
-                      모델 연결 해제
-                    </button>
-                  )}
                   <button
                     className="primary full"
                     disabled={!project || !!busy}
@@ -1170,8 +1858,8 @@ export default function App() {
                   <div className="note">
                     <Sparkles size={13} />
                     <span>
-                      세부 파츠는 랜드마크 기반 기하 초안입니다. 복잡한 가림은
-                      보정이 필요합니다.
+                      MobileSAM + 랜드마크 분할 후 클릭 보정(P)과 브러시로
+                      세부 경계를 다듬으세요.
                     </span>
                   </div>
                 </section>
@@ -1192,6 +1880,27 @@ export default function App() {
                               ? "미해당"
                               : "초안"}
                         </span>
+                      </div>
+                      <div className="provenance-row">
+                        <span
+                          className={`prov-chip prov-${part.provenance ?? "geometry"}`}
+                          title="생성 출처 (검토 상태와 별개)"
+                        >
+                          출처·{partProvenanceLabel(part.provenance)}
+                          {part.confidence !== undefined && part.confidence > 0
+                            ? ` ${(part.confidence * 100).toFixed(0)}%`
+                            : ""}
+                        </span>
+                        {part.fillKind && part.fillKind !== "none" && (
+                          <span className="prov-chip prov-estimated">
+                            보완·{part.fillKind === "external" ? "외부PNG" : "인접외삽"}
+                          </span>
+                        )}
+                        {part.diagnostics?.map((diag) => (
+                          <span key={diag} className="prov-chip prov-danger">
+                            {diagnosticLabel(diag)}
+                          </span>
+                        ))}
                       </div>
                       <label className="field-label" htmlFor="part-name">
                         레이어 이름
@@ -1219,7 +1928,16 @@ export default function App() {
                         disabled={!!busy}
                         onChange={(e) => setRadius(+e.target.value)}
                       />
-                      <div className="two-buttons">
+                      <div className="three-buttons compact">
+                        <button
+                          className={tool === "prompt" ? "active" : ""}
+                          disabled={!!busy}
+                          onClick={() => setTool("prompt")}
+                          title="좌클릭: 포함(+), 우클릭/Alt+클릭: 제외(-)"
+                        >
+                          <Crosshair size={14} />
+                          클릭 보정
+                        </button>
                         <button
                           className={tool === "add" ? "active" : ""}
                           disabled={!!busy}
@@ -1237,6 +1955,55 @@ export default function App() {
                           제거
                         </button>
                       </div>
+                      {isHairPart(part) && (
+                        <div className="check-options">
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={subtractHairOnPrompt}
+                              disabled={!!busy}
+                              onChange={(e) =>
+                                setSubtractHairOnPrompt(e.target.checked)
+                              }
+                            />
+                            클릭 추출 시 기존 머리카락에서 겹침 빼기
+                          </label>
+                        </div>
+                      )}
+                      {(promptResult?.partId === part.id ||
+                        (part.prompts && part.prompts.length > 0)) && (
+                        <div className="prompt-card">
+                          <div className="prompt-card-head">
+                            <span>
+                              프롬프트 점 {part.prompts?.length ?? 0}개
+                            </span>
+                            <button
+                              className="text-button small"
+                              disabled={!!busy}
+                              onClick={clearPartPrompts}
+                            >
+                              점 초기화
+                            </button>
+                          </div>
+                          {promptResult?.partId === part.id && (
+                            <div className="candidate-pills">
+                              {promptResult.candidates.map((cand) => (
+                                <button
+                                  key={cand.index}
+                                  className={`compact-pill ${
+                                    promptCandidateIdx === cand.index ? "active" : ""
+                                  }`}
+                                  disabled={!!busy}
+                                  onClick={() => selectPromptCandidate(cand.index)}
+                                >
+                                  후보 #{cand.index + 1} ·{" "}
+                                  {(cand.iouScore * 100).toFixed(0)}%
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                       <div className="check-options">
                         <label>
                           <input
@@ -1245,6 +2012,26 @@ export default function App() {
                             onChange={(e) => setOverlay(e.target.checked)}
                           />
                           마스크 색상 표시
+                        </label>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={fillOverlay}
+                            onChange={(e) => setFillOverlay(e.target.checked)}
+                          />
+                          가림 보완 영역 표시
+                        </label>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={compareDiff}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              setCompareDiff(checked);
+                              if (checked) setOriginal(false);
+                            }}
+                          />
+                          원본 대비 합성 차이
                         </label>
                         <label>
                           <input
@@ -1258,7 +2045,7 @@ export default function App() {
                       <div className="two-buttons">
                         <button disabled={!!busy} onClick={fillPart}>
                           <Sparkles size={14} />
-                          가림 보완
+                          가림 보완 ({defaultFillRadius(part)}px)
                         </button>
                         <button
                           disabled={!!busy}
@@ -1268,6 +2055,39 @@ export default function App() {
                           PNG 교체
                         </button>
                       </div>
+                      <button
+                        className="text-button small"
+                        disabled={!!busy}
+                        onClick={fillCriticalOcclusions}
+                        style={{ marginTop: 4 }}
+                      >
+                        얼굴·목·뒷머리 가림 일괄 보완 (36px)
+                      </button>
+                      {part.fillMask && (
+                        <div className="analysis-banner status-model-missing">
+                          <div>
+                            <div>
+                              <strong>가림 보완({part.fillKind ?? "neighbor"})</strong>{" "}
+                              가시 마스크와 분리 저장됨
+                            </div>
+                            {(part.id.startsWith("eye") ||
+                              part.id.startsWith("mouth") ||
+                              part.id.startsWith("hair")) && (
+                              <small>
+                                인접 픽셀 외삽만 적용되며 가려진 눈·입·머리카락 내부
+                                디테일은 복원되지 않습니다.
+                              </small>
+                            )}
+                            <button
+                              className="text-button small"
+                              disabled={!!busy}
+                              onClick={clearFillMask}
+                            >
+                              보완 영역만 제거
+                            </button>
+                          </div>
+                        </div>
+                      )}
                       <div className="two-buttons compact">
                         <button disabled={!!busy} onClick={() => shiftPart(1)}>
                           <ArrowUp size={13} />
@@ -1385,6 +2205,27 @@ export default function App() {
                     눈을 감았을 때의 빈 영역, 입 주변 경계와 고개 회전 시 틈을
                     확인하세요. 보완한 파츠를 Cubism에서 정밀하게 마무리합니다.
                   </p>
+                  {meshWarnings.length > 0 ? (
+                    <div className="analysis-banner status-no-face">
+                      <AlertCircle size={15} />
+                      <div>
+                        <strong>극단 포즈 · 메쉬 품질 경고 ({meshWarnings.length})</strong>
+                        {meshWarnings.map((w) => (
+                          <div key={w.partId} className="tiny">
+                            {w.warnings.join(" / ")}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    meshes.size > 0 && (
+                      <div className="analysis-banner status-detected">
+                        <span>
+                          극단 포즈(±30°) 및 구멍 횡단 메쉬 검증을 통과했습니다.
+                        </span>
+                      </div>
+                    )
+                  )}
                   <button className="full" onClick={() => changeTab("prepare")}>
                     파츠 보정으로 돌아가기
                     <ChevronRight size={14} />
@@ -1451,7 +2292,11 @@ export default function App() {
                 ? "내보내기"
                 : modal === "help"
                   ? "사용 가이드"
-                  : "파츠 재생성"
+                  : modal === "reanalysis"
+                    ? "랜드마크 재추출 확인"
+                    : modal === "models"
+                      ? "모델 관리"
+                      : "파츠 재생성"
             }
           >
             <button
@@ -1510,6 +2355,181 @@ export default function App() {
                   확인이 필요합니다.
                 </p>
               </>
+            ) : modal === "reanalysis" && pendingReanalysis && project ? (
+              <>
+                <span className="eyebrow">PRESERVE MANUAL EDITS</span>
+                <h2>수동 보정한 랜드마크가 있습니다</h2>
+                <p>
+                  사용자가 직접 드래그한 좌표({pendingReanalysis.manualKeys.join(", ")})를
+                  유지할지, 새 자동 예측으로 덮어쓸지 선택하세요.
+                </p>
+                <div className="reanalysis-diffs">
+                  {(["eyeR", "eyeL", "mouth", "chin", "crown"] as LandmarkId[]).map((k) => {
+                    const cur = project.landmarks[k];
+                    const next = pendingReanalysis.response.rigLandmarks?.[k];
+                    const diffPx = next
+                      ? Math.hypot(cur.x - next.x, cur.y - next.y).toFixed(1)
+                      : "0.0";
+                    const isManual = pendingReanalysis.manualKeys.includes(k);
+                    return (
+                      <div key={k} className="diff-row">
+                        <span>
+                          <strong>{k}</strong>
+                          {isManual && <em>수동</em>}
+                        </span>
+                        <span>차이 {diffPx}px</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="two-buttons">
+                  <button
+                    className="primary"
+                    onClick={() => {
+                      const next = applyAnalysisResponse(
+                        project,
+                        pendingReanalysis.response,
+                        true,
+                      );
+                      commit(next, project);
+                      setPendingReanalysis(null);
+                      setModal(null);
+                      notify("수동 보정 좌표를 보존하고 나머지 결과를 적용했습니다.");
+                    }}
+                  >
+                    수동 수정 보존
+                  </button>
+                  <button
+                    onClick={() => {
+                      const next = applyAnalysisResponse(
+                        project,
+                        pendingReanalysis.response,
+                        false,
+                      );
+                      commit(next, project);
+                      setPendingReanalysis(null);
+                      setModal(null);
+                      notify(pendingReanalysis.response.message);
+                    }}
+                  >
+                    모두 덮어쓰기
+                  </button>
+                </div>
+                <button
+                  className="text-button full"
+                  onClick={() => {
+                    setPendingReanalysis(null);
+                    setModal(null);
+                  }}
+                >
+                  취소하고 현재 좌표 유지
+                </button>
+              </>
+            ) : modal === "models" ? (
+              <>
+                <span className="eyebrow">LOCAL ONNX RUNTIME</span>
+                <h2>ONNX 모델 관리 · SHA-256 검증</h2>
+                <p>
+                  models/manifest.json 기준으로 무결성을 검증하며 모든 추론은
+                  로컬 기기에서 실행됩니다.
+                </p>
+                <div className="model-list">
+                  {modelStatus.length === 0 ? (
+                    <p className="muted tiny">
+                      {desktop
+                        ? "등록된 모델 상태를 불러오는 중입니다."
+                        : "데스크톱 앱(tauri) 환경에서 로컬 ONNX 모델을 연결·검증할 수 있습니다."}
+                    </p>
+                  ) : (
+                    modelStatus.map((entry) => {
+                      const busySelf = modelBusyRole === entry.role;
+                      const sizeMb = (entry.expectedBytes / (1024 * 1024)).toFixed(1);
+                      return (
+                        <div key={entry.role} className="model-row">
+                          <div className="model-row-head">
+                            <div>
+                              <strong>{ROLE_LABELS[entry.role] ?? entry.role}</strong>
+                              <small>
+                                {entry.filename} · {sizeMb} MB · {entry.license}
+                              </small>
+                            </div>
+                            <span
+                              className={`prov-chip ${
+                                entry.hashMatches
+                                  ? "prov-manual"
+                                  : entry.installed
+                                    ? "prov-estimated"
+                                    : "prov-danger"
+                              }`}
+                            >
+                              {entry.hashMatches
+                                ? "SHA-256 일치"
+                                : entry.installed
+                                  ? "해시 불일치"
+                                  : "미설치"}
+                            </span>
+                          </div>
+                          <div className="model-row-meta">
+                            <code>sha256: {entry.expectedSha256.slice(0, 16)}…</code>
+                            {entry.path && <span title={entry.path}>{entry.path}</span>}
+                          </div>
+                          {entry.error && !entry.hashMatches && (
+                            <p className="tiny muted">{entry.error}</p>
+                          )}
+                          <div className="candidate-pills">
+                            <button
+                              className="compact-pill"
+                              disabled={!desktop || !!busy || busySelf}
+                              onClick={() => void linkModelRole(entry.role)}
+                            >
+                              <FolderOpen size={12} />
+                              로컬 .onnx 연결
+                            </button>
+                            {entry.downloadUrl && !entry.hashMatches && (
+                              <button
+                                className="compact-pill active"
+                                disabled={!desktop || !!busy || busySelf}
+                                onClick={() => void downloadModelRole(entry.role)}
+                              >
+                                <Download size={12} />
+                                {busySelf ? "다운로드 중…" : "자동 다운로드"}
+                              </button>
+                            )}
+                            {!entry.downloadUrl && !entry.hashMatches && (
+                              <span className="tiny muted">
+                                python tools/model-export/export_models.py 실행 또는 파일 연결
+                              </span>
+                            )}
+                            {entry.path && (
+                              <button
+                                className="compact-pill"
+                                disabled={!desktop || !!busy || busySelf}
+                                onClick={() => void unlinkModelRole(entry.role)}
+                              >
+                                연결 해제
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+                {desktop && (
+                  <button
+                    className="full"
+                    disabled={!!modelBusyRole}
+                    onClick={() => {
+                      void getModelStatus()
+                        .then(setModelStatus)
+                        .catch((e) => setError(String(e)));
+                    }}
+                  >
+                    <RefreshCw size={14} />
+                    상태 새로고침
+                  </button>
+                )}
+              </>
             ) : modal === "regenerate" ? (
               <>
                 <h2>파츠 초안을 다시 만들까요?</h2>
@@ -1519,7 +2539,7 @@ export default function App() {
                 </p>
                 <div className="two-buttons">
                   <button onClick={() => setModal(null)}>돌아가기</button>
-                  <button className="primary" onClick={generate}>
+                  <button className="primary" onClick={() => generate()}>
                     다시 생성
                   </button>
                 </div>
@@ -1534,29 +2554,28 @@ export default function App() {
                     작업 해상도는 긴 변 최대 2,048px입니다.
                   </li>
                   <li>
-                    <strong>얼굴과 랜드마크 맞추기</strong>F로 얼굴 영역을
-                    드래그하고 L로 눈·입·턱 위치를 보정합니다. 상단 점은 얼굴
-                    피부의 상단입니다.
+                    <strong>얼굴과 랜드마크 맞추기</strong>YOLOv3+HRNetV2가
+                    얼굴과 28점 랜드마크를 자동 추출합니다. 다중 얼굴 후보를
+                    전환하거나 F/L로 수동 수정하세요.
                   </li>
                   <li>
-                    <strong>분리 초안 확인</strong>U2Net 모델을 연결하면 Rust
-                    ort로 배경을 제거합니다. 세부 파츠는 기하 템플릿이므로 B/E
-                    브러시로 보정하세요.
+                    <strong>파츠 분리·클릭 보정</strong>MobileSAM과 랜드마크
+                    하이브리드 분할을 실행하고 클릭 보정(P)·브러시(B/E)로
+                    다듬습니다.
                   </li>
                   <li>
-                    <strong>빈 곳 보완</strong>가림 보완은 12px 인접색
-                    확장입니다. 정교한 그리기는 같은 캔버스 크기의 PNG로
-                    교체합니다.
+                    <strong>가림 보완·차이 확인</strong>가림 보완은 가시 마스크와
+                    분리된 12px 인접색 외삽이며, 눈·입·머리카락 내부 디테일은
+                    생성되지 않으므로 필요시 PNG로 교체하세요.
                   </li>
                   <li>
-                    <strong>움직임 확인·내보내기</strong>미리보기 후 PSD와
-                    가이드를 내보냅니다. Cubism에서 메쉬·디포머·변형 키를
-                    마무리하세요.
+                    <strong>움직임 확인·내보내기</strong>윤곽·랜드마크 메쉬와
+                    극단 포즈 경고를 점검한 뒤 Cubism용 PSD·패키지를 내보냅니다.
                   </li>
                 </ol>
                 <p className="muted tiny">
                   저장 Ctrl+S · 실행 취소 Ctrl+Z · 다시 실행 Ctrl+Shift+Z · 선택
-                  V · 얼굴 F · 랜드마크 L · 브러시 B · 지우개 E
+                  V · 얼굴 F · 랜드마크 L · 클릭 보정 P · 브러시 B · 지우개 E
                 </p>
               </>
             )}

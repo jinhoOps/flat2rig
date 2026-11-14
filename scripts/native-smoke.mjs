@@ -109,7 +109,7 @@ try {
   });
   await rpc("Runtime.enable");
   await rpc("Page.enable");
-  await waitFor("document.body.innerText.includes('일러스트 가져오기')");
+  await waitFor("Boolean(document.body?.innerText?.includes('일러스트 가져오기'))");
   const initial = await evaluate(
     "({text:document.body.innerText,tauri:!!window.__TAURI_INTERNALS__,surface:getComputedStyle(document.querySelector('.topbar')).backdropFilter})",
   );
@@ -122,7 +122,7 @@ try {
   });
   await rpc("DOM.setFileInputFiles", { nodeId, files: [fixture] });
   await waitFor(
-    "document.querySelector('.project-title').textContent.includes('native-input')",
+    "document.querySelector('.project-title').textContent.includes('native-input') && !document.querySelector('.busy-overlay')",
   );
   const png = readFileSync(fixture).toString("base64");
   await evaluate(
@@ -148,7 +148,7 @@ try {
     "[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='파츠 초안 생성').click()",
   );
   await waitFor(
-    "document.querySelectorAll('.layer').length===18 && !document.querySelector('.busy-overlay')",
+    "document.querySelectorAll('.layer').length>=18 && !document.querySelector('.busy-overlay')",
   );
   console.log("Image import and Rust part generation passed");
   const lm = {
@@ -171,16 +171,22 @@ try {
     modelPath: existsSync(model) ? model : null,
   };
   const native = await evaluate(
-    `(async()=>{const invoke=window.__TAURI_INTERNALS__.invoke;const a=${JSON.stringify(args)};const r=await invoke('generate_parts',a);const ids=${JSON.stringify(["hair_back", "body", "neck", "face", "eyeR_white", "eyeR_iris", "eyeR_lower", "eyeR_upper", "eyeL_white", "eyeL_iris", "eyeL_lower", "eyeL_upper", "browR", "browL", "mouth_inner", "mouth_lower", "mouth_upper", "hair_front"])};const rig=await invoke('build_rig',{parts:r.masks.map((mask,i)=>({id:ids[i],mask})),width:128,height:128,landmarks:a.landmarks});const fill=await invoke('fill_part',{rgba:a.rgba,mask:r.masks[3],width:128,height:128,radius:12});return {parts:r.masks.length,rigParts:rig.length,vertices:rig.reduce((n,p)=>n+p.mesh.vertices.length,0),samples:rig[3].samples.length,filledBytes:atob(fill.mask).length,provider:r.provider,modelHash:r.modelHash};})()`,
+    `(async()=>{const invoke=window.__TAURI_INTERNALS__.invoke;const a=${JSON.stringify(args)};const r=await invoke('generate_parts',a);const prop=await invoke('propose_parts',{rgba:a.rgba,width:128,height:128,landmarks:a.landmarks,tolerance:32,detailMode:'parent'});const ids=${JSON.stringify(["hair_back", "body", "neck", "face", "eyeR_white", "eyeR_iris", "eyeR_lower", "eyeR_upper", "eyeL_white", "eyeL_iris", "eyeL_lower", "eyeL_upper", "browR", "browL", "mouth_inner", "mouth_lower", "mouth_upper", "hair_front"])};const rig=await invoke('build_rig',{parts:r.masks.map((mask,i)=>({id:ids[i],mask})),width:128,height:128,landmarks:a.landmarks});const meshed=rig.find(p=>p.mesh.triangles.length>0);const fill=await invoke('fill_part',{rgba:a.rgba,mask:r.masks[3],width:128,height:128,radius:12});const occ=await invoke('fill_part_occlusion',{rgba:a.rgba,visibleMask:r.masks[4],width:128,height:128,radius:6,partId:'eyeR_white'});const models=await invoke('get_model_status');return {parts:r.masks.length,parentParts:prop.partIds.length,parentHasEyeR:prop.partIds.includes('eyeR_all'),rigParts:rig.length,vertices:rig.reduce((n,p)=>n+p.mesh.vertices.length,0),samples:meshed?.samples.length??0,extremePosesTested:meshed?.quality?.extremePosesTested??0,filledBytes:atob(fill.mask).length,occFillKind:occ.fillKind,occWarning:!!occ.warning,modelsCount:models.length,provider:r.provider,modelHash:r.modelHash};})()`,
   );
   if (
     native.parts !== 18 ||
+    !native.parentHasEyeR ||
+    native.parentParts >= 18 ||
     native.rigParts !== 18 ||
+    native.extremePosesTested !== 12 ||
     native.filledBytes !== 128 * 128 ||
+    native.occFillKind !== "neighbor" ||
+    !native.occWarning ||
+    native.modelsCount !== 5 ||
     native.samples < 10
   )
-    throw new Error("Native command contract failed");
-  console.log("ort, delaunator, glam and fill commands passed");
+    throw new Error(`Native command contract failed: ${JSON.stringify(native)}`);
+  console.log("ort, delaunator, glam, occlusion and model registry commands passed");
   await evaluate(
     "[...document.querySelectorAll('[role=tab]')].find(b=>b.textContent.includes('리깅')).click()",
   );
@@ -222,9 +228,10 @@ try {
     try {
       console.error(
         await evaluate(
-          "({text:document.body.innerText,html:document.documentElement.outerHTML.slice(0,1800)})",
+          "({text:document.body?.innerText,html:document.documentElement.outerHTML.slice(0,1800)})",
         ),
       );
+      if (exceptions.length) console.error("RUNTIME_EXCEPTIONS:", JSON.stringify(exceptions));
     } catch {}
   }
   throw error;
