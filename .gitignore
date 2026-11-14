@@ -22,3 +22,19 @@ rustc-ice-*.txt
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# flat2rig
+node_modules/
+dist/
+target/
+*.tsbuildinfo
+*.log
+.DS_Store
+models/*.onnx
+models/*.dll
+artifacts/
+*.flat2rig
+
+# Local illustration references and generated Tauri schemas
+/sutteang/
+/src-tauri/gen/
