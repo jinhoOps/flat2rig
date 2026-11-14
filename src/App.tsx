@@ -68,6 +68,8 @@ import {
 } from "./io";
 import Viewport from "./Viewport";
 import { demoFile } from "./demo";
+import { BrandMark, BrandWordmark } from "./brand/Brand";
+import BrandLoop from "./brand/BrandLoop";
 
 export default function App() {
   const [project, setProject] = useState<Project | null>(null),
@@ -658,11 +660,8 @@ export default function App() {
       />
       <header className="topbar">
         <a className="brand" href="#" onClick={(e) => e.preventDefault()}>
-          <img src="/logo.svg" alt="" />
-          <span>
-            flat<span className="brand-two">2</span>rig
-          </span>
-          <small>STUDIO</small>
+          <BrandMark />
+          <BrandWordmark />
         </a>
         <div className="header-divider" />
         <span className="project-title">
@@ -996,11 +995,7 @@ export default function App() {
                 aria-label="일러스트 드롭 영역"
               >
                 <div className="welcome-drop-zone">
-                  <div className="welcome-art">
-                    <div className="welcome-icon">
-                      <ImagePlus size={32} aria-hidden="true" />
-                    </div>
-                  </div>
+                  <BrandLoop />
                   <h1>일러스트 가져오기</h1>
                   <p>
                     PNG 또는 JPG 파일 한 장을 끌어 놓으세요.

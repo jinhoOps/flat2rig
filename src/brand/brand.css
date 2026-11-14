@@ -1,0 +1,104 @@
+.brand-mark {
+  display: inline-flex;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  color: var(--ink-primary, #161920);
+}
+.brand-mark .rig-geometry {
+  width: 100%;
+  height: 100%;
+}
+.brand-mark .rig-plane {
+  transform: rotate(14deg);
+  transform-origin: 38px 53px;
+}
+.brand-mark .rig-mesh {
+  opacity: 0;
+}
+.brand-wordmark {
+  font-weight: 650;
+  letter-spacing: -0.8px;
+}
+.brand-loop {
+  position: relative;
+  width: 100%;
+  max-width: 400px;
+  margin-inline: auto;
+  isolation: isolate;
+}
+.brand-loop .flat2rig-motion .ss-stage {
+  background: transparent;
+  overflow: hidden;
+  --ss-accent: #2456d6;
+}
+.brand-loop .rig-scene {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #161920;
+  --rig-offset: -12px;
+  --rig-angle: 0deg;
+}
+.brand-loop .rig-scene[data-separated] {
+  --rig-offset: 0px;
+}
+.brand-loop .rig-scene[data-turned] {
+  --rig-angle: 14deg;
+}
+.brand-loop .rig-geometry {
+  width: 236px;
+  height: 236px;
+  overflow: visible;
+  /* The logo's base layer stays fixed as the second layer moves around it. */
+  transform: translateX(8px);
+}
+.brand-loop .ss-stage[data-layout="compact"] .rig-geometry {
+  width: 212px;
+  height: 212px;
+}
+.brand-loop .rig-plane {
+  transform-origin: 38px 53px;
+  transform: translateX(var(--rig-offset)) rotate(var(--rig-angle));
+  transition: transform 1200ms cubic-bezier(0.45, 0, 0.1, 1);
+}
+.brand-loop .rig-mesh {
+  opacity: 0;
+  transition: opacity 800ms ease;
+}
+.brand-loop .rig-mesh[data-on] {
+  opacity: 0.64;
+}
+.brand-loop .brand-motion-control {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  gap: 6px;
+  min-height: 28px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--ink-muted, #747e8f);
+  font: 10px/1.4 var(--font-sans, "Segoe UI", sans-serif);
+}
+.brand-loop .brand-motion-control:hover {
+  color: var(--ink-primary, #161920);
+  border-color: var(--line-subtle, #dce0e8);
+  background: #ffffff;
+}
+.brand-loop .brand-motion-control:focus-visible {
+  outline: 2px solid #2456d6;
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-loop .brand-motion-control {
+    display: none;
+  }
+  .brand-loop .rig-plane,
+  .brand-loop .rig-mesh {
+    transition: none;
+  }
+}
