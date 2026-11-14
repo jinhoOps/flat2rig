@@ -67,4 +67,6 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin flat2rig-cli -- INPUT.png a
 
 구현 범위와 데이터 계약: [MVP 사양](docs/mvp-spec.md). 모델 출처와 설정: [모델 안내](models/README.md).
 
+자동 얼굴 검출·랜드마크·파츠 분리의 다음 구현 순서와 완료 조건: [구현 계획](docs/implementation-plan.md).
+
 화면 테마는 [DESIGN.md](DESIGN.md)를 기준으로 [src/design.css](src/design.css)에 구현했습니다. 불투명 캔버스와 도킹 레이아웃을 유지하고, 패널·HUD·모달에 글래스 토큰을 적용합니다. 투명 효과/모션 축소 설정과 미지원 엔진 폴백을 포함합니다.
