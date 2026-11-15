@@ -36,7 +36,8 @@ artifacts/
 *.flat2rig
 
 # Local illustration references and generated Tauri schemas
-/sutteang/
+*/sutteang/
+/ref/*
 /src-tauri/gen/
 models/*.onnx
 models/*.dll
