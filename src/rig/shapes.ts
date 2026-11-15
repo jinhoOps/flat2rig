@@ -1,5 +1,5 @@
 import { zlibSync } from "fflate";
-import { clamp } from "../engine";
+import { buildHeadFrame, clamp, toHeadLocal, toHeadWorld } from "../engine";
 import { canvas } from "../images";
 import type {
   Part,
@@ -367,235 +367,17 @@ function sampleSectorSkin(
   ];
 }
 
-function buildEyeSubstituteAsset(
-  project: Project,
-  sourcePixels: Uint8ClampedArray,
-  region: "eye_L" | "eye_R",
-  kind: "closed" | "smiling",
-): ShapeSubstituteAsset {
-  const isLeft = region === "eye_L";
-  const prefix = isLeft ? "eyeL" : "eyeR";
-  const isSd = project.rigProfile.proportionMode === "sd";
-  const eye = isLeft ? project.landmarks.eyeL : project.landmarks.eyeR;
-  const eyeDist = Math.max(
-    12,
-    Math.hypot(
-      project.landmarks.eyeL.x - project.landmarks.eyeR.x,
-      project.landmarks.eyeL.y - project.landmarks.eyeR.y,
-    ),
-  );
-  const hidesPartIds = [
-    `${prefix}_white`,
-    `${prefix}_iris`,
-    `${prefix}_lower`,
-    `${prefix}_upper`,
-    `${prefix}_all`,
-  ];
-
-  const nonSkinPartIds = [
-    ...hidesPartIds,
-    "browL",
-    "browR",
-    ...project.parts
-      .filter(
-        (p) =>
-          p.id.startsWith("hair") ||
-          p.id.startsWith("acc_") ||
-          p.id === "hat",
-      )
-      .map((p) => p.id),
-  ];
-
-  // Exclude eye parts, brows, hair, and headwear/glasses during skin sampling
-  const colors = sampleRegionColors(
-    project,
-    sourcePixels,
-    eye.x,
-    eye.y,
-    eyeDist * 0.45,
-    [`${prefix}_upper`, `${prefix}_all`],
-    nonSkinPartIds,
-  );
-
-  const union = unionPartsMask(
-    project.parts,
-    hidesPartIds,
-    project.width,
-    project.height,
-  );
-  const defaultRx = eyeDist * (isSd ? 0.26 : 0.22);
-  const defaultRy = eyeDist * (isSd ? 0.22 : 0.14);
-  const pad = Math.max(4, Math.round(eyeDist * 0.08));
-  const boxLeft = union.bounds
-    ? Math.min(union.bounds.left, eye.x - defaultRx) - pad
-    : eye.x - defaultRx - pad;
-  const boxTop = union.bounds
-    ? Math.min(union.bounds.top, eye.y - defaultRy) - pad
-    : eye.y - defaultRy - pad;
-  const boxRight = union.bounds
-    ? Math.max(union.bounds.right + 1, eye.x + defaultRx) + pad
-    : eye.x + defaultRx + pad;
-  const boxBot = union.bounds
-    ? Math.max(union.bounds.bottom + 1, eye.y + defaultRy) + pad
-    : eye.y + defaultRy + pad;
-  const bounds = clampRect(
-    boxLeft,
-    boxTop,
-    boxRight - boxLeft,
-    boxBot - boxTop,
-    project.width,
-    project.height,
-  );
-
-  const localX = eye.x - bounds.left;
-  const localY = eye.y - bounds.top;
-
-  // Layer 1: Smooth perimeter-blended skin cover hiding open eye aperture cleanly
-  const unionRx = union.bounds
-    ? Math.max(
-        localX - (union.bounds.left - bounds.left),
-        union.bounds.right + 1 - bounds.left - localX,
-      )
-    : defaultRx;
-  const unionRy = union.bounds
-    ? Math.max(
-        localY - (union.bounds.top - bounds.top),
-        union.bounds.bottom + 1 - bounds.top - localY,
-      )
-    : defaultRy;
-  const rxCover = Math.max(6, defaultRx * 1.12, unionRx * 1.08);
-  const ryCover = Math.max(5, defaultRy * 1.12, unionRy * 1.08);
-  const perimeter = buildPerimeterSkinPalette(
-    project,
-    sourcePixels,
-    eye.x,
-    eye.y,
-    rxCover,
-    ryCover,
-    nonSkinPartIds,
-    colors.skin,
-  );
-
-  const skinCanvas = canvas(bounds.width, bounds.height);
-  const sg = skinCanvas.getContext("2d")!;
-  const skinImg = sg.createImageData(bounds.width, bounds.height);
-  for (let y = 0; y < bounds.height; y++) {
-    for (let x = 0; x < bounds.width; x++) {
-      const gx = bounds.left + x;
-      const gy = bounds.top + y;
-      const partAlpha = union.mask[gy * project.width + gx];
-      const dx = (x + 0.5 - localX) / rxCover;
-      const dy = (y + 0.5 - localY) / ryCover;
-      const r2 = dx * dx + dy * dy;
-      const ellipseAlpha =
-        r2 >= 1 ? 0 : Math.round(clamp((1 - r2) / 0.35, 0, 1) * 255);
-      const a = Math.max(partAlpha, ellipseAlpha);
-      if (!a) continue;
-      const baseRgb = sampleSectorSkin(perimeter, colors.skin, dx, dy);
-      const di = (y * bounds.width + x) * 4;
-      // Subtle soft tint only on upper closed lid crease or warm lower cheek
-      const tintMix =
-        kind === "smiling" && dy > 0.25
-          ? 0.08
-          : kind === "closed" && dy < -0.1
-            ? 0.03
-            : 0;
-      const tintRgb: [number, number, number] =
-        kind === "smiling"
-          ? colors.rose
-          : [
-              Math.max(0, colors.skin[0] - 8),
-              Math.max(0, colors.skin[1] - 10),
-              Math.max(0, colors.skin[2] - 8),
-            ];
-      skinImg.data[di] = Math.round(baseRgb[0] * (1 - tintMix) + tintRgb[0] * tintMix);
-      skinImg.data[di + 1] = Math.round(baseRgb[1] * (1 - tintMix) + tintRgb[1] * tintMix);
-      skinImg.data[di + 2] = Math.round(baseRgb[2] * (1 - tintMix) + tintRgb[2] * tintMix);
-      skinImg.data[di + 3] = a;
-    }
-  }
-  sg.putImageData(skinImg, 0, 0);
-
-  // Layer 2: Crisp closed or smiling eyelash arc (sampled character ink)
-  const lidCanvas = canvas(bounds.width, bounds.height);
-  const lg = lidCanvas.getContext("2d")!;
-  const span = Math.max(4, eyeDist * (isSd ? 0.21 : 0.17));
-  const strokeW = clamp(eyeDist * (isSd ? 0.042 : 0.03), 1.6, 8);
-  const outerDir = isLeft ? 1 : -1;
-
-  lg.lineCap = "round";
-  lg.lineJoin = "round";
-  lg.strokeStyle = rgbCss(colors.ink);
-  lg.lineWidth = strokeW;
-
-  if (kind === "closed") {
-    const midY = localY + eyeDist * (isSd ? 0.045 : 0.025);
-    const outerTipX = localX + outerDir * span;
-    const innerTipX = localX - outerDir * span * 0.88;
-    const tipY = midY - eyeDist * (isSd ? 0.025 : 0.015);
-    const dipY = midY + eyeDist * (isSd ? 0.045 : 0.022);
-    lg.beginPath();
-    lg.moveTo(innerTipX, tipY);
-    lg.quadraticCurveTo(localX, dipY, outerTipX, tipY - eyeDist * 0.008);
-    lg.stroke();
-
-    // Subtle tapered outer lash wing
-    lg.lineWidth = Math.max(1.2, strokeW * 0.55);
-    lg.beginPath();
-    lg.moveTo(outerTipX - outerDir * strokeW * 0.4, tipY);
-    lg.lineTo(outerTipX + outerDir * span * 0.14, tipY + eyeDist * 0.012);
-    lg.stroke();
-  } else {
-    const baseY = localY + eyeDist * (isSd ? 0.02 : 0.015);
-    const peakY = localY - eyeDist * (isSd ? 0.13 : 0.08);
-    const innerTipX = localX - outerDir * span * 0.88;
-    const outerTipX = localX + outerDir * span;
-    lg.beginPath();
-    lg.moveTo(innerTipX, baseY);
-    lg.quadraticCurveTo(localX, peakY, outerTipX, baseY - eyeDist * 0.006);
-    lg.stroke();
-
-    // Soft happy double-lid / lower cheek smile crease hint
-    lg.strokeStyle = rgbCss(colors.ink, 0.35);
-    lg.lineWidth = Math.max(1.0, strokeW * 0.4);
-    lg.beginPath();
-    lg.moveTo(localX - outerDir * span * 0.45, peakY - eyeDist * 0.032);
-    lg.quadraticCurveTo(
-      localX,
-      peakY - eyeDist * 0.058,
-      localX + outerDir * span * 0.45,
-      peakY - eyeDist * 0.035,
-    );
-    lg.stroke();
-  }
-
-  return {
-    assetId: `${region}_${kind}_v1`,
-    region,
-    recipeVersion: 1,
-    hidesPartIds,
-    layers: [
-      canvasToLayer(`${prefix}_sub_skin`, skinCanvas, bounds, hidesPartIds),
-      canvasToLayer(`${prefix}_sub_lid`, lidCanvas, bounds),
-    ],
-  };
-}
-
 function buildMouthSubstituteAsset(
   project: Project,
   sourcePixels: Uint8ClampedArray,
   kind: "closed" | "a" | "i" | "u" | "e" | "o",
 ): ShapeSubstituteAsset {
   const isSd = project.rigProfile.proportionMode === "sd";
+  const frame = buildHeadFrame(project.landmarks, project.width, project.height);
+  const tiltRad = Math.atan2(frame.exY, frame.exX);
   const mouth = project.landmarks.mouth;
-  const eyeDist = Math.max(
-    12,
-    Math.hypot(
-      project.landmarks.eyeL.x - project.landmarks.eyeR.x,
-      project.landmarks.eyeL.y - project.landmarks.eyeR.y,
-    ),
-  );
-  const headH = Math.max(12, project.landmarks.chin.y - project.landmarks.crown.y);
+  const eyeDist = frame.eyeDist;
+  const headH = frame.hh;
   const hidesPartIds = ["mouth_upper", "mouth_lower", "mouth_inner", "mouth_all"];
 
   const colors = sampleRegionColors(
@@ -603,7 +385,7 @@ function buildMouthSubstituteAsset(
     sourcePixels,
     mouth.x,
     mouth.y,
-    Math.max(12, eyeDist * 0.32),
+    Math.max(10, eyeDist * 0.28),
     hidesPartIds,
     [...hidesPartIds, "face_shadow"],
   );
@@ -614,64 +396,116 @@ function buildMouthSubstituteAsset(
     project.width,
     project.height,
   );
-  const defaultRx = Math.max(8, eyeDist * (isSd ? 0.25 : 0.25));
-  const defaultRy = Math.max(6, headH * (isSd ? 0.12 : 0.1));
-  const pad = Math.max(4, Math.round(headH * 0.035));
+  const [mouthU, mouthV] = toHeadLocal(frame, mouth.x, mouth.y);
+  const defaultRu = Math.max(5.5, eyeDist * (isSd ? 0.11 : 0.135));
+  const defaultRv = Math.max(3.5, headH * (isSd ? 0.036 : 0.042));
+  const pad = clamp(Math.round(headH * 0.022), 3, 7);
 
-  // Also scan nearby face pixels for drawn lip/mouth ink in case landmark mouth.x is slightly offset on SD faces
+  // Sample perioral skin ring in tilted HeadFrame coordinates before scanning mouth ink
   const facePart = project.parts.find((p) => p.id === "face");
-  let lipMinX = project.width;
-  let lipMaxX = -1;
-  let lipMinY = project.height;
-  let lipMaxY = -1;
-  const scanX0 = clamp(Math.floor(mouth.x - eyeDist * 0.34), 0, project.width - 1);
-  const scanX1 = clamp(Math.ceil(mouth.x + eyeDist * 0.34), 0, project.width - 1);
-  const scanY0 = clamp(Math.floor(mouth.y - headH * 0.08), 0, project.height - 1);
-  const scanY1 = clamp(Math.ceil(mouth.y + headH * 0.08), 0, project.height - 1);
-  const skinLuma =
-    0.299 * colors.skin[0] + 0.587 * colors.skin[1] + 0.114 * colors.skin[2];
-  for (let gy = scanY0; gy <= scanY1; gy++) {
-    for (let gx = scanX0; gx <= scanX1; gx++) {
+  let ringR = 0,
+    ringG = 0,
+    ringB = 0,
+    ringCnt = 0;
+  const scanWin = Math.ceil(eyeDist * 0.34);
+  const ringX0 = clamp(Math.floor(mouth.x - scanWin), 0, project.width - 1);
+  const ringX1 = clamp(Math.ceil(mouth.x + scanWin), 0, project.width - 1);
+  const ringY0 = clamp(Math.floor(mouth.y - scanWin), 0, project.height - 1);
+  const ringY1 = clamp(Math.ceil(mouth.y + scanWin), 0, project.height - 1);
+  for (let gy = ringY0; gy <= ringY1; gy++) {
+    for (let gx = ringX0; gx <= ringX1; gx++) {
       const idx = gy * project.width + gx;
-      const inMouthOrFace =
-        union.mask[idx] > 80 || (facePart ? facePart.mask[idx] > 180 : true);
-      if (!inMouthOrFace || sourcePixels[idx * 4 + 3] < 180) continue;
-      const r = sourcePixels[idx * 4];
-      const g = sourcePixels[idx * 4 + 1];
-      const b = sourcePixels[idx * 4 + 2];
+      if (union.mask[idx] > 80 || sourcePixels[idx * 4 + 3] < 180) continue;
+      if (facePart && facePart.mask[idx] <= 128) continue;
+      const [lu, lv] = toHeadLocal(frame, gx + 0.5, gy + 0.5);
+      const d = Math.hypot(lu - mouthU, lv - mouthV);
+      if (d < eyeDist * 0.19 || d > eyeDist * 0.33) continue;
+      const k = idx * 4;
+      ringR += sourcePixels[k];
+      ringG += sourcePixels[k + 1];
+      ringB += sourcePixels[k + 2];
+      ringCnt++;
+    }
+  }
+  const refSkin: [number, number, number] =
+    ringCnt >= 8 ? [ringR / ringCnt, ringG / ringCnt, ringB / ringCnt] : colors.skin;
+  const refSkinLuma = 0.299 * refSkin[0] + 0.587 * refSkin[1] + 0.114 * refSkin[2];
+
+  // Scan strictly within tight perioral HeadFrame box for real painted mouth/lip pixels
+  let lipMinU = Infinity,
+    lipMaxU = -Infinity,
+    lipMinV = Infinity,
+    lipMaxV = -Infinity;
+  let lipCount = 0;
+  const innerLimitU = eyeDist * 0.175;
+  const innerLimitV = headH * 0.052;
+  const sx0 = clamp(Math.floor(mouth.x - eyeDist * 0.24), 0, project.width - 1);
+  const sx1 = clamp(Math.ceil(mouth.x + eyeDist * 0.24), 0, project.width - 1);
+  const sy0 = clamp(Math.floor(mouth.y - eyeDist * 0.24), 0, project.height - 1);
+  const sy1 = clamp(Math.ceil(mouth.y + eyeDist * 0.24), 0, project.height - 1);
+  for (let gy = sy0; gy <= sy1; gy++) {
+    for (let gx = sx0; gx <= sx1; gx++) {
+      const idx = gy * project.width + gx;
+      const inFaceOrMouth =
+        union.mask[idx] > 80 || (facePart ? facePart.mask[idx] > 160 : true);
+      if (!inFaceOrMouth || sourcePixels[idx * 4 + 3] < 180) continue;
+      const [lu, lv] = toHeadLocal(frame, gx + 0.5, gy + 0.5);
+      if (Math.abs(lu - mouthU) > innerLimitU || Math.abs(lv - mouthV) > innerLimitV) {
+        continue;
+      }
+      const k = idx * 4;
+      const r = sourcePixels[k];
+      const g = sourcePixels[k + 1];
+      const b = sourcePixels[k + 2];
       const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-      const colorDist = Math.hypot(r - colors.skin[0], g - colors.skin[1], b - colors.skin[2]);
-      if (luma < skinLuma - 38 || colorDist > 42) {
-        if (gx < lipMinX) lipMinX = gx;
-        if (gx > lipMaxX) lipMaxX = gx;
-        if (gy < lipMinY) lipMinY = gy;
-        if (gy > lipMaxY) lipMaxY = gy;
+      const colorDist = Math.hypot(r - refSkin[0], g - refSkin[1], b - refSkin[2]);
+      if (luma < refSkinLuma - 28 || colorDist > 34 || union.mask[idx] > 160) {
+        if (lu < lipMinU) lipMinU = lu;
+        if (lu > lipMaxU) lipMaxU = lu;
+        if (lv < lipMinV) lipMinV = lv;
+        if (lv > lipMaxV) lipMaxV = lv;
+        lipCount++;
       }
     }
   }
-  const hasLipBlob = lipMaxX >= lipMinX && lipMaxY >= lipMinY;
-  const blobCenterX = hasLipBlob ? (lipMinX + lipMaxX) * 0.5 : mouth.x;
-  const blobCenterY = hasLipBlob ? (lipMinY + lipMaxY) * 0.5 : mouth.y;
-  const coverCenterX = hasLipBlob ? (mouth.x + blobCenterX) * 0.5 : mouth.x;
-  const coverCenterY = hasLipBlob ? (mouth.y + blobCenterY) * 0.5 : mouth.y;
+  const hasLipBlob = lipCount >= 6 && lipMaxU >= lipMinU && lipMaxV >= lipMinV;
+  const blobMidU = hasLipBlob ? (lipMinU + lipMaxU) * 0.5 : mouthU;
+  const blobMidV = hasLipBlob ? (lipMinV + lipMaxV) * 0.5 : mouthV;
+  const drawU =
+    hasLipBlob && Math.abs(blobMidU - mouthU) <= eyeDist * 0.12 ? blobMidU : mouthU;
+  const drawV =
+    hasLipBlob && Math.abs(blobMidV - mouthV) <= headH * 0.035 ? blobMidV : mouthV;
+  const coverU = (mouthU + drawU) * 0.5;
+  const coverV = (mouthV + drawV) * 0.5;
 
-  let boxLeft = mouth.x - defaultRx - pad;
-  let boxTop = mouth.y - defaultRy - pad;
-  let boxRight = mouth.x + defaultRx + pad;
-  let boxBot = mouth.y + defaultRy + pad;
+  const skinRu = hasLipBlob
+    ? clamp((lipMaxU - lipMinU) * 0.5 + 3.5, defaultRu * 0.85, eyeDist * 0.18)
+    : defaultRu;
+  const skinRv = hasLipBlob
+    ? clamp((lipMaxV - lipMinV) * 0.5 + 3.5, defaultRv * 0.85, headH * 0.058)
+    : defaultRv;
+
+  // Also cap union mask contribution strictly around cover box so oversized draft parts don't erase blush
+  const [drawX, drawY] = toHeadWorld(frame, drawU, drawV);
+  const [coverX, coverY] = toHeadWorld(frame, coverU, coverV);
+  const coverSpan = Math.hypot(skinRu, skinRv) + pad;
+  const rxOpen = Math.max(4, eyeDist * (isSd ? 0.125 : 0.155));
+  const ryOpen = Math.max(4, headH * (isSd ? 0.048 : 0.056));
+  const drawSpan = Math.max(coverSpan, Math.hypot(rxOpen, ryOpen) + pad);
+
+  let boxLeft = coverX - drawSpan;
+  let boxTop = coverY - drawSpan;
+  let boxRight = coverX + drawSpan;
+  let boxBot = coverY + drawSpan;
   if (union.bounds) {
-    boxLeft = Math.min(boxLeft, union.bounds.left - pad);
-    boxTop = Math.min(boxTop, union.bounds.top - pad);
-    boxRight = Math.max(boxRight, union.bounds.right + 1 + pad);
-    boxBot = Math.max(boxBot, union.bounds.bottom + 1 + pad);
+    const maxReach = eyeDist * 0.21;
+    if (union.bounds.right - union.bounds.left <= maxReach * 2) {
+      boxLeft = Math.min(boxLeft, union.bounds.left - pad);
+      boxTop = Math.min(boxTop, union.bounds.top - pad);
+      boxRight = Math.max(boxRight, union.bounds.right + 1 + pad);
+      boxBot = Math.max(boxBot, union.bounds.bottom + 1 + pad);
+    }
   }
-  if (hasLipBlob) {
-    boxLeft = Math.min(boxLeft, lipMinX - pad);
-    boxTop = Math.min(boxTop, lipMinY - pad);
-    boxRight = Math.max(boxRight, lipMaxX + 1 + pad);
-    boxBot = Math.max(boxBot, lipMaxY + 1 + pad);
-  }
-
   const bounds = clampRect(
     boxLeft,
     boxTop,
@@ -680,38 +514,19 @@ function buildMouthSubstituteAsset(
     project.width,
     project.height,
   );
-  // Center drawn substitute lip near detected lip center if close to landmark, else landmark
-  const drawShiftX =
-    hasLipBlob && Math.abs(blobCenterX - mouth.x) <= eyeDist * 0.25
-      ? blobCenterX
-      : mouth.x;
-  const drawShiftY =
-    hasLipBlob && Math.abs(blobCenterY - mouth.y) <= headH * 0.05
-      ? blobCenterY
-      : mouth.y;
-  const cx = drawShiftX - bounds.left;
-  const cy = drawShiftY - bounds.top;
-  const skinCx = coverCenterX - bounds.left;
-  const skinCy = coverCenterY - bounds.top;
-  const skinRx = Math.max(
-    defaultRx * 1.05,
-    (boxRight - boxLeft) * 0.5 - pad * 0.4,
-  );
-  const skinRy = Math.max(
-    defaultRy * 1.05,
-    (boxBot - boxTop) * 0.5 - pad * 0.4,
-  );
+  const cx = drawX - bounds.left;
+  const cy = drawY - bounds.top;
 
-  // Layer 1: Perimeter-blended skin cover hiding original mouth contour cleanly
+  // Layer 1: Compact HeadFrame-tilted feathered skin cover hiding ONLY original painted mouth
   const perimeter = buildPerimeterSkinPalette(
     project,
     sourcePixels,
-    coverCenterX,
-    coverCenterY,
-    skinRx,
-    skinRy,
+    coverX,
+    coverY,
+    skinRu,
+    skinRv,
     [...hidesPartIds, "face_shadow"],
-    colors.skin,
+    refSkin,
   );
   const skinCanvas = canvas(bounds.width, bounds.height);
   const sg = skinCanvas.getContext("2d")!;
@@ -720,15 +535,17 @@ function buildMouthSubstituteAsset(
     for (let x = 0; x < bounds.width; x++) {
       const gx = bounds.left + x;
       const gy = bounds.top + y;
-      const origA = union.mask[gy * project.width + gx];
-      const dx = (x + 0.5 - skinCx) / Math.max(4, skinRx);
-      const dy = (y + 0.5 - skinCy) / Math.max(4, skinRy);
+      const [pu, pv] = toHeadLocal(frame, gx + 0.5, gy + 0.5);
+      const dx = (pu - coverU) / Math.max(3, skinRu);
+      const dy = (pv - coverV) / Math.max(3, skinRv);
       const r2 = dx * dx + dy * dy;
+      const inTightUnion =
+        r2 < 1.35 ? union.mask[gy * project.width + gx] : 0;
       const softA =
-        r2 >= 1 ? 0 : Math.round(clamp((1 - r2) / 0.35, 0, 1) * 255);
-      const a = Math.max(origA, softA);
+        r2 >= 1 ? 0 : Math.round(clamp((1 - r2) / 0.42, 0, 1) * 255);
+      const a = Math.max(inTightUnion, softA);
       if (!a) continue;
-      const rgb = sampleSectorSkin(perimeter, colors.skin, dx, dy);
+      const rgb = sampleSectorSkin(perimeter, refSkin, dx, dy);
       const di = (y * bounds.width + x) * 4;
       skinImg.data[di] = rgb[0];
       skinImg.data[di + 1] = rgb[1];
@@ -740,21 +557,26 @@ function buildMouthSubstituteAsset(
 
   const lipCanvas = canvas(bounds.width, bounds.height);
   const lg = lipCanvas.getContext("2d")!;
-  const strokeW = clamp(headH * 0.011, 1.3, 4.2);
+  const strokeW = clamp(headH * 0.0085, 1.15, 3.4);
 
   if (kind === "closed") {
-    const span = Math.max(4, eyeDist * (isSd ? 0.1 : 0.14));
+    const detHalfW = hasLipBlob ? (lipMaxU - lipMinU) * 0.52 : eyeDist * 0.1;
+    const span = clamp(detHalfW, eyeDist * 0.072, eyeDist * (isSd ? 0.105 : 0.13));
+    lg.save();
+    lg.translate(cx, cy);
+    lg.rotate(tiltRad);
     lg.strokeStyle = rgbCss(colors.ink);
     lg.lineWidth = strokeW;
     lg.lineCap = "round";
     lg.beginPath();
-    lg.moveTo(cx - span, cy - strokeW * 0.35);
-    lg.quadraticCurveTo(cx, cy + strokeW * 1.1, cx + span, cy - strokeW * 0.35);
+    lg.moveTo(-span, -strokeW * 0.28);
+    lg.quadraticCurveTo(0, strokeW * 0.95, span, -strokeW * 0.28);
     lg.stroke();
+    lg.restore();
     return {
       assetId: `mouth_closed_v1`,
       region: "mouth",
-      recipeVersion: 1,
+      recipeVersion: 2,
       hidesPartIds,
       layers: [
         canvasToLayer("mouth_sub_skin", skinCanvas, bounds, hidesPartIds),
@@ -763,62 +585,68 @@ function buildMouthSubstituteAsset(
     };
   }
 
-  // Layer 2: Vowel mouth interior cavity + teeth + tongue
+  // Layer 2: Compact HeadFrame-aligned illustration mouth cavity + soft teeth + dome tongue
   const innerCanvas = canvas(bounds.width, bounds.height);
   const ig = innerCanvas.getContext("2d")!;
-
+  const sizeMul = hasLipBlob
+    ? clamp((lipMaxU - lipMinU) / Math.max(8, eyeDist * 0.18), 0.78, 1.12)
+    : 1;
   const rxMap = {
-    a: eyeDist * (isSd ? 0.14 : 0.17),
-    i: eyeDist * (isSd ? 0.17 : 0.21),
-    u: eyeDist * (isSd ? 0.068 : 0.088),
-    e: eyeDist * (isSd ? 0.155 : 0.19),
-    o: eyeDist * (isSd ? 0.095 : 0.115),
+    a: eyeDist * (isSd ? 0.105 : 0.13) * sizeMul,
+    i: eyeDist * (isSd ? 0.13 : 0.16) * sizeMul,
+    u: eyeDist * (isSd ? 0.052 : 0.068) * sizeMul,
+    e: eyeDist * (isSd ? 0.118 : 0.145) * sizeMul,
+    o: eyeDist * (isSd ? 0.074 : 0.092) * sizeMul,
   };
   const ryTopMap = {
-    a: headH * 0.025,
-    i: headH * 0.022,
-    u: headH * 0.028,
-    e: headH * 0.022,
-    o: headH * 0.045,
+    a: headH * 0.017,
+    i: headH * 0.015,
+    u: headH * 0.019,
+    e: headH * 0.015,
+    o: headH * 0.03,
   };
   const ryBotMap = {
-    a: headH * (isSd ? 0.068 : 0.072),
-    i: headH * (isSd ? 0.032 : 0.036),
-    u: headH * (isSd ? 0.038 : 0.042),
-    e: headH * (isSd ? 0.048 : 0.052),
-    o: headH * (isSd ? 0.065 : 0.072),
+    a: headH * (isSd ? 0.044 : 0.05),
+    i: headH * (isSd ? 0.024 : 0.028),
+    u: headH * (isSd ? 0.028 : 0.032),
+    e: headH * (isSd ? 0.034 : 0.039),
+    o: headH * (isSd ? 0.046 : 0.052),
   };
   const rx = Math.max(3, rxMap[kind]);
-  const topY = cy - Math.max(1.5, ryTopMap[kind]);
-  const botY = cy + Math.max(2.5, ryBotMap[kind]);
+  const topY = -Math.max(1.2, ryTopMap[kind]);
+  const botY = Math.max(2.0, ryBotMap[kind]);
 
   const traceMouthCavity = (g: CanvasRenderingContext2D) => {
     g.beginPath();
     if (kind === "u" || kind === "o") {
       const midY = (topY + botY) * 0.5;
       const rY = (botY - topY) * 0.52;
-      g.ellipse(cx, midY, rx, rY, 0, 0, Math.PI * 2);
+      g.ellipse(0, midY, rx, rY, 0, 0, Math.PI * 2);
     } else if (kind === "i") {
-      g.moveTo(cx - rx, topY + 0.5);
-      g.quadraticCurveTo(cx, topY + 2.2, cx + rx, topY + 0.5);
-      g.quadraticCurveTo(cx, botY + 1.5, cx - rx, topY + 0.5);
+      g.moveTo(-rx, topY + 0.4);
+      g.quadraticCurveTo(0, topY + 1.8, rx, topY + 0.4);
+      g.quadraticCurveTo(0, botY + 1.2, -rx, topY + 0.4);
     } else {
       const cornerY = topY + (botY - topY) * 0.18;
-      g.moveTo(cx - rx, cornerY);
-      g.quadraticCurveTo(cx, topY - (botY - topY) * 0.16, cx + rx, cornerY);
-      g.quadraticCurveTo(cx, botY + (botY - topY) * 0.24, cx - rx, cornerY);
+      g.moveTo(-rx, cornerY);
+      g.quadraticCurveTo(0, topY - (botY - topY) * 0.14, rx, cornerY);
+      g.quadraticCurveTo(0, botY + (botY - topY) * 0.22, -rx, cornerY);
     }
     g.closePath();
   };
 
-  // Paint interior cavity
   ig.save();
+  ig.translate(cx, cy);
+  ig.rotate(tiltRad);
   traceMouthCavity(ig);
-  ig.fillStyle = "#6e2938";
+  const grad = ig.createLinearGradient(0, topY, 0, botY);
+  grad.addColorStop(0, "#4f1c28");
+  grad.addColorStop(1, "#7b2d3e");
+  ig.fillStyle = grad;
   ig.fill();
   ig.clip();
 
-  // Tongue dome inside lower mouth
+  // Tongue dome inside lower cavity
   ig.fillStyle = rgbCss(
     [
       Math.round((colors.rose[0] + 235) * 0.5),
@@ -827,37 +655,41 @@ function buildMouthSubstituteAsset(
     ],
   );
   ig.beginPath();
-  ig.ellipse(
-    cx,
-    botY + (botY - topY) * 0.08,
-    rx * 0.78,
-    (botY - topY) * 0.52,
-    0,
-    Math.PI,
-    Math.PI * 2,
-  );
+  ig.ellipse(0, botY + (botY - topY) * 0.08, rx * 0.74, (botY - topY) * 0.5, 0, Math.PI, Math.PI * 2);
   ig.fill();
 
-  // Upper teeth bar for open articulated vowels (A / I / E / O)
+  // Subtle curved upper teeth highlight
   if (kind === "i" || kind === "a" || kind === "e") {
-    ig.fillStyle = "#fff8f7";
-    const teethH = (botY - topY) * (kind === "i" ? 0.52 : 0.28);
-    ig.fillRect(cx - rx * 0.88, topY - 1, rx * 1.76, teethH);
+    ig.fillStyle = "rgba(255, 248, 246, 0.92)";
+    const teethH = (botY - topY) * (kind === "i" ? 0.46 : 0.24);
+    ig.beginPath();
+    ig.ellipse(0, topY, rx * 0.88, teethH, 0, 0, Math.PI);
+    ig.fill();
   }
   ig.restore();
 
-  // Layer 3: Lip ink border hugging the cavity
+  // Layer 3: Rotated anime lip ink outline + subtle lower lip shadow hint
+  lg.save();
+  lg.translate(cx, cy);
+  lg.rotate(tiltRad);
   lg.strokeStyle = rgbCss(colors.ink);
   lg.lineWidth = strokeW;
   lg.lineJoin = "round";
   lg.lineCap = "round";
   traceMouthCavity(lg);
   lg.stroke();
+  lg.strokeStyle = rgbCss(colors.ink, 0.28);
+  lg.lineWidth = Math.max(0.8, strokeW * 0.55);
+  lg.beginPath();
+  lg.moveTo(-rx * 0.35, botY + strokeW * 1.4);
+  lg.quadraticCurveTo(0, botY + strokeW * 1.9, rx * 0.35, botY + strokeW * 1.4);
+  lg.stroke();
+  lg.restore();
 
   return {
     assetId: `mouth_${kind}_v1`,
     region: "mouth",
-    recipeVersion: 1,
+    recipeVersion: 2,
     hidesPartIds,
     layers: [
       canvasToLayer("mouth_sub_skin", skinCanvas, bounds, hidesPartIds),
@@ -868,8 +700,8 @@ function buildMouthSubstituteAsset(
 }
 
 /**
- * Generates or refreshes per-character LD/SD shape substitute assets (`closed`/`smiling` eyes and
- * `closed`/`a`/`i`/`u`/`e`/`o` mouths) and links them onto built-in `ShapePreset` entries.
+ * Generates or refreshes HeadFrame-aligned mouth substitute assets while keeping eye expressions
+ * driven natively by real upper-eyelid mesh curves (`^` smile and downward `u` sad).
  */
 export function synthesizeShapeAssetsForProject(
   project: Project,
@@ -879,16 +711,17 @@ export function synthesizeShapeAssetsForProject(
   const existingAssets = { ...(project.shapeAssets ?? {}) };
   const presetAssetAssignments = new Map<string, { asset: ShapeSubstituteAsset; region: ShapeRegion }>();
 
-  const eyeKinds: ("closed" | "smiling")[] = ["closed", "smiling"];
-  for (const region of ["eye_L", "eye_R"] as const) {
-    for (const kind of eyeKinds) {
-      const presetId = `${region}_${kind}`;
-      const preset = project.shapePresets.find((s) => s.id === presetId);
-      if (!preset) continue;
-      if (!forceRegenerate && preset.assetId && existingAssets[preset.assetId]) continue;
-      const asset = buildEyeSubstituteAsset(project, sourcePixels, region, kind);
-      existingAssets[asset.assetId] = asset;
-      presetAssetAssignments.set(presetId, { asset, region });
+  // Remove stale synthetic eye sticker links/assets on regeneration so real upper lashes drive blink/smile/sad.
+  let clearedEyeLinks = false;
+  if (forceRegenerate) {
+    for (const side of ["L", "R"] as const) {
+      for (const kind of ["closed", "smiling"] as const) {
+        const sid = `eye_${side}_${kind}_v1`;
+        if (existingAssets[sid]) {
+          delete existingAssets[sid];
+          clearedEyeLinks = true;
+        }
+      }
     }
   }
 
@@ -910,14 +743,35 @@ export function synthesizeShapeAssetsForProject(
     presetAssetAssignments.set(presetId, { asset, region: "mouth" });
   }
 
-  if (presetAssetAssignments.size === 0) return project;
+  const hasSyntheticEyeLink = project.shapePresets.some(
+    (p) =>
+      (p.region === "eye_L" || p.region === "eye_R") &&
+      !!p.assetId &&
+      /^eye_[LR]_(closed|smiling)_v1$/.test(p.assetId) &&
+      (forceRegenerate || !existingAssets[p.assetId]),
+  );
+
+  if (presetAssetAssignments.size === 0 && !clearedEyeLinks && !hasSyntheticEyeLink) {
+    return project;
+  }
 
   return {
     ...project,
     shapeAssets: existingAssets,
     shapePresets: project.shapePresets.map((preset) => {
       const assigned = presetAssetAssignments.get(preset.id);
-      return assigned ? { ...preset, assetId: assigned.asset.assetId } : preset;
+      if (assigned) return { ...preset, assetId: assigned.asset.assetId };
+      if (
+        (preset.region === "eye_L" || preset.region === "eye_R") &&
+        preset.assetId &&
+        /^eye_[LR]_(closed|smiling)_v1$/.test(preset.assetId) &&
+        (forceRegenerate || !existingAssets[preset.assetId])
+      ) {
+        const next = { ...preset };
+        delete next.assetId;
+        return next;
+      }
+      return preset;
     }),
   };
 }

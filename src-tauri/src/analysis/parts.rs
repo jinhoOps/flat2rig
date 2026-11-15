@@ -5,7 +5,10 @@ use super::segmentation::{
     SAM_PREPROCESS_VERSION,
 };
 use super::state::{hash_rgba_bytes, AnalysisState, SamEmbeddingCache};
-use super::templates::{synthesize_template_bank, StyleMatchReport, TemplateStyleSelection};
+use super::templates::{
+    normalize_pipeline_stage, stage_includes_layer, synthesize_template_bank_for_stage,
+    StyleMatchReport, TemplateStyleSelection,
+};
 use crate::core::{self, HeadFrame, Landmarks, IDS};
 use crate::inference;
 use glam::DVec2;
@@ -2401,6 +2404,41 @@ pub fn propose_parts_with_sam_with_template(
     template_mode: bool,
     style_overrides: Option<&TemplateStyleSelection>,
 ) -> Result<PartsProposalOutput, String> {
+    propose_parts_with_sam_with_template_stage(
+        state,
+        rgba,
+        w,
+        h,
+        landmarks,
+        points_28,
+        face_bbox,
+        tolerance,
+        u2net_path,
+        detail_mode,
+        hair_split,
+        template_mode,
+        style_overrides,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_parts_with_sam_with_template_stage(
+    state: &AnalysisState,
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    landmarks: &Landmarks,
+    points_28: &[Landmark28Point],
+    face_bbox: Option<[f64; 4]>,
+    tolerance: f64,
+    u2net_path: Option<&str>,
+    detail_mode: &str,
+    hair_split: bool,
+    template_mode: bool,
+    style_overrides: Option<&TemplateStyleSelection>,
+    pipeline_stage: Option<&str>,
+) -> Result<PartsProposalOutput, String> {
     let image_hash = hash_rgba_bytes(rgba, w, h);
 
     // 1. Background removal: explicit u2net_path -> registered Background role -> border flood / alpha.
@@ -2995,9 +3033,13 @@ pub fn propose_parts_with_sam_with_template(
             .unwrap_or(0)
     };
 
-    let eye_rx = eye_dist * 0.24;
-    let eye_ry = eye_dist * 0.15;
-    let hh = (landmarks.chin.y - landmarks.crown.y).max(eye_dist * 1.4);
+    let hf = crate::core::HeadFrame::from_landmarks(landmarks, w, h);
+    let eye_rx = hf.eye_dist * 0.24;
+    let eye_ry = hf.eye_dist * 0.15;
+    let hh = hf.hh;
+    let (er_u, er_v) = hf.to_local(glam::DVec2::new(landmarks.eye_r.x, landmarks.eye_r.y));
+    let (el_u, el_v) = hf.to_local(glam::DVec2::new(landmarks.eye_l.x, landmarks.eye_l.y));
+    let (mouth_u, mouth_v) = hf.to_local(glam::DVec2::new(landmarks.mouth.x, landmarks.mouth.y));
     let neck_skin_rgb = sample_patch_rgb(
         rgba,
         w,
@@ -3062,32 +3104,33 @@ pub fn propose_parts_with_sam_with_template(
             let pb = rgba[i * 4 + 2] as f64;
             let px_luma = 0.299 * pr + 0.587 * pg + 0.114 * pb;
             let px_chroma = pr.max(pg).max(pb) - pr.min(pg).min(pb);
+            let (pu, pv) = hf.to_local(glam::DVec2::new(fx, fy));
             let bang_match = in_hair
                 && px_luma > 76.0
                 && hair_p_d < 28.0
                 && hair_p_d + 8.0 < skin_d;
-            let bang_over_eye_r = bang_match && fy <= landmarks.eye_r.y - eye_ry * 0.82;
-            let bang_over_eye_l = bang_match && fy <= landmarks.eye_l.y - eye_ry * 0.82;
-            let bang_over_brow = bang_match && fy <= landmarks.eye_r.y.max(landmarks.eye_l.y);
+            let bang_over_eye_r = bang_match && pv <= er_v - eye_ry * 0.82;
+            let bang_over_eye_l = bang_match && pv <= el_v - eye_ry * 0.82;
+            let bang_over_brow = bang_match && pv <= er_v.max(el_v);
 
             let classify_eye_sam_part =
-                |dx: f64, dy: f64, is_left: bool| -> &'static str {
-                    let iris_rn = (dx / (eye_rx * 0.72).max(2.0))
-                        .hypot(dy / (eye_ry * 0.92).max(2.0));
+                |du: f64, dv: f64, is_left: bool| -> &'static str {
+                    let iris_rn = (du / (eye_rx * 0.72).max(2.0))
+                        .hypot(dv / (eye_ry * 0.92).max(2.0));
                     let is_upper_iris = iris_rn <= 0.98
-                        && dy >= -eye_ry * 0.72
+                        && dv >= -eye_ry * 0.72
                         && (px_luma >= 205.0
                             || (px_chroma >= 14.0 && px_luma >= 66.0));
                     let is_lower_iris = iris_rn <= 0.88
-                        && dy <= eye_ry * 0.72
+                        && dv <= eye_ry * 0.72
                         && px_chroma >= 16.0
                         && px_luma >= 66.0;
-                    if dy < -eye_ry * 0.48 && !is_upper_iris {
+                    if dv < -eye_ry * 0.48 && !is_upper_iris {
                         if is_left { "eyeL_upper" } else { "eyeR_upper" }
-                    } else if dy > eye_ry * 0.60 && !is_lower_iris {
+                    } else if dv > eye_ry * 0.60 && !is_lower_iris {
                         if is_left { "eyeL_lower" } else { "eyeR_lower" }
                     } else if iris_rn <= 1.0
-                        && !(px_luma >= 220.0 && px_chroma < 16.0 && dx.abs() >= eye_rx * 0.48)
+                        && !(px_luma >= 220.0 && px_chroma < 16.0 && du.abs() >= eye_rx * 0.48)
                     {
                         if is_left { "eyeL_iris" } else { "eyeR_iris" }
                     } else {
@@ -3096,22 +3139,19 @@ pub fn propose_parts_with_sam_with_template(
                 };
 
             if !bang_over_eye_r && sam_masks.get("eyeR_all").is_some_and(|(m, _)| m[i] > 128) {
-                let dx = fx - landmarks.eye_r.x;
-                let dy = fy - landmarks.eye_r.y;
-                chosen = Some(classify_eye_sam_part(dx, dy, false));
+                chosen = Some(classify_eye_sam_part(pu - er_u, pv - er_v, false));
             } else if !bang_over_eye_l && sam_masks.get("eyeL_all").is_some_and(|(m, _)| m[i] > 128) {
-                let dx = fx - landmarks.eye_l.x;
-                let dy = fy - landmarks.eye_l.y;
-                chosen = Some(classify_eye_sam_part(dx, dy, true));
+                chosen = Some(classify_eye_sam_part(pu - el_u, pv - el_v, true));
             } else if !bang_over_brow && sam_masks.get("browR").is_some_and(|(m, _)| m[i] > 128) {
                 chosen = Some("browR");
             } else if !bang_over_brow && sam_masks.get("browL").is_some_and(|(m, _)| m[i] > 128) {
                 chosen = Some("browL");
             } else if sam_masks.get("mouth_all").is_some_and(|(m, _)| m[i] > 128) {
-                let dy = fy - landmarks.mouth.y;
-                if dy < -eye_dist * 0.018 {
+                let dm_v = pv - mouth_v;
+                let _ = mouth_u;
+                if dm_v < -hf.eye_dist * 0.015 {
                     chosen = Some("mouth_upper");
-                } else if dy > eye_dist * 0.018 {
+                } else if dm_v > hf.eye_dist * 0.015 {
                     chosen = Some("mouth_lower");
                 } else {
                     chosen = Some("mouth_inner");
@@ -3309,6 +3349,7 @@ pub fn propose_parts_with_sam_with_template(
             "sam-hybrid-partition-v1"
         },
         image_hash,
+        pipeline_stage,
     )
 }
 
@@ -3402,6 +3443,7 @@ fn finalize_part_proposal(
     model_hashes: HashMap<String, String>,
     postprocess_version: &str,
     image_hash: String,
+    pipeline_stage: Option<&str>,
 ) -> Result<PartsProposalOutput, String> {
     let n = w * h;
     let id_index: HashMap<&str, usize> = IDS.iter().enumerate().map(|(i, &id)| (id, i)).collect();
@@ -3616,14 +3658,17 @@ fn finalize_part_proposal(
     let mut style_match: Option<StyleMatchReport> = None;
     let mut effective_postprocess = postprocess_version.to_string();
 
+    let stage = normalize_pipeline_stage(pipeline_stage.unwrap_or("full"));
+
     if (template_mode
+        || stage != "full"
         || style_overrides.is_some_and(crate::analysis::templates::has_explicit_style_override))
         && detail_mode == "detail"
         && w.max(h) >= 200
     {
         let default_sel = TemplateStyleSelection::default();
         let sel = style_overrides.unwrap_or(&default_sel);
-        let tpl = synthesize_template_bank(
+        let tpl = synthesize_template_bank_for_stage(
             rgba,
             w,
             h,
@@ -3634,6 +3679,7 @@ fn finalize_part_proposal(
             &final_provenances,
             &final_confidences,
             sel,
+            stage,
         );
         final_ids = tpl.part_ids;
         final_masks = tpl.masks;
@@ -3648,6 +3694,20 @@ fn finalize_part_proposal(
         textures = tpl.textures;
         style_match = Some(tpl.style_match);
         effective_postprocess = "template-hybrid-v2".to_string();
+    } else if stage != "full" {
+        let mut keep_idx = Vec::with_capacity(final_ids.len());
+        for (idx, id) in final_ids.iter().enumerate() {
+            if stage_includes_layer(id, stage) {
+                keep_idx.push(idx);
+            }
+        }
+        final_ids = keep_idx.iter().map(|&i| final_ids[i].clone()).collect();
+        final_masks = keep_idx.iter().map(|&i| final_masks[i].clone()).collect();
+        final_provenances = keep_idx.iter().map(|&i| final_provenances[i].clone()).collect();
+        final_confidences = keep_idx.iter().map(|&i| final_confidences[i]).collect();
+        fill_masks = keep_idx.iter().map(|&i| fill_masks[i].clone()).collect();
+        fill_kinds = keep_idx.iter().map(|&i| fill_kinds[i].clone()).collect();
+        textures = keep_idx.iter().map(|&i| textures[i].clone()).collect();
     }
 
     let eye_r_cx = final_ids
@@ -3773,6 +3833,41 @@ pub fn propose_parts_auto_with_template(
     template_mode: bool,
     style_overrides: Option<&TemplateStyleSelection>,
 ) -> Result<PartsProposalOutput, String> {
+    propose_parts_auto_with_template_stage(
+        state,
+        rgba,
+        w,
+        h,
+        landmarks,
+        points_28,
+        face_bbox,
+        tolerance,
+        u2net_path,
+        detail_mode,
+        hair_split,
+        template_mode,
+        style_overrides,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_parts_auto_with_template_stage(
+    state: &AnalysisState,
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    landmarks: &Landmarks,
+    points_28: &[Landmark28Point],
+    face_bbox: Option<[f64; 4]>,
+    tolerance: f64,
+    u2net_path: Option<&str>,
+    detail_mode: &str,
+    hair_split: bool,
+    template_mode: bool,
+    style_overrides: Option<&TemplateStyleSelection>,
+    pipeline_stage: Option<&str>,
+) -> Result<PartsProposalOutput, String> {
     let has_sam = {
         let reg = state
             .registry
@@ -3782,7 +3877,7 @@ pub fn propose_parts_auto_with_template(
             && reg.resolve_path(ModelRole::PartDecoder).is_some()
     };
     if has_sam {
-        if let Ok(sam_out) = propose_parts_with_sam_with_template(
+        if let Ok(sam_out) = propose_parts_with_sam_with_template_stage(
             state,
             rgba,
             w,
@@ -3796,6 +3891,7 @@ pub fn propose_parts_auto_with_template(
             hair_split,
             template_mode,
             style_overrides,
+            pipeline_stage,
         ) {
             return Ok(sam_out);
         }
@@ -3844,6 +3940,7 @@ pub fn propose_parts_auto_with_template(
         model_hashes,
         "geometry-template-v1",
         image_hash,
+        pipeline_stage,
     )
 }
 
@@ -3905,6 +4002,51 @@ pub fn refine_part_with_prompts(
         for i in 0..(w * h) {
             full_mask[i] = if full_mask[i] > 128 { fg[i] } else { 0 };
         }
+        // Strip isolated MobileSAM micro-specks (< 20px) containing no positive click prompt
+        // so manual click refinements never leave fragmented edge noise.
+        let n_px = w * h;
+        let mut seen = vec![false; n_px];
+        let mut q = VecDeque::new();
+        for start in 0..n_px {
+            if seen[start] || full_mask[start] == 0 {
+                continue;
+            }
+            seen[start] = true;
+            q.push_back(start);
+            let mut comp = Vec::new();
+            let mut has_pos = false;
+            while let Some(cur) = q.pop_front() {
+                comp.push(cur);
+                let cx = cur % w;
+                let cy = cur / w;
+                if !has_pos {
+                    has_pos = prompts.iter().any(|p| {
+                        p.label > 0
+                            && (p.x - cx as f64).abs() <= 2.5
+                            && (p.y - cy as f64).abs() <= 2.5
+                    });
+                }
+                for nb in [
+                    (cx > 0).then(|| cur - 1),
+                    (cx + 1 < w).then(|| cur + 1),
+                    (cy > 0).then(|| cur - w),
+                    (cy + 1 < h).then(|| cur + w),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !seen[nb] && full_mask[nb] > 0 {
+                        seen[nb] = true;
+                        q.push_back(nb);
+                    }
+                }
+            }
+            if !has_pos && comp.len() < 20 {
+                for idx in comp {
+                    full_mask[idx] = 0;
+                }
+            }
+        }
         let iou = dec.iou_scores[slot];
         let (pixel_count, diagnostics) =
             diagnose_part_mask(part_id, &full_mask, rgba, w, h, iou as f64);
@@ -3917,12 +4059,176 @@ pub fn refine_part_with_prompts(
         });
     }
 
+    let best_index =
+        select_best_prompt_candidate(part_id, &candidates, prompts, &fg, w, h, dec.best_idx);
+
     Ok(RefinePromptOutput {
         part_id: part_id.to_string(),
-        best_index: dec.best_idx,
+        best_index,
         candidates,
         used_face_crop: all_in_crop,
         decoder_sha256: dec.decoder_sha256,
         encoder_sha256: cache.model_hash,
     })
+}
+
+fn max_prompt_area_ratio(part_id: &str) -> f64 {
+    if part_id.starts_with("eye") || part_id.starts_with("brow") || part_id.starts_with("mouth") {
+        0.18
+    } else if part_id.starts_with("hair_front")
+        || part_id.starts_with("hair_side")
+        || part_id.starts_with("acc_")
+        || part_id == "face"
+        || part_id == "neck"
+    {
+        0.65
+    } else {
+        0.94
+    }
+}
+
+fn point_in_mask_radius(mask: &[u8], w: usize, h: usize, px: f64, py: f64, radius: i32) -> bool {
+    let cx = px.round() as i32;
+    let cy = py.round() as i32;
+    for dy in -radius..=radius {
+        let yy = cy + dy;
+        if yy < 0 || yy >= h as i32 {
+            continue;
+        }
+        for dx in -radius..=radius {
+            let xx = cx + dx;
+            if xx < 0 || xx >= w as i32 {
+                continue;
+            }
+            if mask[yy as usize * w + xx as usize] > 128 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Prefer MobileSAM candidate slot 1 (UI candidate #2) when plausible within part area budget
+/// and prompt constraints, avoiding oversized whole-head slot 2/3 masks winning raw IoU.
+fn select_best_prompt_candidate(
+    part_id: &str,
+    candidates: &[PromptCandidateMask],
+    prompts: &[PromptInput],
+    fg: &[u8],
+    w: usize,
+    h: usize,
+    fallback_best: usize,
+) -> usize {
+    if candidates.is_empty() {
+        return fallback_best;
+    }
+    let fg_pixels = fg.iter().filter(|&&v| v > 128).count().max(1);
+    let min_px = 16usize.min(fg_pixels);
+    let max_ratio = max_prompt_area_ratio(part_id);
+    let pos_count = prompts.iter().filter(|p| p.label > 0).count();
+
+    let mut best_slot = candidates[0].index;
+    let mut best_score = f64::NEG_INFINITY;
+
+    for c in candidates {
+        let ratio = c.pixel_count as f64 / fg_pixels as f64;
+        let in_budget = c.pixel_count >= min_px && ratio <= max_ratio;
+        let mut pos_hits = 0usize;
+        let mut neg_hits = 0usize;
+        for p in prompts {
+            let hit = point_in_mask_radius(&c.mask, w, h, p.x, p.y, 2);
+            if p.label > 0 {
+                if hit {
+                    pos_hits += 1;
+                }
+            } else if hit {
+                neg_hits += 1;
+            }
+        }
+
+        let mut score = (c.iou_score as f64).clamp(0.0, 1.0);
+        if pos_count > 0 {
+            score += 2.0 * (pos_hits as f64 / pos_count as f64);
+            if pos_hits == 0 {
+                score -= 1.5;
+            }
+        }
+        score -= 2.5 * (neg_hits as f64);
+        if !in_budget {
+            score -= 1.6;
+        }
+        if c.index == 1 && in_budget && (pos_count == 0 || pos_hits > 0) {
+            // MobileSAM slot 1 ("후보 #2") isolates crisp local sub-parts best on anime faces.
+            score += 0.35;
+        }
+        if score > best_score {
+            best_score = score;
+            best_slot = c.index;
+        }
+    }
+    best_slot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_selector_prefers_candidate_2_over_oversized_higher_iou() {
+        let w = 100usize;
+        let h = 100usize;
+        let fg = vec![255u8; w * h];
+        let mut slot0 = vec![0u8; w * h];
+        let mut slot1 = vec![0u8; w * h];
+        let slot2 = vec![255u8; w * h]; // 100% fg: oversized whole-head mask
+        let mut slot3 = vec![0u8; w * h];
+        for y in 20..30 {
+            for x in 20..35 {
+                slot0[y * w + x] = 255;
+                slot1[y * w + x] = 255;
+            }
+        }
+        for y in 15..55 {
+            for x in 10..60 {
+                slot3[y * w + x] = 255;
+            }
+        }
+        let candidates = vec![
+            PromptCandidateMask {
+                index: 0,
+                iou_score: 0.72,
+                pixel_count: 150,
+                mask: slot0,
+                diagnostics: vec![],
+            },
+            PromptCandidateMask {
+                index: 1,
+                iou_score: 0.85,
+                pixel_count: 150,
+                mask: slot1,
+                diagnostics: vec![],
+            },
+            PromptCandidateMask {
+                index: 2,
+                iou_score: 0.94,
+                pixel_count: w * h,
+                mask: slot2,
+                diagnostics: vec![],
+            },
+            PromptCandidateMask {
+                index: 3,
+                iou_score: 0.89,
+                pixel_count: 2000,
+                mask: slot3,
+                diagnostics: vec![],
+            },
+        ];
+        let prompts = vec![PromptInput {
+            x: 25.0,
+            y: 25.0,
+            label: 1,
+        }];
+        let chosen = select_best_prompt_candidate("eyeL_upper", &candidates, &prompts, &fg, w, h, 2);
+        assert_eq!(chosen, 1);
+    }
 }

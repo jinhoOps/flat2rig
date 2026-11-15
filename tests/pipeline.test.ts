@@ -4,6 +4,7 @@ import { initializeCanvas, readPsd } from "ag-psd";
 import { strFromU8, unzipSync, zipSync, strToU8 } from "fflate";
 import {
   checkMeshQuality,
+  cleanSubtractedSiblingMask,
   compositePartTexture,
   deform,
   defaultLandmarks,
@@ -21,18 +22,26 @@ import {
   exportPsd,
   insertHairPartInOrder,
   loadProject,
+  isHairStageLayer,
   mergePreservedParts,
+  mergeStage2HairParts,
+  mergeStageParts,
   newDynamicPart,
   newHairPart,
   parseCsv,
+  partPipelineStage,
   readCsvTemplate,
   saveProject,
+  stageIncludesLayer,
 } from "../src/io";
 import {
   createDefaultProjectRigState,
   DEFAULT_MOUTH_HANDLES,
+  describeDynamicPart,
+  inferPartRole,
   PARAM_DEFS,
   REST,
+  type Landmarks,
   type Project,
 } from "../src/types";
 import {
@@ -772,7 +781,7 @@ describe("preserved part merging on regeneration", () => {
   it("keeps closed eye_upper lids monotonic without outer corner droop onto cheek", () => {
     const lm = defaultLandmarks(64, 64);
     const dist = Math.hypot(lm.eyeL.x - lm.eyeR.x, lm.eyeL.y - lm.eyeR.y);
-    const anchor = { x: lm.eyeL.x, y: lm.eyeL.y - dist * 0.34 };
+    const anchor = { x: lm.eyeL.x, y: lm.eyeL.y - dist * 0.45 };
     const lashPeak = { x: lm.eyeL.x, y: lm.eyeL.y - dist * 0.16 };
     const cornerTip = { x: lm.eyeL.x + dist * 0.22, y: lm.eyeL.y - dist * 0.02 };
 
@@ -1072,7 +1081,7 @@ describe("preserved part merging on regeneration", () => {
     expect(changedPx).toBeGreaterThan(15);
   });
 
-  it("synthesizes distinct T3 eye and T4 mouth shape assets, preserves across ZIP round-trip, and handles blink/interior alpha", async () => {
+  it("synthesizes HeadFrame mouth shape assets, drives blink/smile/sad via real upper eyelid mesh, and round-trips ZIP", async () => {
     const width = 128;
     const height = 128;
     const landmarks = defaultLandmarks(width, height);
@@ -1082,7 +1091,7 @@ describe("preserved part merging on regeneration", () => {
     ctx.fillRect(16, 6, 96, 118);
     ctx.fillStyle = "#f9dcd0";
     ctx.fillRect(32, 18, 64, 54);
-    // Draw distinct irises & mouth right at landmarks so T3/T4 covers and vowel shapes differ clearly
+    // Draw distinct irises, real dark upper lash arcs, & mouth right at landmarks
     for (const pt of [landmarks.eyeR, landmarks.eyeL]) {
       ctx.fillStyle = "#ffffff";
       ctx.beginPath();
@@ -1092,6 +1101,12 @@ describe("preserved part merging on regeneration", () => {
       ctx.beginPath();
       ctx.arc(pt.x, pt.y, 4.5, 0, Math.PI * 2);
       ctx.fill();
+      ctx.strokeStyle = "#1f1524";
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.moveTo(pt.x - 8, pt.y - 4);
+      ctx.quadraticCurveTo(pt.x, pt.y - 7, pt.x + 8, pt.y - 4);
+      ctx.stroke();
     }
     ctx.fillStyle = "#c95b6b";
     ctx.fillRect(landmarks.mouth.x - 6, landmarks.mouth.y - 2, 12, 4);
@@ -1128,10 +1143,6 @@ describe("preserved part merging on regeneration", () => {
 
     const synth = synthesizeShapeAssetsForProject(base, data, true);
     const expectedAssetIds = [
-      "eye_L_closed_v1",
-      "eye_L_smiling_v1",
-      "eye_R_closed_v1",
-      "eye_R_smiling_v1",
       "mouth_closed_v1",
       "mouth_a_v1",
       "mouth_i_v1",
@@ -1147,6 +1158,11 @@ describe("preserved part merging on regeneration", () => {
         expect(layer.pngBytes?.length ?? 0).toBeGreaterThan(20);
       }
     }
+    // Eye closed/smiling presets stay driven by real upper eyelid meshes (no synthetic sticker replacement)
+    expect(synth.shapeAssets?.["eye_L_closed_v1"]).toBeUndefined();
+    expect(synth.shapeAssets?.["eye_L_smiling_v1"]).toBeUndefined();
+    expect(synth.shapePresets.find((s) => s.id === "eye_L_closed")?.assetId).toBeUndefined();
+    expect(synth.shapePresets.find((s) => s.id === "eye_L_smiling")?.assetId).toBeUndefined();
 
     // ZIP save/load round-trip preserves shapeAssets and preset assetId links
     const reloaded = await loadProject(await saveProject(synth));
@@ -1232,7 +1248,7 @@ describe("preserved part merging on regeneration", () => {
       }
     }
 
-    // Auto-blink swaps eye_L to closed asset when pulse drops eyeL <= 0.22
+    // Auto-blink animates real upper lid + fades sclera/iris/lower alpha cleanly when eyeL <= 0.22
     const autoBlinkProj: Project = {
       ...reloaded,
       playback: { ...reloaded.playback, autoBlink: true, blinkIntervalSec: 3.6, autoBreath: false, autoIdle: false },
@@ -1243,7 +1259,51 @@ describe("preserved part merging on regeneration", () => {
       playing: true,
     });
     expect(blinkEval.parameters.eyeL).toBeLessThanOrEqual(0.22);
-    expect(blinkEval.activeShapes.eye_L?.assetId).toBe("eye_L_closed_v1");
+    expect(blinkEval.hiddenBasePartIds.has("eyeL_upper")).toBe(false);
+    expect(blinkEval.eyeLowerAlpha.L).toBeLessThan(0.25);
+
+    // Sad expression uses closed eye + negative upperCurveDelta (u curve), Smile uses positive ^ arch
+    const sadEval = evaluateRigFrame({
+      project: selectExpressionPreset(reloaded, "sad"),
+      deterministic: true,
+    });
+    expect(sadEval.parameters.eyeL).toBe(0);
+    expect(sadEval.eyeWhiteAlpha.L).toBe(0);
+    expect(sadEval.eyeIrisAlpha.L).toBe(0);
+    expect(sadEval.shapeDeform.eyeL?.upperCurveDelta ?? 0).toBeLessThan(-0.8);
+
+    const smileEval = evaluateRigFrame({
+      project: selectExpressionPreset(reloaded, "smile"),
+      deterministic: true,
+    });
+    expect(smileEval.parameters.eyeL).toBe(0);
+    expect(smileEval.parameters.eyeLSmile).toBeGreaterThan(0.8);
+    expect(smileEval.hiddenBasePartIds.has("eyeL_upper")).toBe(false);
+
+    // Tilted HeadFrame deform in TS keeps ^ smile above u sad on rotated portrait faces
+    const tiltLm: Landmarks = {
+      eyeR: { x: 40, y: 36 },
+      eyeL: { x: 80, y: 44 },
+      mouth: { x: 56, y: 66 },
+      chin: { x: 54, y: 84 },
+      crown: { x: 68, y: 8 },
+    };
+    const tipPt = { x: landmarks.eyeL.x, y: landmarks.eyeL.y };
+    const smileTip = deform(
+      tipPt,
+      { id: "eyeL_upper" },
+      tiltLm,
+      smileEval.parameters,
+      smileEval.shapeDeform,
+    );
+    const sadTip = deform(
+      tipPt,
+      { id: "eyeL_upper" },
+      tiltLm,
+      sadEval.parameters,
+      sadEval.shapeDeform,
+    );
+    expect(smileTip.y).toBeLessThan(sadTip.y);
 
     // DEFAULT_MOUTH_HANDLES reveals mouthInteriorAlpha only when mouth opens (> 0.03), 0 at rest / mouth_closed
     expect(DEFAULT_MOUTH_HANDLES.interiorVisibility).toBe(1);
@@ -1287,5 +1347,409 @@ describe("preserved part merging on regeneration", () => {
       .getContext("2d")
       .getImageData(0, 0, width, height).data;
     expect(diffCount(a, b)).toBe(0);
+  });
+
+  it("cleanSubtractedSiblingMask strips 1px AA halos and tiny seam rings without deleting distant curls", () => {
+    const w = 64;
+    const h = 64;
+    const sibling = new Uint8Array(w * h);
+    const claimed = new Uint8Array(w * h);
+
+    // Main hair_front island on left (18x20 = 360px)
+    for (let y = 4; y < 24; y++) {
+      for (let x = 4; x < 22; x++) sibling[y * w + x] = 255;
+    }
+    // Claimed hair_side_L overlaps x=[16..34), y=[6..24) with soft AA perimeter at x=15
+    for (let y = 6; y < 24; y++) {
+      for (let x = 16; x < 34; x++) claimed[y * w + x] = 255;
+      sibling[y * w + 15] = 100; // AA fringe next to claimed boundary
+    }
+    // Thin detached 2x10 (20px) sliver left behind at right side touching claimed border (x=34..35)
+    for (let y = 10; y < 20; y++) {
+      sibling[y * w + 34] = 240;
+      sibling[y * w + 35] = 240;
+    }
+    // Distant genuine floating curl on bottom right (4x8 = 32px, does NOT touch claimed)
+    for (let y = 46; y < 54; y++) {
+      for (let x = 50; x < 54; x++) sibling[y * w + x] = 255;
+    }
+
+    const res = cleanSubtractedSiblingMask(sibling, claimed, w, h);
+    expect(res.changed).toBe(true);
+    // Overlap & 1px AA border cleared
+    expect(res.mask[12 * w + 16]).toBe(0);
+    expect(res.mask[12 * w + 15]).toBe(0);
+    // Thin detached seam ring sliver stripped
+    expect(res.mask[14 * w + 34]).toBe(0);
+    // Main hair_front island preserved
+    expect(res.mask[12 * w + 8]).toBe(255);
+    // Distant untouched strand preserved
+    expect(res.mask[49 * w + 51]).toBe(255);
+  });
+
+  it("mergeStage2HairParts keeps Stage-1 bald base hole-free in fillMask and splices hair cleanly", () => {
+    expect(isHairStageLayer("hair_front")).toBe(true);
+    expect(isHairStageLayer("hair_side_L_2")).toBe(true);
+    expect(isHairStageLayer("hat")).toBe(true);
+    expect(isHairStageLayer("acc_hairpin")).toBe(true);
+    expect(isHairStageLayer("acc_ribbon")).toBe(true);
+    expect(isHairStageLayer("face")).toBe(false);
+    expect(isHairStageLayer("clothes_hands")).toBe(false);
+    expect(isHairStageLayer("acc_glasses")).toBe(false);
+
+    const n = 16;
+    const faceMask = new Uint8Array(n);
+    const faceFill = new Uint8Array(n);
+    faceMask[0] = 255;
+    faceMask[1] = 255;
+    faceMask[2] = 255;
+    faceFill[3] = 255;
+
+    const clothesMask = new Uint8Array(n);
+    clothesMask[4] = 255;
+    clothesMask[5] = 255;
+
+    const baseParts = [
+      {
+        id: "clothes",
+        name: "의상",
+        group: "몸" as const,
+        color: "#888",
+        role: "clothes" as const,
+        visible: true,
+        status: "draft" as const,
+        mask: clothesMask,
+        fillKind: "none" as const,
+      },
+      {
+        id: "face",
+        name: "얼굴 피부",
+        group: "머리" as const,
+        color: "#fca",
+        role: "face" as const,
+        visible: true,
+        status: "approved" as const,
+        mask: faceMask,
+        fillMask: faceFill,
+        fillKind: "template" as const,
+      },
+    ];
+
+    const backMask = new Uint8Array(n);
+    backMask[5] = 255;
+    backMask[6] = 255;
+    const frontMask = new Uint8Array(n);
+    frontMask[1] = 255;
+    frontMask[3] = 255;
+
+    const hairParts = [
+      {
+        id: "hair_back",
+        name: "뒷머리",
+        group: "머리" as const,
+        color: "#557",
+        role: "hair_back" as const,
+        visible: true,
+        status: "draft" as const,
+        mask: backMask,
+        fillKind: "none" as const,
+      },
+      {
+        id: "hair_front",
+        name: "앞머리",
+        group: "머리" as const,
+        color: "#779",
+        role: "hair_front" as const,
+        visible: true,
+        status: "draft" as const,
+        mask: frontMask,
+        fillKind: "none" as const,
+      },
+    ];
+
+    const { parts: merged } = mergeStage2HairParts(baseParts, hairParts);
+    expect(merged.map((p) => p.id)).toEqual([
+      "hair_back",
+      "clothes",
+      "face",
+      "hair_front",
+    ]);
+
+    const mergedFace = merged.find((p) => p.id === "face")!;
+    expect(mergedFace.status).toBe("approved");
+    // Pixel 1 overlapped by hair_front shifted out of face.mask into face.fillMask
+    expect(mergedFace.mask[1]).toBe(0);
+    expect(mergedFace.fillMask![1]).toBe(255);
+    expect(mergedFace.mask[2]).toBe(255);
+    expect(mergedFace.fillMask![3]).toBe(255);
+
+    const mergedClothes = merged.find((p) => p.id === "clothes")!;
+    // Pixel 5 overlapped by hair_back shifted out of clothes.mask into clothes.fillMask
+    expect(mergedClothes.mask[5]).toBe(0);
+    expect(mergedClothes.fillMask![5]).toBe(255);
+
+    // Verify visible masks across all merged parts remain strictly pairwise disjoint
+    for (let px = 0; px < n; px++) {
+      const active = merged.filter((p) => p.mask[px] > 0);
+      expect(active.length).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("4-stage mergeStageParts composes silhouette -> features -> clothes -> hair in canonical order with clipping", () => {
+    expect(partPipelineStage("body")).toBe("base_silhouette");
+    expect(partPipelineStage("neck")).toBe("base_silhouette");
+    expect(partPipelineStage("face")).toBe("base_silhouette");
+    expect(partPipelineStage("eyeR_white")).toBe("base_silhouette");
+    expect(partPipelineStage("eyeL_white")).toBe("base_silhouette");
+    expect(partPipelineStage("mouth_inner")).toBe("base_silhouette");
+
+    expect(partPipelineStage("face_detail")).toBe("features_overlay");
+    expect(partPipelineStage("eyeR_iris")).toBe("features_overlay");
+    expect(partPipelineStage("eyeL_upper")).toBe("features_overlay");
+    expect(partPipelineStage("browL")).toBe("features_overlay");
+    expect(partPipelineStage("mouth_upper")).toBe("features_overlay");
+
+    expect(partPipelineStage("clothes")).toBe("clothes_overlay");
+    expect(partPipelineStage("clothes_inner")).toBe("clothes_overlay");
+    expect(partPipelineStage("clothes_hands")).toBe("clothes_overlay");
+    expect(partPipelineStage("acc_glasses")).toBe("clothes_overlay");
+
+    expect(partPipelineStage("hair_back")).toBe("hair_overlay");
+    expect(partPipelineStage("hair_side_L_2")).toBe("hair_overlay");
+    expect(partPipelineStage("hair_front")).toBe("hair_overlay");
+    expect(partPipelineStage("hat")).toBe("hair_overlay");
+
+    expect(stageIncludesLayer("face_detail", "features_overlay")).toBe(true);
+    expect(stageIncludesLayer("face_detail", "base_silhouette")).toBe(false);
+    expect(stageIncludesLayer("face_detail", "base_body")).toBe(true);
+    expect(stageIncludesLayer("hair_front", "base_body")).toBe(false);
+
+    expect(inferPartRole("face_detail")).toBe("face");
+    expect(describeDynamicPart("face_detail")).toMatchObject({
+      name: "얼굴 디테일 (볼터치·코)",
+      group: "얼굴",
+      role: "face",
+    });
+
+    const n = 20;
+    const mkMask = (...indices: number[]) => {
+      const m = new Uint8Array(n);
+      for (const idx of indices) m[idx] = 255;
+      return m;
+    };
+    const mkPart = (
+      id: string,
+      maskIndices: number[],
+      status: "draft" | "approved" = "draft",
+      fillIndices: number[] = [],
+    ) => ({
+      id,
+      name: id,
+      group: "얼굴",
+      color: "#aaa",
+      role: inferPartRole(id),
+      visible: true,
+      status,
+      mask: mkMask(...maskIndices),
+      ...(fillIndices.length > 0
+        ? { fillMask: mkMask(...fillIndices), fillKind: "template" as const }
+        : { fillKind: "none" as const }),
+    });
+
+    const s1 = [
+      mkPart("body", [0, 1]),
+      mkPart("neck", [2, 3]),
+      mkPart("face", [4, 5, 6, 7]),
+      mkPart("eyeL_white", [8, 9]),
+    ];
+    const s2 = [
+      mkPart("face_detail", [5]),
+      mkPart("eyeL_iris", [9], "approved"),
+      mkPart("eyeL_upper", [6, 9]),
+    ];
+    // Overlaps in s2 intentionally yield mask->fillMask cleanly per lower layer
+    const stage12 = mergeStageParts(s1, [
+      mkPart("face_detail", [5]),
+      mkPart("eyeL_iris", [9], "approved"),
+      mkPart("eyeL_upper", [6]),
+    ], "features_overlay");
+
+    // Re-running Stage 2 preserves approved eyeL_iris
+    const regenStage2 = mergeStageParts(
+      stage12.parts,
+      [
+        mkPart("face_detail", [5]),
+        mkPart("eyeL_iris", [8], "draft"),
+        mkPart("eyeL_upper", [6]),
+      ],
+      "features_overlay",
+      true,
+    );
+    expect(regenStage2.preservedCount).toBe(1);
+    expect(
+      regenStage2.parts.find((p) => p.id === "eyeL_iris")!.mask[9],
+    ).toBe(255);
+
+    const stage123 = mergeStageParts(
+      regenStage2.parts,
+      [
+        mkPart("clothes", [1, 2, 10]),
+        mkPart("clothes_hands", [11]),
+        mkPart("acc_glasses", [5, 12]),
+      ],
+      "clothes_overlay",
+    );
+    const stage1234 = mergeStageParts(
+      stage123.parts,
+      [
+        mkPart("hair_back", [0, 13]),
+        mkPart("hair_front", [4, 14]),
+      ],
+      "hair_overlay",
+    );
+
+    expect(stage1234.parts.map((p) => p.id)).toEqual([
+      "hair_back",
+      "body",
+      "neck",
+      "clothes",
+      "clothes_hands",
+      "face",
+      "face_detail",
+      "eyeL_white",
+      "eyeL_iris",
+      "eyeL_upper",
+      "acc_glasses",
+      "hair_front",
+    ]);
+
+    // Base face stays hole-free in mask|fillMask when covered by face_detail, upper lid, glasses, hair
+    const finalFace = stage1234.parts.find((p) => p.id === "face")!;
+    expect(finalFace.mask[4]).toBe(0);
+    expect(finalFace.fillMask![4]).toBe(255);
+    expect(finalFace.mask[5]).toBe(0);
+    expect(finalFace.fillMask![5]).toBe(255);
+    expect(finalFace.mask[7]).toBe(255);
+
+    // Every visible pixel across all 4 stages stays strictly pairwise disjoint
+    for (let px = 0; px < n; px++) {
+      const active = stage1234.parts.filter((p) => p.mask[px] > 0);
+      expect(active.length).toBeLessThanOrEqual(1);
+    }
+    void s2;
+  });
+
+  it("clips face_detail strictly inside face boundary at rest and during motion unless soloed", async () => {
+    const p = fixture();
+    const n = p.width * p.height;
+    const faceBase = p.parts.find((pt) => pt.id === "face")!;
+    const faceFill = new Uint8Array(n);
+    const fdMask = new Uint8Array(n);
+    // Keep face inside (20..44, 14..32), fill all face area, and put an intentionally overflowing blush at (10, 22)
+    const clippedFaceMask = new Uint8Array(n);
+    for (let y = 14; y <= 32; y++) {
+      for (let x = 20; x <= 44; x++) {
+        clippedFaceMask[y * p.width + x] = 255;
+        faceFill[y * p.width + x] = 255;
+      }
+    }
+    // Outside-face stray blush blob at x=8..11, y=20..23
+    for (let y = 20; y <= 23; y++) {
+      for (let x = 8; x <= 11; x++) {
+        fdMask[y * p.width + x] = 255;
+      }
+    }
+    // Inside-face cheek blush blob at x=24..27, y=20..23
+    for (let y = 20; y <= 23; y++) {
+      for (let x = 24; x <= 27; x++) {
+        fdMask[y * p.width + x] = 255;
+        clippedFaceMask[y * p.width + x] = 0;
+      }
+    }
+
+    const srcCanvas = createCanvas(p.width, p.height);
+    const sCtx = srcCanvas.getContext("2d");
+    sCtx.fillStyle = "rgb(245, 220, 208)";
+    sCtx.fillRect(20, 14, 25, 19);
+    // Distinct hot pink outside face (x=8..11) + inside face (x=24..27)
+    sCtx.fillStyle = "rgb(255, 60, 140)";
+    sCtx.fillRect(8, 20, 4, 4);
+    sCtx.fillRect(24, 20, 4, 4);
+    const px = new Uint8ClampedArray(sCtx.getImageData(0, 0, p.width, p.height).data);
+
+    const rigState = createDefaultProjectRigState("ld");
+    const clippedProject: Project = {
+      ...p,
+      ...rigState,
+      parts: [
+        {
+          ...faceBase,
+          compositeOrder: 0,
+          mask: clippedFaceMask,
+          fillMask: faceFill,
+          fillKind: "template",
+        },
+        {
+          id: "face_detail",
+          compositeOrder: 1,
+          name: "얼굴 디테일 (볼터치·코)",
+          group: "얼굴",
+          color: "#fb7185",
+          role: "face",
+          visible: true,
+          status: "draft",
+          mask: fdMask,
+          fillKind: "none",
+        },
+      ],
+    };
+
+    const textures = buildAllPartTextures(clippedProject, px);
+    const meshes = buildAllPartMeshes(clippedProject);
+    const restSnap = renderDeterministicSnapshot(
+      { project: clippedProject },
+      textures,
+      meshes,
+    );
+    const restData = (restSnap.canvas as unknown as ReturnType<typeof createCanvas>)
+      .getContext("2d")
+      .getImageData(0, 0, p.width, p.height).data;
+    // Pixel (10, 22) outside face boundary MUST be clipped away even at rest
+    expect(restData[(22 * p.width + 10) * 4 + 3]).toBe(0);
+    // Pixel (26, 22) inside face boundary MUST remain visible
+    expect(restData[(22 * p.width + 26) * 4]).toBeGreaterThan(200);
+    expect(restData[(22 * p.width + 26) * 4 + 3]).toBe(255);
+
+    // Moving pose also clips face_detail cleanly to face
+    const movingSnap = renderDeterministicSnapshot(
+      { project: clippedProject, userOffsets: { angleX: 12 } },
+      textures,
+      meshes,
+    );
+    const movingData = (movingSnap.canvas as unknown as ReturnType<typeof createCanvas>)
+      .getContext("2d")
+      .getImageData(0, 0, p.width, p.height).data;
+    expect(movingData[(22 * p.width + 8) * 4 + 3]).toBe(0);
+
+    // Solo inspection of face_detail renders unclipped blob at (10, 22)
+    const soloEval = evaluateRigFrame({
+      project: clippedProject,
+      deterministic: true,
+      playing: false,
+    });
+    const soloCanvas = createCanvas(p.width, p.height);
+    renderCharacterFrame({
+      ctx: soloCanvas.getContext("2d") as unknown as CanvasRenderingContext2D,
+      project: clippedProject,
+      evaluated: soloEval,
+      partTextures: textures,
+      meshes,
+      soloPartId: "face_detail",
+      enableGpu: false,
+    });
+    const soloData = soloCanvas
+      .getContext("2d")
+      .getImageData(0, 0, p.width, p.height).data;
+    expect(soloData[(22 * p.width + 10) * 4 + 3]).toBeGreaterThan(200);
   });
 });

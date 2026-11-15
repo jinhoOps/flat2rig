@@ -51,6 +51,7 @@ import type {
   Parameters,
   Part,
   PartProvenance,
+  PipelineStage,
   Point,
   Project,
   PromptPoint,
@@ -64,7 +65,13 @@ import {
   REST,
   TEMPLATE_STYLE_CATALOG,
 } from "./types";
-import { bounds, clamp, faceBoxLandmarks, paint } from "./engine";
+import {
+  bounds,
+  clamp,
+  cleanSubtractedSiblingMask,
+  faceBoxLandmarks,
+  paint,
+} from "./engine";
 import { loadImage, pixels, pixelsCanvas, readImage } from "./images";
 import {
   analyzeFace,
@@ -94,9 +101,12 @@ import {
   exportPsd,
   insertHairPartInOrder,
   isPreservedPart,
+  isHairStageLayer,
   loadProject,
   mergePreservedParts,
+  mergeStageParts,
   newDynamicPart,
+  partPipelineStage,
   newHairPart,
   newPart,
   readCsvTemplate,
@@ -231,10 +241,22 @@ export default function App() {
     };
   }, []);
   const [modal, setModal] = useState<
-    "export" | "regenerate" | "reanalysis" | "models" | "help" | "spriteGuide" | "updates" | null
+    | "export"
+    | "regenerate"
+    | "reanalysis"
+    | "replaceWorkspace"
+    | "models"
+    | "help"
+    | "spriteGuide"
+    | "updates"
+    | null
   >(null),
+    [pendingDrop, setPendingDrop] = useState<{
+      kind: "image" | "project";
+      file: File;
+    } | null>(null),
     [dirty, setDirty] = useState(false);
-  const [appVersion, setAppVersion] = useState("0.2.0-2");
+  const [appVersion, setAppVersion] = useState("0.2.0-3");
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [updateCustomUrl, setUpdateCustomUrl] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -599,13 +621,42 @@ export default function App() {
       notify(res.message);
     });
   };
-  const openImage = (file?: File) => {
+  const hasActiveWorkspace = () => {
+    const cur = projectRef.current;
+    return Boolean(cur && (dirty || cur.parts.length > 0));
+  };
+  const openProjectFile = (file?: File, force = false) => {
     if (!file) return;
-    if (
-      dirty &&
-      !confirm("저장하지 않은 변경 사항이 있습니다. 새 이미지를 여시겠습니까?")
-    )
+    if (!force && hasActiveWorkspace()) {
+      setPendingDrop({ kind: "project", file });
+      setModal("replaceWorkspace");
       return;
+    }
+    setPendingDrop(null);
+    void task("프로젝트 불러오는 중", async (signal) => {
+      const loaded = loadProject(new Uint8Array(await file.arrayBuffer()));
+      const img = await loadImage(loaded.source);
+      signal.throwIfAborted();
+      const prepared =
+        loaded.parts.length > 0
+          ? synthesizeShapeAssetsForProject(
+              loaded,
+              pixels(img, loaded.width, loaded.height),
+              false,
+            )
+          : loaded;
+      reset(prepared);
+      notify("프로젝트를 불러왔습니다.");
+    });
+  };
+  const openImage = (file?: File, force = false) => {
+    if (!file) return;
+    if (!force && hasActiveWorkspace()) {
+      setPendingDrop({ kind: "image", file });
+      setModal("replaceWorkspace");
+      return;
+    }
+    setPendingDrop(null);
     const jobId = ++analysisJobSeq.current;
     void task("이미지 준비 · 얼굴 검출 중", async (signal) => {
       const p = await readImage(file);
@@ -626,6 +677,7 @@ export default function App() {
     overrideMode?: "detail" | "parent",
     overrideStyles?: TemplateStyleSelection,
     preserveApproved = false,
+    stage: PipelineStage | "base_body" = "full",
   ) => {
     const p = projectRef.current;
     if (!p) return;
@@ -641,77 +693,144 @@ export default function App() {
       effectiveMode === "preserve"
         ? { proportionMode: rawStyles.proportionMode ?? "auto" }
         : rawStyles;
+    const hybridStages = [
+      "base_silhouette",
+      "features_overlay",
+      "clothes_overlay",
+      "hair_overlay",
+    ] as const;
+    const stageLabels: Record<PipelineStage | "base_body", string> = {
+      base_silhouette: "1단계 · 실루엣 소체",
+      features_overlay: "2단계 · 이목구비 적층",
+      clothes_overlay: "3단계 · 의상·소품 적층",
+      hair_overlay: "4단계 · 머리카락 적층",
+      base_body: "소체+의상+이목구비",
+      full: "전체 1→4단계",
+    };
+    const stageIdx = hybridStages.indexOf(
+      stage as (typeof hybridStages)[number],
+    );
+    const stagesToRun: Array<PipelineStage | "base_body"> = [];
+    if (stageIdx > 0) {
+      for (let i = 0; i < stageIdx; i += 1) {
+        const prereq = hybridStages[i];
+        if (!p.parts.some((tp) => partPipelineStage(tp.id) === prereq)) {
+          stagesToRun.push(prereq);
+        }
+      }
+    }
+    stagesToRun.push(stage);
+
     setModal(null);
     setPromptResult(null);
-    const jobId = ++analysisJobSeq.current;
-    void task("파츠 분리 초안 생성 중", async (signal) => {
+    const taskTitle =
+      stagesToRun.length > 1
+        ? `1→${stageIdx + 1}단계 순차 실루엣 적층 중`
+        : `${stageLabels[stage]} 생성 중`;
+    void task(taskTitle, async (signal) => {
       const data = pixels(await loadImage(p.source), p.width, p.height);
       const faceCand = p.faceCandidates?.[p.selectedFaceId ?? 0];
-      const result = await proposeParts(
-        data,
-        p.width,
-        p.height,
-        p.landmarks,
-        tolerance,
-        {
-          points28: p.landmarks28,
-          faceBbox: faceCand?.bbox ?? null,
-          modelPath,
-          detailMode: mode,
-          hairSplit,
-          templateMode: templateMode && mode === "detail",
-          styleOverrides: styles,
-          jobId,
-        },
-        signal,
-      );
-      signal.throwIfAborted();
-      const { parts: mergedParts, preservedCount } = preserveApproved
-        ? mergePreservedParts(p.parts, result.parts)
-        : { parts: result.parts, preservedCount: 0 };
+      let workingParts = p.parts.slice();
+      let totalPreserved = 0;
+      let lastResult: Awaited<ReturnType<typeof proposeParts>> | null = null;
+      for (const stepStage of stagesToRun) {
+        const jobId = ++analysisJobSeq.current;
+        const result = await proposeParts(
+          data,
+          p.width,
+          p.height,
+          p.landmarks,
+          tolerance,
+          {
+            points28: p.landmarks28,
+            faceBbox: faceCand?.bbox ?? null,
+            modelPath,
+            detailMode: mode,
+            hairSplit,
+            templateMode:
+              (templateMode || stepStage !== "full") && mode === "detail",
+            pipelineStage: stepStage,
+            styleOverrides: styles,
+            jobId,
+          },
+          signal,
+        );
+        signal.throwIfAborted();
+        const preserveStep = preserveApproved || stepStage !== stage;
+        const merged =
+          stepStage === "full"
+            ? preserveStep
+              ? mergePreservedParts(workingParts, result.parts)
+              : { parts: result.parts, preservedCount: 0 }
+            : mergeStageParts(workingParts, result.parts, stepStage, preserveStep);
+        workingParts = merged.parts;
+        totalPreserved += merged.preservedCount;
+        lastResult = result;
+      }
+      if (!lastResult) return;
       const nextProportion =
-        result.styleMatch?.resolved.proportionMode === "sd"
+        lastResult.styleMatch?.resolved.proportionMode === "sd"
           ? "sd"
-          : result.styleMatch?.resolved.proportionMode === "ld"
+          : lastResult.styleMatch?.resolved.proportionMode === "ld"
             ? "ld"
             : p.rigProfile.proportionMode;
       const nextProject = synthesizeShapeAssetsForProject(
         {
           ...p,
-          parts: mergedParts,
-          provider: result.provider,
+          parts: workingParts,
+          provider: lastResult.provider,
           detailMode: mode,
-          styleMatch: result.styleMatch,
+          rigStage: stage,
+          styleMatch: lastResult.styleMatch,
           styleSelection: styles,
           rigProfile: {
             ...p.rigProfile,
             proportionMode: nextProportion,
           },
           modelHash:
-            result.modelHashes.part_decoder ??
-            result.modelHashes.background ??
+            lastResult.modelHashes.part_decoder ??
+            lastResult.modelHashes.background ??
             p.modelHash,
-          modelHashes: { ...p.modelHashes, ...result.modelHashes },
+          modelHashes: { ...p.modelHashes, ...lastResult.modelHashes },
           postprocessVersions: {
             ...p.postprocessVersions,
-            parts: result.postprocessVersion,
+            parts: lastResult.postprocessVersion,
           },
         },
         data,
-        !preserveApproved,
+        !preserveApproved && (stage === "full" || stage === "base_silhouette"),
       );
       commit(nextProject);
-      if (!mergedParts.some((t) => t.id === selected)) {
-        setSelected(mergedParts[0]?.id ?? "face");
+      const preferredIds =
+        stage === "base_silhouette"
+          ? ["face", "body"]
+          : stage === "features_overlay"
+            ? ["face_detail", "eyeL_upper", "mouth_lower"]
+            : stage === "clothes_overlay"
+              ? ["clothes", "acc_glasses"]
+              : ["hair_front", "face"];
+      if (!workingParts.some((t) => t.id === selected) || stageIdx >= 0) {
+        const preferred = preferredIds.find((pid) =>
+          workingParts.some((t) => t.id === pid),
+        );
+        setSelected(preferred ?? workingParts[0]?.id ?? "face");
       }
       setTool("select");
       setTab("prepare");
-    setAdvancedPreview(false);
+      setAdvancedPreview(false);
       const overrideCount = countStyleOverrides(styles);
       const propLabel =
-        result.styleMatch?.resolved.proportionMode === "sd" ? "SD형" : "일반 LD";
+        lastResult.styleMatch?.resolved.proportionMode === "sd"
+          ? "SD형"
+          : "일반 LD";
+      const stagePrefix =
+        stage === "full"
+          ? ""
+          : stagesToRun.length > 1
+            ? `[1→${stageIdx + 1}단계 자동 적층] `
+            : `[${stageLabels[stage]}] `;
       notify(
-        `${mergedParts.length}개 파츠가 ${result.styleMatch ? (overrideCount > 0 ? `명시적 스타일 변경(${overrideCount}개 부위 · ${propLabel})` : `원화 유지 + 가림 보완(${propLabel})`) : mode === "parent" ? "눈·입 통합 모드" : "세부 파츠 모드"}로 준비됐습니다.${preservedCount ? ` (수정·확인 ${preservedCount}개 보존)` : ""}`,
+        `${stagePrefix}${workingParts.length}개 파츠가 ${lastResult.styleMatch ? (overrideCount > 0 ? `명시적 스타일 변경(${overrideCount}개 부위 · ${propLabel})` : `원화 유지 + 가림 보완(${propLabel})`) : mode === "parent" ? "눈·입 통합 모드" : "세부 파츠 모드"}로 준비됐습니다.${totalPreserved ? ` (수정·확인 ${totalPreserved}개 보존)` : ""}`,
       );
     });
   };
@@ -880,6 +999,44 @@ export default function App() {
       ),
     });
   };
+  const toggleGroupVisible = (groupName: string) => {
+    const p = projectRef.current;
+    if (!p) return;
+    const anyVisible = p.parts.some(
+      (t) => (t.group || "기타") === groupName && t.visible,
+    );
+    const nextVisible = !anyVisible;
+    commit({
+      ...p,
+      parts: p.parts.map((t) =>
+        (t.group || "기타") === groupName ? { ...t, visible: nextVisible } : t,
+      ),
+    });
+  };
+  const commitBrushMask = useCallback(
+    (partId: string, mask: Uint8Array, fillMask?: Uint8Array) => {
+      const p = projectRef.current;
+      if (!p) return;
+      commit(
+        {
+          ...p,
+          parts: p.parts.map((t) =>
+            t.id === partId
+              ? {
+                  ...t,
+                  status: "draft" as const,
+                  provenance: "manual" as const,
+                  mask,
+                  ...(fillMask ? { fillMask } : {}),
+                }
+              : t,
+          ),
+        },
+        p,
+      );
+    },
+    [commit],
+  );
   const shiftPart = (direction: number) => {
     if (!project) return;
     const index = project.parts.findIndex((p) => p.id === selected),
@@ -924,6 +1081,8 @@ export default function App() {
   const applyPromptMaskToParts = (
     parts: Part[],
     targetId: string,
+    width: number,
+    height: number,
     mask: Uint8Array,
     iouScore: number,
     diagnostics: string[],
@@ -932,6 +1091,7 @@ export default function App() {
     const targetPart = parts.find((t) => t.id === targetId);
     const shouldSubtractHair =
       subtractHairOnPrompt && !!targetPart && isHairPart(targetPart);
+    const targetIsHairStage = !!targetPart && isHairStageLayer(targetPart.id);
     return parts.map((t) => {
       if (t.id === targetId) {
         let nextFill = t.fillMask;
@@ -953,15 +1113,37 @@ export default function App() {
         };
       }
       if (shouldSubtractHair && isHairPart(t) && t.status !== "approved") {
-        let changed = false;
-        const trimmed = t.mask.slice();
-        for (let i = 0; i < trimmed.length; i++) {
-          if (mask[i] > 128 && trimmed[i] > 0) {
-            trimmed[i] = 0;
-            changed = true;
+        const cleaned = cleanSubtractedSiblingMask(t.mask, mask, width, height);
+        return cleaned.changed ? { ...t, mask: cleaned.mask } : t;
+      }
+      if (targetIsHairStage && !isHairStageLayer(t.id)) {
+        const n = Math.min(t.mask.length, mask.length);
+        let overlap = false;
+        for (let i = 0; i < n; i++) {
+          if (mask[i] > 0 && t.mask[i] > 0) {
+            overlap = true;
+            break;
           }
         }
-        return changed ? { ...t, mask: trimmed } : t;
+        if (overlap) {
+          const nextMask = t.mask.slice();
+          const nextFill = t.fillMask
+            ? t.fillMask.slice()
+            : new Uint8Array(t.mask.length);
+          for (let i = 0; i < n; i++) {
+            if (mask[i] > 0 && nextMask[i] > 0) {
+              if (nextMask[i] > nextFill[i]) nextFill[i] = nextMask[i];
+              nextMask[i] = 0;
+            }
+          }
+          return {
+            ...t,
+            mask: nextMask,
+            fillMask: nextFill,
+            fillKind:
+              t.fillKind && t.fillKind !== "none" ? t.fillKind : "template",
+          };
+        }
       }
       return t;
     });
@@ -999,6 +1181,8 @@ export default function App() {
           parts: applyPromptMaskToParts(
             latest.parts,
             part.id,
+            latest.width,
+            latest.height,
             chosen.mask,
             chosen.iouScore,
             chosen.diagnostics,
@@ -1025,6 +1209,8 @@ export default function App() {
       parts: applyPromptMaskToParts(
         p.parts,
         promptResult.partId,
+        p.width,
+        p.height,
         cand.mask,
         cand.iouScore,
         cand.diagnostics,
@@ -1415,15 +1601,19 @@ export default function App() {
         if (busy || modal) return;
         const files = Array.from(e.dataTransfer.files);
         if (files.length !== 1) {
-          setError("PNG 또는 JPG 이미지 한 장을 놓으세요.");
+          setError("PNG, JPG 이미지 또는 .flat2rig 파일 한 개를 놓으세요.");
           return;
         }
         const file = files[0];
+        if (/\.flat2rig$/i.test(file.name)) {
+          openProjectFile(file);
+          return;
+        }
         if (
           !/^image\/(png|jpeg)$/.test(file.type) &&
           !/\.(png|jpe?g)$/i.test(file.name)
         ) {
-          setError("PNG 또는 JPG 파일만 불러올 수 있습니다.");
+          setError("PNG, JPG 이미지 또는 .flat2rig 파일만 불러올 수 있습니다.");
           return;
         }
         openImage(file);
@@ -1433,8 +1623,8 @@ export default function App() {
         <div className="drop-target" role="status" aria-live="polite">
           <div className="drop-card">
             <ImagePlus size={22} />
-            <strong>일러스트 놓기</strong>
-            <span>PNG · JPG 한 장</span>
+            <strong>일러스트 · 프로젝트 놓기</strong>
+            <span>PNG · JPG · .flat2rig 한 개</span>
           </div>
         </div>
       )}
@@ -1458,27 +1648,7 @@ export default function App() {
         onChange={(e) => {
           const file = e.target.files?.[0];
           e.target.value = "";
-          if (
-            !file ||
-            (dirty &&
-              !confirm("변경 사항을 저장하지 않고 프로젝트를 여시겠습니까?"))
-          )
-            return;
-          void task("프로젝트 불러오는 중", async (signal) => {
-            const loaded = loadProject(new Uint8Array(await file.arrayBuffer()));
-            const img = await loadImage(loaded.source);
-            signal.throwIfAborted();
-            const prepared =
-              loaded.parts.length > 0
-                ? synthesizeShapeAssetsForProject(
-                    loaded,
-                    pixels(img, loaded.width, loaded.height),
-                    false,
-                  )
-                : loaded;
-            reset(prepared);
-            notify("프로젝트를 불러왔습니다.");
-          });
+          if (file) openProjectFile(file);
         }}
       />
       <input
@@ -1667,7 +1837,15 @@ export default function App() {
                     i > 0 ? rev[i - 1].group || "기타" : null;
                   const showHeader = groupName !== prevGroup;
                   let runCount = 0;
+                  let groupAllVisible = true;
+                  let groupAnyVisible = false;
                   if (showHeader) {
+                    for (const gp of project!.parts) {
+                      if ((gp.group || "기타") === groupName) {
+                        if (gp.visible) groupAnyVisible = true;
+                        else groupAllVisible = false;
+                      }
+                    }
                     for (
                       let k = i;
                       k < rev.length && (rev[k].group || "기타") === groupName;
@@ -1679,7 +1857,42 @@ export default function App() {
                     <Fragment key={p.id}>
                       {showHeader && (
                         <div className="layer-group-header">
-                          <span>{groupName}</span>
+                          <span className="layer-group-left">
+                            <span
+                              className={`layer-group-eye${
+                                groupAnyVisible && !groupAllVisible
+                                  ? " is-partial"
+                                  : !groupAnyVisible
+                                    ? " is-hidden"
+                                    : ""
+                              }`}
+                              role="checkbox"
+                              aria-checked={
+                                groupAllVisible
+                                  ? true
+                                  : groupAnyVisible
+                                    ? "mixed"
+                                    : false
+                              }
+                              aria-label={`${groupName} 그룹 일괄 표시`}
+                              title={`${groupName} 그룹 일괄 표시/숨김`}
+                              tabIndex={0}
+                              onKeyDown={(e) => {
+                                if (e.key === " " || e.key === "Enter") {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  toggleGroupVisible(groupName);
+                                }
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleGroupVisible(groupName);
+                              }}
+                            >
+                              {groupAnyVisible ? <Eye size={13} /> : <EyeOff size={13} />}
+                            </span>
+                            <span>{groupName}</span>
+                          </span>
                           <span className="param-group-badge">{runCount}</span>
                         </div>
                       )}
@@ -1976,6 +2189,7 @@ export default function App() {
                   onStart={start}
                   onMove={move}
                   onEnd={end}
+                  onCommitMask={commitBrushMask}
                 />
                 <div className="stage-bottom">
                   <span>
@@ -1988,14 +2202,14 @@ export default function App() {
                           : preview
                             ? "고급 메쉬/변형 확인 모드입니다"
                             : tool === "face"
-                              ? "얼굴 피부 영역의 좌상단에서 우하단까지 드래그하세요"
+                              ? "얼굴 피부 영역의 좌상단에서 우하단까지 드래그하세요 · Space+드래그: 이동"
                               : tool === "landmark"
-                                ? "눈 · 입 · 턱 · 얼굴 상단의 점을 드래그하세요"
+                                ? "눈 · 입 · 턱 · 얼굴 상단의 점을 드래그하세요 · Space+드래그: 이동"
                                 : tool === "prompt"
-                                  ? "좌클릭: 포함(+) · 우클릭/Alt/Shift+클릭: 제외(-) 영역 지정"
+                                  ? "좌클릭: 포함(+) · 우클릭/Alt/Shift+클릭: 제외(-) · Space+드래그: 이동"
                                   : tool === "add" || tool === "erase"
-                                    ? "드래그하여 선택 파츠의 마스크를 수정하세요"
-                                    : "파츠를 선택하여 경계를 확인하세요"}
+                                    ? "드래그하여 마스크 수정 · Space+드래그: 캔버스 이동"
+                                    : "파츠를 선택하여 경계를 확인하세요 · Space+드래그: 이동"}
                   </span>
                   <div>
                     {isRigStage && (
@@ -2080,7 +2294,7 @@ export default function App() {
                     }}
                   >
                     <CircleHelp size={14} />
-                    권장 일러스트 · 파츠 예시 시트 보기 (?)
+                    권장 일러스트 · 텍스처 아틀라스 예시 보기 (?)
                   </button>
                 </div>
                 <div className="welcome-features">
@@ -2490,15 +2704,23 @@ export default function App() {
                         <button
                           className="full"
                           disabled={!project || !!busy}
-                          onClick={() =>
+                          onClick={() => {
+                            const activeStage =
+                              project?.rigStage === "base_silhouette" ||
+                              project?.rigStage === "features_overlay" ||
+                              project?.rigStage === "clothes_overlay" ||
+                              project?.rigStage === "hair_overlay"
+                                ? project.rigStage
+                                : "full";
                             generate(
                               undefined,
                               styleMode === "preserve"
                                 ? { proportionMode: styleSelection.proportionMode ?? "auto" }
                                 : styleSelection,
                               true,
-                            )
-                          }
+                              activeStage,
+                            );
+                          }}
                         >
                           <RefreshCw size={14} />
                           {styleMode === "preserve"
@@ -2508,17 +2730,211 @@ export default function App() {
                       )}
                     </div>
                   )}
+                  {(() => {
+                    const s1Done =
+                      project?.parts.some(
+                        (t) => partPipelineStage(t.id) === "base_silhouette",
+                      ) ?? false;
+                    const s2Done =
+                      project?.parts.some(
+                        (t) => partPipelineStage(t.id) === "features_overlay",
+                      ) ?? false;
+                    const s3Done =
+                      project?.parts.some(
+                        (t) => partPipelineStage(t.id) === "clothes_overlay",
+                      ) ?? false;
+                    const s4Done =
+                      project?.parts.some(
+                        (t) => partPipelineStage(t.id) === "hair_overlay",
+                      ) ?? false;
+                    const stageItems: Array<{
+                      key:
+                        | "base_silhouette"
+                        | "features_overlay"
+                        | "clothes_overlay"
+                        | "hair_overlay";
+                      shortLabel: string;
+                      buttonLabel: string;
+                      tooltip: string;
+                      done: boolean;
+                    }> = [
+                      {
+                        key: "base_silhouette",
+                        shortLabel: "1 소체",
+                        buttonLabel: "1단계 · 실루엣 소체",
+                        tooltip:
+                          "구멍·잔선 없는 순수 SD/LD 실루엣(몸·목·얼굴·눈흰자·입내부)만 먼저 생성합니다",
+                        done: s1Done,
+                      },
+                      {
+                        key: "features_overlay",
+                        shortLabel: "2 이목구비",
+                        buttonLabel: "2단계 · 이목구비 적층",
+                        tooltip:
+                          "볼터치·코·눈(홍채/속눈썹)·눈썹·입술을 실루엣 위에 클리핑·적층합니다 (선행 단계 미실행 시 자동 실행)",
+                        done: s2Done,
+                      },
+                      {
+                        key: "clothes_overlay",
+                        shortLabel: "3 의상·소품",
+                        buttonLabel: "3단계 · 의상·소품 적층",
+                        tooltip:
+                          "의상·손·안경을 소체 위에 적층합니다 (선행 단계 미실행 시 자동 실행)",
+                        done: s3Done,
+                      },
+                      {
+                        key: "hair_overlay",
+                        shortLabel: "4 머리카락",
+                        buttonLabel: "4단계 · 머리카락 적층",
+                        tooltip:
+                          "앞·옆·뒷머리·모자·머리장식을 분리해 최종 적층합니다 (선행 단계 미실행 시 자동 실행)",
+                        done: s4Done,
+                      },
+                    ];
+                    const nextStage =
+                      stageItems.find((st) => !st.done)?.key ?? null;
+                    const stageHint =
+                      !project || total === 0
+                        ? "권장: 1 실루엣 소체 -> 2 이목구비 -> 3 의상·소품 -> 4 머리카락"
+                        : nextStage === "features_overlay"
+                          ? "1단계 소체 완료 · 얼굴·눈흰자 확인 후 2단계 이목구비를 적층하세요"
+                          : nextStage === "clothes_overlay"
+                            ? "2단계 이목구비 완료 · 클리핑·표정 확인 후 3단계 의상을 적층하세요"
+                            : nextStage === "hair_overlay"
+                              ? "3단계 의상 완료 · 마지막 4단계 머리카락·모자를 적층하세요"
+                              : s1Done && s2Done && s3Done && s4Done
+                                ? "1→4단계 하이브리드 실루엣 적층 완료"
+                                : `현재 ${stageItems.filter((st) => st.done).length}/4단계 구성됨 · 빈 단계를 눌러 적층할 수 있습니다`;
+                    return (
+                      <>
+                        <div
+                          className="note"
+                          style={{
+                            marginBottom: 8,
+                            flexDirection: "column",
+                            alignItems: "stretch",
+                            gap: 5,
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 6,
+                            }}
+                          >
+                            <Sparkles size={13} />
+                            <span>{stageHint}</span>
+                          </div>
+                          <div
+                            style={{
+                              display: "grid",
+                              gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                              gap: 4,
+                              fontSize: 11,
+                            }}
+                          >
+                            {stageItems.map((st) => {
+                              const isNext = nextStage === st.key;
+                              return (
+                                <span
+                                  key={st.key}
+                                  style={{
+                                    textAlign: "center",
+                                    padding: "2px 3px",
+                                    borderRadius: 4,
+                                    whiteSpace: "nowrap",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    background: st.done
+                                      ? "var(--ok-tint)"
+                                      : isNext
+                                        ? "var(--accent-tint)"
+                                        : "transparent",
+                                    border: `1px solid ${st.done ? "var(--ok-border)" : isNext ? "var(--accent-border)" : "var(--border)"}`,
+                                    color: st.done
+                                      ? "var(--ok)"
+                                      : isNext
+                                        ? "var(--accent-text)"
+                                        : "var(--muted)",
+                                    fontWeight: st.done || isNext ? 600 : 400,
+                                  }}
+                                >
+                                  {st.done ? "✓ " : ""}
+                                  {st.shortLabel}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                            gap: 6,
+                            marginBottom: 8,
+                          }}
+                        >
+                          {stageItems.map((st) => (
+                            <button
+                              key={st.key}
+                              className={
+                                nextStage === st.key &&
+                                (total > 0 || st.key === "base_silhouette")
+                                  ? "primary"
+                                  : undefined
+                              }
+                              disabled={!project || !!busy}
+                              title={st.tooltip}
+                              onClick={() =>
+                                generate(
+                                  undefined,
+                                  undefined,
+                                  st.key !== "base_silhouette",
+                                  st.key,
+                                )
+                              }
+                            >
+                              {st.buttonLabel}
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          className={
+                            nextStage && total > 0 ? "full" : "primary full"
+                          }
+                          disabled={!project || !!busy}
+                          onClick={() =>
+                            total
+                              ? setModal("regenerate")
+                              : generate(undefined, undefined, false, "full")
+                          }
+                        >
+                          <WandSparkles size={16} />
+                          {total
+                            ? "파츠 초안 다시 생성"
+                            : "전체 한 번에 생성 (1→4단계)"}
+                        </button>
+                      </>
+                    );
+                  })()}
                   <button
                     className="model-button"
+                    style={{ marginTop: 8 }}
                     disabled={!!busy}
                     onClick={() => {
-                      if (desktop) void getModelStatus().then(setModelStatus).catch(() => {});
+                      if (desktop)
+                        void getModelStatus()
+                          .then(setModelStatus)
+                          .catch(() => {});
                       setModal("models");
                     }}
                   >
                     <Settings size={15} />
                     <span>
-                      ONNX 모델 관리 ({modelStatus.filter((m) => m.hashMatches).length}/{modelStatus.length || 5})
+                      ONNX 모델 관리 (
+                      {modelStatus.filter((m) => m.hashMatches).length}/
+                      {modelStatus.length || 5})
                       <small>
                         {desktop
                           ? "MobileSAM · HRNet · YOLOv3 · U2NetP"
@@ -2526,16 +2942,6 @@ export default function App() {
                       </small>
                     </span>
                     <ChevronRight size={14} />
-                  </button>
-                  <button
-                    className="primary full"
-                    disabled={!project || !!busy}
-                    onClick={() =>
-                      total ? setModal("regenerate") : generate()
-                    }
-                  >
-                    <WandSparkles size={16} />
-                    {total ? "파츠 초안 다시 생성" : "파츠 초안 생성"}
                   </button>
                   {total > 0 && (
                     <button
@@ -3047,14 +3453,16 @@ export default function App() {
                 : modal === "help"
                   ? "사용 가이드"
                   : modal === "spriteGuide"
-                    ? "권장 일러스트 및 파츠 예시 시트"
+                    ? "권장 일러스트 및 텍스처 아틀라스 예시"
                     : modal === "reanalysis"
                       ? "랜드마크 재추출 확인"
-                      : modal === "models"
-                        ? "모델 관리"
-                        : modal === "updates"
-                          ? "앱 자동 업데이트"
-                          : "파츠 재생성"
+                      : modal === "replaceWorkspace"
+                        ? "워크스페이스 저장 확인"
+                        : modal === "models"
+                          ? "모델 관리"
+                          : modal === "updates"
+                            ? "앱 자동 업데이트"
+                            : "파츠 재생성"
             }
           >
             <button
@@ -3197,6 +3605,78 @@ export default function App() {
                   취소하고 현재 좌표 유지
                 </button>
               </>
+            ) : modal === "replaceWorkspace" && pendingDrop ? (
+              <>
+                <span className="eyebrow">WORKSPACE</span>
+                <h2>현재 워크스페이스를 저장할까요?</h2>
+                <p>
+                  새 파일(<strong>{pendingDrop.file.name}</strong>)을 열기 전에
+                  현재 작업(<strong>{project?.name ?? "현재 프로젝트"}</strong>)을{" "}
+                  <code>.flat2rig</code>로 저장하시겠습니까?
+                  {dirty ? " 저장하지 않은 변경 사항이 있습니다." : ""}
+                </p>
+                <div className="two-buttons">
+                  <button
+                    className="primary"
+                    onClick={() => {
+                      const cur = projectRef.current;
+                      const nextDrop = pendingDrop;
+                      if (!cur) {
+                        setPendingDrop(null);
+                        setModal(null);
+                        return;
+                      }
+                      void (async () => {
+                        let savedOk = false;
+                        await task("워크스페이스 저장 중", async () => {
+                          const saved = await saveFile(
+                            `${safeName(cur.name)}.flat2rig`,
+                            await saveProject(cur),
+                          );
+                          if (saved) {
+                            setDirty(false);
+                            savedOk = true;
+                          }
+                        });
+                        if (!savedOk) return;
+                        setPendingDrop(null);
+                        setModal(null);
+                        if (nextDrop.kind === "project") {
+                          openProjectFile(nextDrop.file, true);
+                        } else {
+                          openImage(nextDrop.file, true);
+                        }
+                      })();
+                    }}
+                  >
+                    <Save size={14} />
+                    저장하고 열기
+                  </button>
+                  <button
+                    onClick={() => {
+                      const nextDrop = pendingDrop;
+                      setPendingDrop(null);
+                      setModal(null);
+                      if (nextDrop.kind === "project") {
+                        openProjectFile(nextDrop.file, true);
+                      } else {
+                        openImage(nextDrop.file, true);
+                      }
+                    }}
+                  >
+                    저장하지 않고 열기
+                  </button>
+                </div>
+                <button
+                  className="text-button full"
+                  onClick={() => {
+                    setPendingDrop(null);
+                    setModal(null);
+                  }}
+                >
+                  취소하고 현재 작업 유지
+                </button>
+              </>
             ) : modal === "models" ? (
               <>
                 <span className="eyebrow">LOCAL ONNX RUNTIME</span>
@@ -3318,7 +3798,9 @@ export default function App() {
                       <button
                         className="primary full"
                         style={{ marginBottom: 10 }}
-                        onClick={() => generate(undefined, undefined, true)}
+                        onClick={() =>
+                          generate(undefined, undefined, true, "full")
+                        }
                       >
                         수정·확인 파츠 유지 후 다시 생성
                       </button>
@@ -3327,7 +3809,9 @@ export default function App() {
                       <button onClick={() => setModal(null)}>돌아가기</button>
                       <button
                         className={hasPreservedParts ? "" : "primary"}
-                        onClick={() => generate(undefined, undefined, false)}
+                        onClick={() =>
+                          generate(undefined, undefined, false, "full")
+                        }
                       >
                         {hasPreservedParts ? "전체 초기화" : "다시 생성"}
                       </button>
@@ -3339,10 +3823,10 @@ export default function App() {
               <>
                 <div className="sprite-guide-head-row">
                   <div>
-                    <span className="eyebrow">SPRITE PREPARATION GUIDE</span>
-                    <h2>권장 일러스트 구도 &amp; LD/SD 실루엣 21파츠 예시</h2>
+                    <span className="eyebrow">TEXTURE ATLAS PREPARATION GUIDE</span>
+                    <h2>권장 일러스트 구도 &amp; LD/SD 실루엣 21파츠 텍스처 아틀라스</h2>
                   </div>
-                  <div className="sprite-guide-zoom-controls" role="group" aria-label="시트 배율">
+                  <div className="sprite-guide-zoom-controls" role="group" aria-label="아틀라스 배율">
                     {(["fit", 100, 150, 200] as const).map((level) => (
                       <button
                         key={String(level)}
@@ -3372,7 +3856,7 @@ export default function App() {
                             }
                       }
                       src={spriteGuideUrl}
-                      alt="일러스트 구도 및 21개 파츠 스프라이트 분해 예시"
+                      alt="일러스트 구도 및 21개 파츠 텍스처 아틀라스 분해 예시"
                       onClick={() =>
                         setGuideZoom((z) => (z === "fit" ? 150 : z === 150 ? 200 : "fit"))
                       }
@@ -3387,7 +3871,7 @@ export default function App() {
                   <button
                     onClick={() => {
                       downloadSpriteGuide();
-                      notify("스프라이트 준비 가이드 PNG를 저장했습니다.");
+                      notify("텍스처 아틀라스 준비 가이드 PNG를 저장했습니다.");
                     }}
                   >
                     <Download size={14} />
@@ -3511,12 +3995,12 @@ export default function App() {
                     }}
                   >
                     <CircleHelp size={15} />
-                    권장 일러스트 · 파츠 예시 시트 확대 보기
+                    권장 일러스트 · 텍스처 아틀라스 예시 확대 보기
                   </button>
                   <button
                     onClick={() => {
                       downloadSpriteGuide();
-                      notify("스프라이트 준비 가이드 PNG를 저장했습니다.");
+                      notify("텍스처 아틀라스 준비 가이드 PNG를 저장했습니다.");
                     }}
                   >
                     <Download size={14} />

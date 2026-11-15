@@ -419,9 +419,10 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
     return scratch;
   }
 
-  const clippingTargets = p.rigProfile.clippingTargets ?? {
+  const baseClippingTargets = p.rigProfile.clippingTargets ?? {
     eyeL_iris: "eyeL_white",
     eyeR_iris: "eyeR_white",
+    face_detail: "face",
   };
 
   const orderedParts = [...p.parts]
@@ -435,6 +436,33 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
   const visibleOrdered = orderedParts.filter(
     ({ part }) => part.visible && part.status !== "missing" && (!soloPartId || part.id === soloPartId),
   );
+  const hasFaceFill = visibleOrdered.some(
+    ({ part }) => part.id === "face" && Boolean(part.fillMask),
+  );
+  const scleraHasFill = (targetId: string) =>
+    visibleOrdered.some(
+      ({ part }) => part.id === targetId && Boolean(part.fillMask?.some((v) => v > 0)),
+    );
+  const clippingTargets: Record<string, string> = {};
+  for (const [childId, targetId] of Object.entries(baseClippingTargets)) {
+    if (
+      targetId === "face"
+        ? hasFaceFill
+        : moving || scleraHasFill(targetId)
+    ) {
+      clippingTargets[childId] = targetId;
+    }
+  }
+  if (hasFaceFill) {
+    Object.assign(clippingTargets, {
+      face_detail: "face",
+      mouth_inner: "face",
+      mouth_upper: "face",
+      mouth_lower: "face",
+      mouth_sub_skin: "face",
+      mouth_sub_inner: "face",
+    });
+  }
   const subsAtSlot = new Map<string, ShapeSubstituteAsset[]>();
   const subsAfterFace: ShapeSubstituteAsset[] = [];
   const subsUnanchored: ShapeSubstituteAsset[] = [];
@@ -538,6 +566,10 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
       if (previewDeform && !soloPartId) {
         if (part.id === "eyeL_iris") partAlpha = evaluated.eyeIrisAlpha.L;
         else if (part.id === "eyeR_iris") partAlpha = evaluated.eyeIrisAlpha.R;
+        else if (part.id === "eyeL_white") partAlpha = evaluated.eyeWhiteAlpha.L;
+        else if (part.id === "eyeR_white") partAlpha = evaluated.eyeWhiteAlpha.R;
+        else if (part.id === "eyeL_lower") partAlpha = evaluated.eyeLowerAlpha.L;
+        else if (part.id === "eyeR_lower") partAlpha = evaluated.eyeLowerAlpha.R;
         else if (part.id === "mouth_inner") partAlpha = evaluated.mouthInteriorAlpha;
       }
       pushLayer(
@@ -569,7 +601,7 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
       p.width,
       p.height,
       clippingTargets,
-      moving && !soloPartId,
+      !soloPartId && Object.keys(clippingTargets).length > 0,
     );
 
   if (glRendered && scratch.gl) {
@@ -621,7 +653,7 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
           moving,
           spec.posedPoints,
         );
-        if (moving && !soloPartId) {
+        if (!soloPartId) {
           let targetCanvas = scratch.scleraTargets.get(partObj.id);
           if (
             !targetCanvas ||
@@ -647,7 +679,7 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
           );
           renderedSclera.set(partObj.id, targetCanvas);
         }
-      } else if (clippingTargets[partObj.id] && moving && !soloPartId) {
+      } else if (clippingTargets[partObj.id] && !soloPartId) {
         const sclera = renderedSclera.get(clippingTargets[partObj.id]);
         if (sclera) {
           const iCtx = scratch.iris.getContext("2d")!;

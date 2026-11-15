@@ -163,6 +163,11 @@ struct AnalyzedEvidence {
     iris_l: IrisFit,
     mouth_u: f64,
     mouth_v: f64,
+    true_mouth_mask: Vec<bool>,
+    true_mouth_open_core: Vec<bool>,
+    true_mouth_rx: f64,
+    true_mouth_ry: f64,
+    has_true_mouth: bool,
     torso_cx_u: f64,
     clothes_top_v: f64,
     clothes_top_u_bins: Vec<f64>,
@@ -359,7 +364,8 @@ fn build_color_field(
     h: usize,
     fallback: [u8; 3],
 ) -> ColorField {
-    let step = (w.max(h) / 128).clamp(2, 8);
+    // Use a fine <= 4px grid so harmonic infill has zero visible square blockiness.
+    let step = (w.max(h) / 256).clamp(2, 4);
     let gw = w.div_ceil(step).max(4);
     let gh = h.div_ceil(step).max(4);
     let gn = gw * gh;
@@ -423,9 +429,8 @@ fn build_color_field(
         }
     }
 
-    // Harmonic Jacobi relaxation across non-pinned cells for smooth gradients across holes/occlusions.
-    let mut next = rgb.clone();
-    for _ in 0..18 {
+    // In-place Gauss-Seidel harmonic relaxation across non-pinned cells for smooth occlusion fill.
+    for _ in 0..48 {
         for gy in 0..gh {
             for gx in 0..gw {
                 let gi = gy * gw + gx;
@@ -443,7 +448,7 @@ fn build_color_field(
                 .into_iter()
                 .flatten()
                 {
-                    let wt = if pinned[nb] { 2.0 } else { 1.0 };
+                    let wt = if pinned[nb] { 1.5 } else { 1.0 };
                     for ch in 0..3 {
                         acc[ch] += rgb[nb][ch] * wt;
                     }
@@ -451,12 +456,11 @@ fn build_color_field(
                 }
                 if w_sum > 0.0 {
                     for ch in 0..3 {
-                        next[gi][ch] = acc[ch] / w_sum;
+                        rgb[gi][ch] = acc[ch] / w_sum;
                     }
                 }
             }
         }
-        std::mem::swap(&mut rgb, &mut next);
     }
 
     ColorField { gw, gh, step, rgb }
@@ -875,15 +879,17 @@ fn analyze_evidence(
                         mouth_open_px += 1;
                     }
                 }
-                if is_eye_r {
+                if is_eye_r && !hair_raw[i] && !clothes_raw[i] {
                     eye_r_us.push(u);
                     eye_r_vs.push(v);
                 }
-                if is_eye_l {
+                if is_eye_l && !hair_raw[i] && !clothes_raw[i] {
                     eye_l_us.push(u);
                     eye_l_vs.push(v);
                 }
                 if is_eye_r_any
+                    && !hair_raw[i]
+                    && !clothes_raw[i]
                     && (u - eye_r_lm_u).abs() <= eye_dist * 0.42
                     && (v - eye_r_lm_v).abs() <= eye_dist * 0.44
                 {
@@ -892,6 +898,8 @@ fn analyze_evidence(
                     eye_r_full_mask[i] = true;
                 }
                 if is_eye_l_any
+                    && !hair_raw[i]
+                    && !clothes_raw[i]
                     && (u - eye_l_lm_u).abs() <= eye_dist * 0.42
                     && (v - eye_l_lm_v).abs() <= eye_dist * 0.44
                 {
@@ -1153,12 +1161,307 @@ fn analyze_evidence(
 
     let avg_eye_rx = 0.5 * (er_rx + el_rx);
     let avg_eye_ry = 0.5 * (er_ry + el_ry);
-    let er_rx = 0.55 * er_rx + 0.45 * avg_eye_rx;
-    let el_rx = 0.55 * el_rx + 0.45 * avg_eye_rx;
-    let er_ry = 0.55 * er_ry + 0.45 * avg_eye_ry;
-    let el_ry = 0.55 * el_ry + 0.45 * avg_eye_ry;
+    let _ = (avg_eye_rx, avg_eye_ry);
 
-    let (mouth_w_ratio, mouth_h_ratio) = {
+    // Focused single-eye selection & bilateral symmetry in HeadFrame (excluding hair/accessories):
+    // Score cleanliness of R vs L eye evidence so the sharper unoccluded eye guides symmetrical socket geometry.
+    let mut r_clean_px = 0usize;
+    let mut l_clean_px = 0usize;
+    let mut r_hair_occ = 0usize;
+    let mut l_hair_occ = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if eye_r_full_mask[i] {
+                r_clean_px += 1;
+            }
+            if eye_l_full_mask[i] {
+                l_clean_px += 1;
+            }
+            if hair_raw[i] {
+                let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                if (u - er_u).abs() <= er_rx * 1.05 && (v - er_v).abs() <= er_ry * 1.05 {
+                    r_hair_occ += 1;
+                }
+                if (u - el_u).abs() <= el_rx * 1.05 && (v - el_v).abs() <= el_ry * 1.05 {
+                    l_hair_occ += 1;
+                }
+            }
+        }
+    }
+    let r_score = (r_clean_px as f64) - (r_hair_occ as f64) * 1.35;
+    let l_score = (l_clean_px as f64) - (l_hair_occ as f64) * 1.35;
+    let dom_is_left = l_score >= r_score;
+    let (dom_cnt, weak_cnt) = if dom_is_left {
+        (l_clean_px, r_clean_px)
+    } else {
+        (r_clean_px, l_clean_px)
+    };
+    let w_dom = if weak_cnt * 2 < dom_cnt.max(1) { 1.0 } else { 0.80 };
+    let (dom_u, dom_v, dom_rx, dom_ry, oth_u, oth_v, oth_rx, oth_ry) = if dom_is_left {
+        (el_u, el_v, el_rx, el_ry, er_u, er_v, er_rx, er_ry)
+    } else {
+        (er_u, er_v, er_rx, er_ry, el_u, el_v, el_rx, el_ry)
+    };
+    let sym_rx = dom_rx * w_dom + oth_rx * (1.0 - w_dom);
+    let sym_ry = dom_ry * w_dom + oth_ry * (1.0 - w_dom);
+    let sym_v = (dom_v * w_dom + oth_v * (1.0 - w_dom))
+        .clamp(-eye_dist * 0.04, eye_dist * 0.04);
+    let sym_abs_u = (dom_u.abs() * w_dom + oth_u.abs() * (1.0 - w_dom))
+        .clamp(eye_dist * 0.44, eye_dist * 0.56);
+    let (er_u, el_u) = (-sym_abs_u, sym_abs_u);
+    let (er_v, el_v) = (sym_v, sym_v);
+    let (er_rx, el_rx) = (sym_rx, sym_rx);
+    let (er_ry, el_ry) = (sym_ry, sym_ry);
+
+    // Sample clean eroded skin palette early so true painted mouth pixel detection uses actual face tones.
+    let mut face_skin_only: Vec<bool> = face_skin_raw
+        .iter()
+        .zip(hair_raw.iter())
+        .map(|(&f, &hr)| f && !hr)
+        .collect();
+    if face_skin_only.iter().filter(|&&v| v).count() < 16 {
+        face_skin_only.clone_from(&face_skin_raw);
+    }
+    let face_eroded = erode_mask(&face_skin_only, w, h, 3);
+    let skin_base = sample_quantile_color(rgba, &face_eroded, 0.62, [246, 224, 212]);
+    let raw_skin_shadow = sample_quantile_color(rgba, &face_eroded, 0.24, scale_rgb(skin_base, 0.87));
+    let skin_shadow = if rgb_dist(raw_skin_shadow, skin_base) <= 72.0
+        && luma(raw_skin_shadow) >= luma(skin_base) * 0.68
+    {
+        raw_skin_shadow
+    } else {
+        scale_rgb(skin_base, 0.87)
+    };
+
+    // Detect actual painted mouth pixels (outline, lip tint, or cavity) instead of slicing cheek slabs.
+    // Anchor search between midline (0.0) and landmark so hand/chin-rest bias does not miss a small central mouth.
+    let mouth_search_u = (mouth_lm_u.clamp(-eye_dist * 0.18, eye_dist * 0.18)) * 0.55;
+    let mouth_mid_span = (mouth_lm_u.abs() + eye_dist * 0.16).clamp(eye_dist * 0.22, eye_dist * 0.30);
+    let mut perioral_mask = vec![false; n];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if !face_skin_raw[i] || hair_raw[i] || mouth_raw[i] {
+                continue;
+            }
+            let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+            let du = (u - mouth_search_u).abs();
+            let dv = (v - mouth_lm_v).abs();
+            if du >= eye_dist * 0.14 && du <= eye_dist * 0.32 && dv <= eye_dist * 0.09 {
+                perioral_mask[i] = true;
+            }
+        }
+    }
+    let local_mouth_skin = sample_quantile_color(rgba, &perioral_mask, 0.58, skin_base);
+    let local_skin_luma = luma(local_mouth_skin);
+    let mut mouth_cand = vec![false; n];
+    let mouth_roi_v_bot = (mouth_lm_v + eye_dist * 0.15).min(frame.chin_v - eye_dist * 0.02);
+    let mouth_roi_v_top = mouth_lm_v - eye_dist * 0.14;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if fg_alpha[i] <= 64 || hair_raw[i] || clothes_raw[i] {
+                continue;
+            }
+            let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+            if ((u - mouth_search_u).abs() > mouth_mid_span && (u - mouth_lm_u).abs() > eye_dist * 0.18)
+                || v < mouth_roi_v_top
+                || v > mouth_roi_v_bot
+            {
+                continue;
+            }
+            let px = pix_rgb(rgba, i);
+            let dl = local_skin_luma - luma(px);
+            let dc = rgb_dist(px, local_mouth_skin);
+            let warm_delta = (px[0] as f64 - px[1] as f64)
+                - (local_mouth_skin[0] as f64 - local_mouth_skin[1] as f64);
+            if dl >= 20.0
+                || (dc >= 17.0 && warm_delta >= 5.0)
+                || (luma(px) >= local_skin_luma + 12.0 && dc >= 16.0)
+            {
+                mouth_cand[i] = true;
+            }
+        }
+    }
+    let mut true_mouth_mask = vec![false; n];
+    let mut true_mouth_open_core = vec![false; n];
+    let mut m_seen = vec![false; n];
+    let mut mouth_comps: Vec<(f64, Vec<usize>, f64, f64, f64, f64)> = Vec::new();
+    for start in 0..n {
+        if m_seen[start] || !mouth_cand[start] {
+            continue;
+        }
+        m_seen[start] = true;
+        let mut stack = vec![start];
+        let mut comp = Vec::new();
+        let mut min_u = f64::INFINITY;
+        let mut max_u = f64::NEG_INFINITY;
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
+        let mut sum_u = 0.0f64;
+        let mut sum_v = 0.0f64;
+        let mut min_lm_dist = f64::INFINITY;
+        let mut min_mid_dist = f64::INFINITY;
+        while let Some(cur) = stack.pop() {
+            comp.push(cur);
+            let cx = cur % w;
+            let cy = cur / w;
+            let (cu, cv) = frame.to_local(DVec2::new(cx as f64, cy as f64));
+            min_u = min_u.min(cu);
+            max_u = max_u.max(cu);
+            min_v = min_v.min(cv);
+            max_v = max_v.max(cv);
+            sum_u += cu;
+            sum_v += cv;
+            min_lm_dist = min_lm_dist.min((cu - mouth_lm_u).hypot(cv - mouth_lm_v));
+            min_mid_dist = min_mid_dist.min((cu - mouth_search_u).hypot(cv - mouth_lm_v));
+            for dy in -1isize..=1 {
+                let ny = cy as isize + dy;
+                if ny < 0 || ny >= h as isize {
+                    continue;
+                }
+                for dx in -1isize..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = cx as isize + dx;
+                    if nx < 0 || nx >= w as isize {
+                        continue;
+                    }
+                    let ni = ny as usize * w + nx as usize;
+                    if !m_seen[ni] && mouth_cand[ni] {
+                        m_seen[ni] = true;
+                        stack.push(ni);
+                    }
+                }
+            }
+        }
+        if comp.len() < 4 {
+            continue;
+        }
+        let cu = sum_u / comp.len() as f64;
+        let cv = sum_v / comp.len() as f64;
+        let anchor_dist = min_lm_dist.min(min_mid_dist);
+        let cent_dist = (cu - mouth_search_u).hypot(cv - mouth_lm_v);
+        // Ignore oversized cheek/jaw shadow spills and detached nose dots high above mouth.
+        if (max_u - min_u) > eye_dist * 0.42 || (max_v - min_v) > eye_dist * 0.25 {
+            continue;
+        }
+        if anchor_dist <= eye_dist * 0.14 || (cu.abs() <= eye_dist * 0.10 && (cv - mouth_lm_v).abs() <= eye_dist * 0.11) {
+            let enclosed_aspect = ((max_v - min_v) / (max_u - min_u).max(2.0)).clamp(0.0, 1.0);
+            let bonus = if comp.len() >= 18 && enclosed_aspect >= 0.35 {
+                eye_dist * 0.04
+            } else {
+                0.0
+            };
+            let score = min_lm_dist.min(min_mid_dist + eye_dist * 0.015) + cent_dist * 0.35 - bonus;
+            mouth_comps.push((score, comp, min_u, max_u, min_v, max_v));
+        }
+    }
+    mouth_comps.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut has_true_mouth = false;
+    let mut obs_mouth_u = mouth_lm_u;
+    let mut obs_mouth_v = mouth_lm_v;
+    let mut true_mouth_rx = eye_dist * if is_sd { 0.085 } else { 0.14 };
+    let mut true_mouth_ry = eye_dist * 0.030;
+    let mut true_mouth_open_ratio = 0.0f64;
+
+    if let Some((_, primary, p_u0, p_u1, p_v0, p_v1)) = mouth_comps.first() {
+        for &i in primary {
+            true_mouth_mask[i] = true;
+        }
+        let merge_pad = eye_dist * 0.032;
+        for (_, other, u0, u1, v0, v1) in mouth_comps.iter().skip(1) {
+            if *u1 >= p_u0 - merge_pad
+                && *u0 <= p_u1 + merge_pad
+                && *v1 >= p_v0 - merge_pad
+                && *v0 <= p_v1 + merge_pad
+            {
+                for &i in other {
+                    true_mouth_mask[i] = true;
+                }
+            }
+        }
+        let mut x0 = w;
+        let mut x1 = 0usize;
+        let mut y0 = h;
+        let mut y1 = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                if true_mouth_mask[y * w + x] {
+                    x0 = x0.min(x);
+                    x1 = x1.max(x);
+                    y0 = y0.min(y);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        // Fill strictly enclosed interior pockets (e.g. teeth/highlight inside `'o'` outline) and mark open core.
+        for y in (y0 + 1)..y1 {
+            for x in (x0 + 1)..x1 {
+                let i = y * w + x;
+                let has_l = (x0..x).any(|lx| true_mouth_mask[y * w + lx]);
+                let has_r = ((x + 1)..=x1).any(|rx| true_mouth_mask[y * w + rx]);
+                let has_t = (y0..y).any(|ty| true_mouth_mask[ty * w + x]);
+                let has_b = ((y + 1)..=y1).any(|by| true_mouth_mask[by * w + x]);
+                if has_l && has_r && has_t && has_b {
+                    true_mouth_mask[i] = true;
+                    let px = pix_rgb(rgba, i);
+                    let dl = local_skin_luma - luma(px);
+                    let warm_delta = (px[0] as f64 - px[1] as f64)
+                        - (local_mouth_skin[0] as f64 - local_mouth_skin[1] as f64);
+                    // Interior pixels not on outer dark border belong to `mouth_inner` cavity/teeth/tongue.
+                    if dl < 58.0 || warm_delta >= 12.0 || rgb_dist(px, local_mouth_skin) >= 20.0 {
+                        true_mouth_open_core[i] = true;
+                    }
+                }
+            }
+        }
+        let mut tu0 = f64::INFINITY;
+        let mut tu1 = f64::NEG_INFINITY;
+        let mut tv0 = f64::INFINITY;
+        let mut tv1 = f64::NEG_INFINITY;
+        let mut total_cnt = 0usize;
+        let mut open_cnt = 0usize;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let i = y * w + x;
+                if true_mouth_mask[i] {
+                    let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                    tu0 = tu0.min(u);
+                    tu1 = tu1.max(u);
+                    tv0 = tv0.min(v);
+                    tv1 = tv1.max(v);
+                    total_cnt += 1;
+                    if true_mouth_open_core[i] {
+                        open_cnt += 1;
+                    }
+                }
+            }
+        }
+        if total_cnt >= 6 {
+            has_true_mouth = true;
+            obs_mouth_u = 0.5 * (tu0 + tu1);
+            obs_mouth_v = 0.5 * (tv0 + tv1);
+            true_mouth_rx = (0.5 * (tu1 - tu0)).clamp(eye_dist * 0.038, eye_dist * 0.22);
+            true_mouth_ry = (0.5 * (tv1 - tv0)).clamp(eye_dist * 0.012, eye_dist * 0.12);
+            let span_v = (tv1 - tv0).max(1.0);
+            let span_u = (tu1 - tu0).max(1.0);
+            if open_cnt >= 12 && span_v >= span_u * 0.32 && span_v >= 5.0 {
+                true_mouth_open_ratio = (open_cnt as f64 / total_cnt.max(1) as f64).clamp(0.32, 1.0);
+            } else {
+                true_mouth_open_core.fill(false);
+            }
+        }
+    }
+
+    let (mouth_w_ratio, mouth_h_ratio) = if has_true_mouth {
+        (
+            (true_mouth_rx / eye_dist).clamp(0.038, 0.22),
+            (true_mouth_ry / eye_dist).clamp(0.012, 0.12),
+        )
+    } else {
         let mut tight_u = Vec::new();
         let mut tight_v = Vec::new();
         for (&mu, &mv) in mouth_us.iter().zip(&mouth_vs) {
@@ -1194,8 +1497,10 @@ fn analyze_evidence(
     let back_max_v = reach_quantile(back_vs, frame.chin_v);
 
     let is_thin_closed_mouth =
-        mouth_h_ratio / mouth_w_ratio.max(0.03) < 0.36 || mouth_h_ratio < 0.035;
-    let mouth_open_ratio = if is_thin_closed_mouth {
+        mouth_h_ratio / mouth_w_ratio.max(0.03) < 0.36 || mouth_h_ratio < 0.032;
+    let mouth_open_ratio = if has_true_mouth {
+        true_mouth_open_ratio
+    } else if is_thin_closed_mouth {
         0.0
     } else {
         (mouth_open_px as f64 / mouth_total_px.max(1) as f64).clamp(0.0, 1.0)
@@ -1368,35 +1673,41 @@ fn analyze_evidence(
         )),
     };
 
-    // Sample clean eroded palette colors (exclude hair overlaps so bangs never hijack `skin_shadow`).
-    let mut face_skin_only: Vec<bool> = face_skin_raw
-        .iter()
-        .zip(hair_raw.iter())
-        .map(|(&f, &hr)| f && !hr)
-        .collect();
-    if face_skin_only.iter().filter(|&&v| v).count() < 16 {
-        face_skin_only.clone_from(&face_skin_raw);
-    }
-    let face_eroded = erode_mask(&face_skin_only, w, h, 3);
-    let skin_base = sample_quantile_color(rgba, &face_eroded, 0.62, [246, 224, 212]);
-    let raw_skin_shadow = sample_quantile_color(rgba, &face_eroded, 0.24, scale_rgb(skin_base, 0.87));
-    let skin_shadow = if rgb_dist(raw_skin_shadow, skin_base) <= 72.0
-        && luma(raw_skin_shadow) >= luma(skin_base) * 0.68
-    {
-        raw_skin_shadow
-    } else {
-        scale_rgb(skin_base, 0.87)
-    };
-
     let hair_eroded = erode_mask(&hair_raw, w, h, 2);
     let hair_base = sample_quantile_color(rgba, &hair_eroded, 0.56, [72, 62, 86]);
     let hair_shadow = sample_quantile_color(rgba, &hair_eroded, 0.22, scale_rgb(hair_base, 0.72));
 
-    let sclera_white = sample_quantile_color(rgba, &sclera_raw, 0.82, [248, 247, 251]);
+    let mut sclera_clean_seeds = vec![false; n];
+    for (i, &is_sc) in sclera_raw.iter().enumerate() {
+        if is_sc {
+            let rgb = pix_rgb(rgba, i);
+            let ch = rgb[0].max(rgb[1]).max(rgb[2]).saturating_sub(rgb[0].min(rgb[1]).min(rgb[2]));
+            if luma(rgb) >= 210.0 && ch <= 32 {
+                sclera_clean_seeds[i] = true;
+            }
+        }
+    }
+    let raw_sclera = sample_quantile_color(rgba, &sclera_clean_seeds, 0.80, [248, 247, 251]);
+    let sclera_white = if luma(raw_sclera) >= 218.0 && (raw_sclera[0] as i32 - raw_sclera[2] as i32) <= 14 {
+        raw_sclera
+    } else {
+        [248, 247, 251]
+    };
     let sclera_shadow = lerp_rgb(sclera_white, [186, 188, 214], 0.38);
     let lash_color = sample_quantile_color(rgba, &lash_raw, 0.14, [42, 34, 44]);
     let brow_color = sample_quantile_color(rgba, &brow_raw, 0.24, scale_rgb(hair_base, 0.68));
-    let mouth_line = sample_quantile_color(rgba, &mouth_raw, 0.22, [132, 74, 78]);
+    let mut mouth_seed_mask = vec![false; n];
+    if has_true_mouth {
+        for i in 0..n {
+            if true_mouth_mask[i] && !true_mouth_open_core[i] {
+                mouth_seed_mask[i] = true;
+            }
+        }
+    }
+    if mouth_seed_mask.iter().filter(|&&v| v).count() < 4 {
+        mouth_seed_mask = if has_true_mouth { true_mouth_mask.clone() } else { mouth_raw.clone() };
+    }
+    let mouth_line = sample_quantile_color(rgba, &mouth_seed_mask, 0.22, [132, 74, 78]);
 
     let clothes_eroded = erode_mask(&clothes_raw, w, h, 3);
     let clothes_primary = sample_quantile_color(rgba, &clothes_eroded, 0.55, [196, 198, 208]);
@@ -1458,6 +1769,39 @@ fn analyze_evidence(
         iris_l.limbal = iris_r.limbal;
         iris_l.mid = iris_r.mid;
         iris_l.pupil = iris_r.pupil;
+    } else if iris_r.sample_count >= 12 || iris_l.sample_count >= 12 {
+        // Synchronize symmetric iris geometry from the dominant clean eye while preserving
+        // each eye's own sampled RGB colors (so heterochromia stays intact).
+        let (dom_iris, dom_eu, oth_iris, oth_eu) = if dom_is_left {
+            (&iris_l, el_u, &iris_r, er_u)
+        } else {
+            (&iris_r, er_u, &iris_l, el_u)
+        };
+        let sym_irx = dom_iris.rx * w_dom + oth_iris.rx * (1.0 - w_dom);
+        let sym_iry = dom_iris.ry * w_dom + oth_iris.ry * (1.0 - w_dom);
+        let sym_icv = dom_iris.center_v * w_dom + oth_iris.center_v * (1.0 - w_dom);
+        let dom_du = dom_iris.center_u - dom_eu;
+        let oth_du = -(oth_iris.center_u - oth_eu);
+        let sym_du = dom_du * w_dom + oth_du * (1.0 - w_dom);
+        if dom_is_left {
+            iris_l.rx = sym_irx;
+            iris_l.ry = sym_iry;
+            iris_l.center_v = sym_icv;
+            iris_l.center_u = el_u + sym_du;
+            iris_r.rx = sym_irx;
+            iris_r.ry = sym_iry;
+            iris_r.center_v = sym_icv;
+            iris_r.center_u = er_u - sym_du;
+        } else {
+            iris_r.rx = sym_irx;
+            iris_r.ry = sym_iry;
+            iris_r.center_v = sym_icv;
+            iris_r.center_u = er_u + sym_du;
+            iris_l.rx = sym_irx;
+            iris_l.ry = sym_iry;
+            iris_l.center_v = sym_icv;
+            iris_l.center_u = el_u - sym_du;
+        }
     }
 
     let iris_r_ratio = 0.5 * (iris_r.rx + iris_l.rx) / eye_dist;
@@ -1492,8 +1836,13 @@ fn analyze_evidence(
         eye_l_ry: el_ry,
         iris_r,
         iris_l,
-        mouth_u: mouth_lm_u,
-        mouth_v: mouth_lm_v,
+        mouth_u: obs_mouth_u,
+        mouth_v: obs_mouth_v,
+        true_mouth_mask,
+        true_mouth_open_core,
+        true_mouth_rx,
+        true_mouth_ry,
+        has_true_mouth,
         torso_cx_u,
         clothes_top_v: clothes_min_v.clamp(frame.chin_v + hh * 0.14, frame.chin_v + hh * 0.52),
         clothes_top_u_bins,
@@ -1696,6 +2045,9 @@ fn bang_tip_v(style: &str, u_norm: f64, frame: HeadFrame) -> f64 {
 }
 
 fn mouth_radii(ev: &AnalyzedEvidence, eye_dist: f64, mouth_style: &str) -> (f64, f64) {
+    if ev.has_true_mouth {
+        return (ev.true_mouth_rx, ev.true_mouth_ry);
+    }
     if mouth_style == "open_o" {
         let min_rx = if ev.is_sd { 0.065 } else { 0.11 };
         let m_rx = (ev.metrics.mouth_width_ratio * eye_dist).clamp(eye_dist * min_rx, eye_dist * 0.15);
@@ -3368,6 +3720,52 @@ fn extract_outfit_sublayers(
     result
 }
 
+/// Returns true for hair & head-wear layers assigned to Stage 4 (`hair_overlay`).
+pub fn is_hair_stage_layer(id: &str) -> bool {
+    id.starts_with("hair_") || id == "hat" || id == "acc_hairpin" || id == "acc_ribbon"
+}
+
+/// Maps any layer ID into its canonical 4-stage hybrid stacking stage:
+/// `"base_silhouette"` -> `"features_overlay"` -> `"clothes_overlay"` -> `"hair_overlay"`.
+pub fn layer_pipeline_stage(id: &str) -> &'static str {
+    if is_hair_stage_layer(id) {
+        "hair_overlay"
+    } else if id == "clothes"
+        || id.starts_with("clothes_")
+        || id == "hands"
+        || id.starts_with("hands_")
+        || id == "acc_glasses"
+    {
+        "clothes_overlay"
+    } else if matches!(
+        id,
+        "body" | "neck" | "face" | "eyeR_white" | "eyeL_white" | "mouth_inner"
+    ) {
+        "base_silhouette"
+    } else {
+        "features_overlay"
+    }
+}
+
+pub fn normalize_pipeline_stage(stage: &str) -> &'static str {
+    match stage {
+        "base_silhouette" => "base_silhouette",
+        "features_overlay" => "features_overlay",
+        "clothes_overlay" => "clothes_overlay",
+        "hair_overlay" => "hair_overlay",
+        "base_body" => "base_body",
+        _ => "full",
+    }
+}
+
+pub fn stage_includes_layer(id: &str, stage: &str) -> bool {
+    match stage {
+        "full" => true,
+        "base_body" => !is_hair_stage_layer(id),
+        _ => layer_pipeline_stage(id) == stage,
+    }
+}
+
 /// Generates layered parametric masks (`masks`, `fill_masks`, `textures`) in Z-order plus separated hats/clothes/accessories.
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize_template_bank(
@@ -3382,6 +3780,37 @@ pub fn synthesize_template_bank(
     evidence_confidences: &[f64],
     overrides: &TemplateStyleSelection,
 ) -> TemplateSynthesisOutput {
+    synthesize_template_bank_for_stage(
+        rgba,
+        w,
+        h,
+        landmarks,
+        points_28,
+        evidence_ids,
+        evidence_masks,
+        evidence_provenances,
+        evidence_confidences,
+        overrides,
+        "full",
+    )
+}
+
+/// Generates stage-filtered template layers (`"base_silhouette" | "features_overlay" | "clothes_overlay" | "hair_overlay" | "base_body" | "full"`) after full-image analysis.
+#[allow(clippy::too_many_arguments)]
+pub fn synthesize_template_bank_for_stage(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    landmarks: &Landmarks,
+    points_28: &[Landmark28Point],
+    evidence_ids: &[String],
+    evidence_masks: &[Vec<u8>],
+    evidence_provenances: &[String],
+    evidence_confidences: &[f64],
+    overrides: &TemplateStyleSelection,
+    pipeline_stage: &str,
+) -> TemplateSynthesisOutput {
+    let stage = normalize_pipeline_stage(pipeline_stage);
     let n = w * h;
     let frame = HeadFrame::from_landmarks(landmarks, w, h);
     let eye_dist = frame.eye_dist.max(8.0);
@@ -3478,12 +3907,7 @@ pub fn synthesize_template_bank(
     }
 
     // 2. Build clean harmonic color fields from inward-eroded seeds so hidden layers have zero smear.
-    let face_erosion_r = (eye_dist * 0.024).round().clamp(3.0, 8.0) as usize;
-    let mut pure_face_seeds = erode_mask(&ev_face, w, h, face_erosion_r);
-    if pure_face_seeds.iter().filter(|&&v| v).count() < 16 {
-        pure_face_seeds = erode_mask(&ev_face, w, h, 2);
-    }
-    let skin_base_luma = luma(ev.palette.skin_base);
+    let mut hole_guard = vec![false; n];
     for i in 0..n {
         if ev_hair_all[i]
             || ev_eye_r_all[i]
@@ -3491,15 +3915,34 @@ pub fn synthesize_template_bank(
             || ev_mouth_all[i]
             || ev_brow_r[i]
             || ev_brow_l[i]
+            || (!ev_face[i] && ev.fg_alpha[i] > 32)
         {
+            hole_guard[i] = true;
+        }
+    }
+    let hole_guard_rad = (eye_dist * 0.028).round().clamp(5.0, 10.0) as usize;
+    let hole_guard_dil = dilate_mask(&hole_guard, w, h, hole_guard_rad);
+    let face_erosion_r = (eye_dist * 0.024).round().clamp(3.0, 8.0) as usize;
+    let mut pure_face_seeds = erode_mask(&ev_face, w, h, face_erosion_r);
+    if pure_face_seeds.iter().filter(|&&v| v).count() < 16 {
+        pure_face_seeds = erode_mask(&ev_face, w, h, 2);
+    }
+    let skin_base_luma = luma(ev.palette.skin_base);
+    for i in 0..n {
+        if hole_guard_dil[i] {
             pure_face_seeds[i] = false;
             continue;
         }
         let k = i * 4;
         let rgb = [rgba[k], rgba[k + 1], rgba[k + 2]];
-        if luma(rgb) < skin_base_luma * 0.78
+        let ch_span = rgb[0].max(rgb[1]).max(rgb[2]).saturating_sub(rgb[0].min(rgb[1]).min(rgb[2]));
+        let is_sclera_like = luma(rgb) > skin_base_luma + 10.0 && ch_span < 12;
+        let is_cool_tint = (rgb[2] as i32) > (rgb[0] as i32) + 2;
+        if luma(rgb) < skin_base_luma * 0.80
+            || is_sclera_like
+            || is_cool_tint
             || (!is_warm_blush_or_skin(rgb, ev.palette.skin_base)
-                && rgb_dist(rgb, ev.palette.skin_base) > 54.0)
+                && rgb_dist(rgb, ev.palette.skin_base) > 36.0)
         {
             pure_face_seeds[i] = false;
         }
@@ -3515,12 +3958,12 @@ pub fn synthesize_template_bank(
         eye_dist * 0.96,
         eye_dist * if ev.is_sd { 1.44 } else { 1.24 },
     );
-    let dynamic_side_reach = (ev.metrics.side_hair_reach + 0.24).min(0.88);
+    let dynamic_side_reach = (ev.metrics.side_hair_reach + 0.24).min(0.92);
     let side_max_v = match side_style {
-        "chest_locks" => frame.chin_v + hh * dynamic_side_reach.max(0.76),
-        "chin_bob" => frame.chin_v + hh * dynamic_side_reach.max(0.58),
-        "short_tuck" => frame.chin_v + hh * dynamic_side_reach.max(0.28),
-        "twin_frame" => frame.chin_v + hh * 0.88,
+        "chest_locks" => frame.chin_v + hh * dynamic_side_reach.max(0.84),
+        "chin_bob" => frame.chin_v + hh * dynamic_side_reach.max(0.72),
+        "short_tuck" => frame.chin_v + hh * dynamic_side_reach.max(0.32),
+        "twin_frame" => frame.chin_v + hh * 0.90,
         _ => frame.chin_v - hh * 0.02,
     };
     let back_max_v = match back_style {
@@ -3564,6 +4007,12 @@ pub fn synthesize_template_bank(
     let el_rx = ev.eye_l_rx;
     let el_ry = ev.eye_l_ry;
 
+    let true_mouth_dil1 = if ev.has_true_mouth {
+        dilate_mask(&ev.true_mouth_mask, w, h, 1)
+    } else {
+        vec![false; n]
+    };
+
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
@@ -3571,36 +4020,31 @@ pub fn synthesize_template_bank(
             let fg_a = ev.fg_alpha[i];
             let (fg_left_u, fg_right_u) = sample_fg_bounds(&ev, frame, v);
 
-            // --- Layer 0: hair_back (strictly inside character silhouette: behind head/neck/torso only) ---
+            // --- Layer 0: hair_back (organic oval behind head/neck/torso only, no hard flat boxes) ---
             let back_half_w = match back_style {
-                "long_wave" => (face_rx * 1.48).max((fg_right_u - fg_left_u) * 0.50),
-                "long_straight" => (face_rx * 1.32).max((fg_right_u - fg_left_u) * 0.48),
-                "twin_tails" => face_rx * 1.68,
-                "shoulder_bob" => face_rx * 1.30,
+                "long_wave" => face_rx * 1.44,
+                "long_straight" => face_rx * 1.32,
+                "twin_tails" => face_rx * 1.62,
+                "shoulder_bob" => face_rx * 1.28,
                 _ => face_rx * 1.16,
             };
             let back_cx = ev.torso_cx_u * smoothstep(frame.chin_v, back_max_v, v);
-            let back_span_v = (back_max_v - frame.chin_v).max(16.0);
+            let back_center_v = (frame.chin_v + frame.crown_v) * 0.5 + hh * 0.22;
+            let back_up_ry = (back_center_v - (frame.crown_v + hh * 0.04)).max(16.0);
+            let back_dn_ry = (back_max_v - back_center_v).max(16.0);
+            let back_ry = if v < back_center_v { back_up_ry } else { back_dn_ry };
             let back_oval_r = ((u - back_cx) / (back_half_w + 4.0).max(1.0))
-                .hypot((v - frame.chin_v).max(0.0) / back_span_v);
-            let skull_top_r = (u / (back_half_w + 4.0).max(1.0))
-                .hypot(((frame.crown_v + hh * 0.42) - v).max(0.0) / (hh * 0.28).max(1.0));
-            let deep_face_interior = face_sdf(u, v, frame, &ev) < -eye_dist * 0.36 && v < frame.chin_v;
+                .hypot((v - back_center_v) / back_ry);
+            let in_neck_or_body_occlude = (ev_neck[i]
+                || ((ev_clothes[i] || ev_body[i]) && v <= ev.clothes_top_v + hh * 0.24))
+                && v >= frame.chin_v - hh * 0.06
+                && (u - back_cx).abs() <= face_rx * 1.24;
             let in_back_hair_template = fg_a > 16
+                && back_oval_r <= 1.0
                 && !ev_face[i]
-                && !deep_face_interior
-                && v >= frame.crown_v + hh * 0.14
-                && skull_top_r <= 1.04
-                && v <= back_max_v
-                && (ev_hair_all[i]
-                    || ev_neck[i]
-                    || ev_body[i]
-                    || ev_clothes[i]
-                    || v >= frame.chin_v + hh * (if ev.is_sd { 0.06 } else { -0.10 }))
-                && (u - back_cx).abs() <= back_half_w
-                && (ev_hair_back[i] || back_oval_r <= 1.02);
+                && (ev_hair_all[i] || in_neck_or_body_occlude);
             if ev_hair_back[i] || in_back_hair_template {
-                let d_edge = (back_oval_r - 1.0) * back_half_w.min(back_span_v) * 0.55;
+                let d_edge = (back_oval_r - 1.0) * back_half_w.min(back_ry) * 0.55;
                 let base_a = if ev_hair_back[i] {
                     fg_a
                 } else {
@@ -3609,54 +4053,44 @@ pub fn synthesize_template_bank(
                 tpl_masks[0][i] = tpl_masks[0][i].max(base_a);
             }
 
-            // --- Layer 1: body (continuous mannequin base behind neck & clothes) ---
+            // --- Layer 1: body (continuous canonical SD/LD torso & shoulder silhouette behind neck & clothes) ---
             let shoulder_hw = (ev.metrics.shoulder_width_ratio * eye_dist).clamp(eye_dist * 1.18, eye_dist * 2.55);
             let body_top = frame.chin_v + hh * if ev.is_sd { 0.10 } else { 0.18 };
             let body_bot = ev.fg_max_v.max(frame.chin_v + hh * 1.05);
-            if v >= body_top && v <= body_bot && (ev_body[i] || ev_clothes[i] || ev_neck[i]) {
+            if v >= body_top && v <= body_bot {
                 let slope_t = smoothstep(body_top, body_top + hh * 0.35, v);
-                let w_at_v = eye_dist * 0.42 + slope_t * (shoulder_hw * 0.88 - eye_dist * 0.42);
+                let w_at_v = eye_dist * 0.44 + slope_t * (shoulder_hw * 0.88 - eye_dist * 0.44);
                 let bd = (u - ev.torso_cx_u).abs() - w_at_v;
-                if bd <= 1.5 || ev_body[i] {
-                    let ta = if ev_body[i] { fg_a } else { sdf_to_alpha(bd).min(fg_a) };
-                    tpl_masks[L_BODY][i] = tpl_masks[L_BODY][i].max(ta);
+                // Keep complete solid torso inside canonical SD/LD shoulders (never punch holes inside silhouette!)
+                if bd <= 1.5 {
+                    tpl_masks[L_BODY][i] = tpl_masks[L_BODY][i].max(sdf_to_alpha(bd));
+                }
+                if stage != "base_silhouette" && ev_body[i] {
+                    tpl_masks[L_BODY][i] = tpl_masks[L_BODY][i].max(fg_a);
                 }
             }
 
-            // --- Layer 2: neck (behind chin & collar so clothes cleanly sit on top of lower neck) ---
-            let neck_rx = eye_dist * if ev.is_sd { 0.18 } else { 0.30 };
-            let neck_top = frame.chin_v - hh * 0.10;
+            // --- Layer 2: neck (solid smooth SD/LD cylinder behind chin & chest, zero hair/collar cutouts) ---
+            let neck_rx = eye_dist * if ev.is_sd { 0.19 } else { 0.27 };
+            let neck_top = frame.chin_v - hh * 0.06;
             let neck_bot = if ev.is_sd {
-                (frame.chin_v + hh * 0.26).min(ev.clothes_top_v + hh * 0.12).max(frame.chin_v + hh * 0.10)
+                (frame.chin_v + hh * 0.26).max(ev.clothes_top_v + hh * 0.08)
             } else {
-                (frame.chin_v + hh * 0.48).max(ev.clothes_top_v + hh * 0.12)
+                (frame.chin_v + hh * 0.46).max(ev.clothes_top_v + hh * 0.12)
             };
-            if v >= neck_top
-                && v <= neck_bot
-                && (ev_neck[i] || ev_face[i] || ev_clothes[i] || ev_body[i] || ev_hair_all[i])
-            {
-                let flare = smoothstep(frame.chin_v + hh * 0.10, neck_bot, v)
-                    * (eye_dist * if ev.is_sd { 0.06 } else { 0.14 });
-                let nd = ((u - ev.torso_cx_u * 0.35).abs() - (neck_rx + flare))
-                    .max(neck_top - v)
-                    .max(v - neck_bot);
-                let neck_c = pix_rgb(rgba, i);
-                let is_cool_collar = (neck_c[2] as i32) > (neck_c[0] as i32) + 4
-                    && luma(neck_c) < luma(ev.palette.skin_base) * 0.78;
-                let is_neck_skin = !is_cool_collar
-                    && (is_warm_blush_or_skin(neck_c, ev.palette.skin_base)
-                        || rgb_dist(neck_c, ev.palette.skin_shadow) <= 46.0
-                        || (luma(neck_c) < luma(ev.palette.skin_base) * 0.65
-                            && (neck_c[0] as i32 - neck_c[2] as i32) >= -2));
-                let accept_ev_neck = ev_neck[i]
-                    && !ev.is_sd
-                    && !ev_clothes[i]
-                    && is_neck_skin
-                    && u.abs() <= neck_rx + eye_dist * 0.08
-                    && v <= neck_bot;
-                if nd <= 1.2 || accept_ev_neck {
-                    let ta = sdf_to_alpha(nd).min(fg_a);
-                    tpl_masks[L_NECK][i] = tpl_masks[L_NECK][i].max(ta).max(if accept_ev_neck { fg_a } else { 0 });
+            if v >= neck_top - 4.0 && v <= neck_bot + 4.0 {
+                let flare = smoothstep(frame.chin_v + hh * 0.08, neck_bot, v)
+                    * (eye_dist * if ev.is_sd { 0.05 } else { 0.10 });
+                let cur_rx = (neck_rx + flare).max(4.0);
+                let half_h = ((neck_bot - neck_top) * 0.5).max(4.0);
+                let cy = (neck_top + neck_bot) * 0.5;
+                let cx = ev.torso_cx_u * 0.35;
+                let cap_r = (cur_rx * 0.55).min(half_h * 0.65);
+                let qx = ((u - cx).abs() - (cur_rx - cap_r)).max(0.0);
+                let qy = ((v - cy).abs() - (half_h - cap_r)).max(0.0);
+                let nd = qx.hypot(qy) - cap_r;
+                if nd <= 1.2 {
+                    tpl_masks[L_NECK][i] = tpl_masks[L_NECK][i].max(sdf_to_alpha(nd));
                 }
             }
 
@@ -3675,23 +4109,38 @@ pub fn synthesize_template_bank(
                 }
             }
 
-            // --- Layer 4: face (solid hole-free skin sheet covering full eye sockets & mouth cavity) ---
+            // --- Layer 4: face (solid hole-free organic silhouette skin sheet, no boxy wings) ---
             let fd = face_sdf(u, v, frame, &ev);
-            let in_socket_interior = u.abs() <= er_u.abs().max(el_u.abs()) + er_rx.max(el_rx) * 1.45
-                && v >= er_v.min(el_v) - er_ry.max(el_ry) * 1.9
-                && v <= ev.mouth_v + hh * if ev.is_sd { 0.24 } else { 0.14 };
-            if ev_face[i] && fd <= 4.0 {
-                tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(fg_a);
-            } else if fd <= 1.5 && (fg_a > 16 || in_socket_interior) {
-                let cap = if fg_a > 16 { fg_a } else { 255 };
+            let in_socket_interior = u.abs() <= er_u.abs().max(el_u.abs()) + er_rx.max(el_rx) * 1.38
+                && v >= er_v.min(el_v) - er_ry.max(el_ry) * 1.95
+                && v <= ev.mouth_v + hh * if ev.is_sd { 0.18 } else { 0.10 };
+            let in_eye_or_mouth_ev = ev_eye_r_all[i]
+                || ev_eye_l_all[i]
+                || ev_brow_r[i]
+                || ev_brow_l[i]
+                || ev_mouth_all[i]
+                || ev.true_mouth_mask[i];
+            if fd <= 1.5 {
+                let cap = if stage == "base_silhouette"
+                    || fd <= 0.0
+                    || in_socket_interior
+                    || in_eye_or_mouth_ev
+                {
+                    255
+                } else {
+                    fg_a
+                };
                 tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(sdf_to_alpha(fd).min(cap));
-            } else if fd <= 14.0
-                && fg_a > 0
-                && in_socket_interior
-                && !ev_clothes[i]
-                && !ev_hair_back[i]
+            }
+            if stage != "base_silhouette"
+                && ((ev_face[i] && fd <= 2.5) || (in_eye_or_mouth_ev && fd <= 4.0))
             {
-                tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(fg_a);
+                let cap = if in_socket_interior || in_eye_or_mouth_ev {
+                    255
+                } else {
+                    fg_a
+                };
+                tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(cap);
             }
 
             // --- Layers 5..12: Eyes (R: 5..8, L: 9..12) ---
@@ -3711,13 +4160,17 @@ pub fn synthesize_template_bank(
                 let sclera_rx = if ev.is_sd { rx * 0.99 } else { rx * 0.96 };
                 let sclera_ry = if ev.is_sd { ry * 0.95 } else { ry * 0.88 };
                 let wd = eye_white_sdf(u, v, (cu, cv, sclera_rx, sclera_ry), is_left, eye_style, ev.is_sd);
-                if wd <= 1.2 || (!explicit_eye_override && ev_all_s[i] && !ev_iris_s[i] && !ev_up_s[i] && !ev_lo_s[i]) {
-                    let ta = if ev_all_s[i] && !explicit_eye_override {
-                        fg_a
-                    } else {
-                        sdf_to_alpha(wd)
-                    };
-                    tpl_masks[side_idx][i] = tpl_masks[side_idx][i].max(ta);
+                if wd <= 1.2 {
+                    tpl_masks[side_idx][i] = tpl_masks[side_idx][i].max(sdf_to_alpha(wd));
+                }
+                if stage != "base_silhouette"
+                    && !explicit_eye_override
+                    && ev_all_s[i]
+                    && !ev_iris_s[i]
+                    && !ev_up_s[i]
+                    && !ev_lo_s[i]
+                {
+                    tpl_masks[side_idx][i] = tpl_masks[side_idx][i].max(fg_a);
                 }
                 // Full round behind-lid iris (`iris`) tucked beneath upper eyelid crescent
                 let clamped_ry = iris_fit.ry.min(ry * if ev.is_sd { 1.12 } else { 1.14 });
@@ -3791,10 +4244,9 @@ pub fn synthesize_template_bank(
                     && (in_fitted_iris_body
                         || (ev_iris_s[i] && (!ev_up_s[i] || is_open_eye_core_color || in_iris_opening))
                         || (ev_all_s[i] && (!ev_up_s[i] && px_luma >= sclera_luma_thresh || is_open_eye_core_color)));
-                if u_rel.abs() <= 1.08 && !is_exposed_eye_core {
-                    let top_cover = (cv - eye_dist * 0.28).min(
-                        arch_v - (ry * if ev.is_sd { 0.68 } else { 0.92 } * corner_taper + 2.5),
-                    );
+                if u_rel.abs() <= 1.06 && !is_exposed_eye_core {
+                    let lid_band = (ry * if ev.is_sd { 0.34 } else { 0.44 }) * (0.20 + 0.80 * corner_taper) + 2.5;
+                    let top_cover = arch_v - lid_band;
                     let bot_lash = if explicit_eye_override {
                         arch_v + lash_drop * (0.45 + 0.55 * corner_taper)
                     } else if is_dark_lash_px {
@@ -3804,16 +4256,15 @@ pub fn synthesize_template_bank(
                     };
                     let ud_bot = v - bot_lash;
                     let ud_top = top_cover - v;
-                    let ud_side = (u_rel.abs() - 1.04) * rx;
-                    let ud = ud_bot.max(ud_top).max(ud_side);
+                    let ud = ud_bot.max(ud_top);
                     if ud <= 1.2 {
                         tpl_masks[side_idx + 3][i] = tpl_masks[side_idx + 3][i].max(sdf_to_alpha(ud));
                     }
                 }
                 let outer_u_signed = u_rel * outer_sign;
                 let is_outer_lash_tip = !explicit_eye_override
-                    && (0.85..=1.42).contains(&outer_u_signed)
-                    && (v - arch_v).abs() <= ry * 0.28
+                    && (0.72..=1.46).contains(&outer_u_signed)
+                    && (v - arch_v).abs() <= ry * 0.42
                     && !ev_hair_all[i]
                     && !ev_iris_s[i]
                     && is_dark_lash_px;
@@ -3869,40 +4320,72 @@ pub fn synthesize_template_bank(
 
             // --- Layers 15..17: Mouth (inner: 15, lower: 16, upper: 17) ---
             let (m_rx, m_inner_ry) = mouth_radii(&ev, eye_dist, mouth_style);
-            let mdx = (u - ev.mouth_u) / m_rx.max(1.0);
-            let mdy = (v - ev.mouth_v) / m_inner_ry.max(1.0);
-            let m_dist = ((mdx * mdx + mdy * mdy).sqrt() - 1.0) * m_rx.min(m_inner_ry);
-            if m_dist <= 1.2 {
-                tpl_masks[15][i] = tpl_masks[15][i].max(sdf_to_alpha(m_dist));
-            }
-            if mdx.abs() <= 1.18 {
-                let lip_curve = match mouth_style {
-                    "soft_smile" => -mdx * mdx * eye_dist * 0.015,
-                    "cat_w" => (mdx.abs() * std::f64::consts::PI).cos() * eye_dist * 0.012,
-                    "open_happy" => mdx * mdx * eye_dist * 0.010,
-                    _ => 0.0,
-                };
-                let lip_y = ev.mouth_v + lip_curve;
-                let cushion_h = if mouth_style == "open_o" { m_inner_ry * 1.15 } else { eye_dist * 0.056 };
-                let upper_overlap = if mouth_style == "open_o" { m_inner_ry * 0.25 } else { eye_dist * 0.008 };
-                if mouth_style == "open_o" {
-                    // For round `'o'` mouth, keep center visible inside `mouth_inner` unless outside oval arc!
-                    if v >= lip_y && v <= lip_y + cushion_h && m_dist >= -1.0 {
-                        let a_l = sdf_to_alpha((v - (lip_y + cushion_h)).max(lip_y - v));
-                        tpl_masks[16][i] = tpl_masks[16][i].max(a_l);
+            let inner_rx = (m_rx * 0.98).max(2.0);
+            let inner_ry = m_inner_ry.max(eye_dist * 0.024);
+            let mdx = (u - ev.mouth_u) / inner_rx;
+            let mdy = (v - ev.mouth_v) / inner_ry;
+            let m_dist = ((mdx * mdx + mdy * mdy).sqrt() - 1.0) * inner_rx.min(inner_ry);
+            if stage != "base_silhouette" && !explicit_mouth_override && ev.has_true_mouth {
+                if ev.true_mouth_open_core[i] {
+                    tpl_masks[15][i] = 255;
+                } else if m_dist <= 1.0 {
+                    tpl_masks[15][i] = tpl_masks[15][i].max(sdf_to_alpha(m_dist));
+                }
+                if ev.true_mouth_mask[i] && !ev.true_mouth_open_core[i] {
+                    if ev.metrics.mouth_open_ratio >= 0.25 {
+                        if v <= ev.mouth_v + 0.5 {
+                            tpl_masks[17][i] = tpl_masks[17][i].max(fg_a);
+                        } else {
+                            tpl_masks[16][i] = tpl_masks[16][i].max(fg_a);
+                        }
+                    } else if v <= ev.mouth_v + 1.2 {
+                        tpl_masks[17][i] = tpl_masks[17][i].max(fg_a);
+                    } else {
+                        tpl_masks[16][i] = tpl_masks[16][i].max(fg_a);
                     }
-                    if v >= lip_y - cushion_h && v <= lip_y + upper_overlap && m_dist >= -1.0 {
-                        let a_u = sdf_to_alpha((v - (lip_y + upper_overlap)).max(lip_y - cushion_h - v));
-                        tpl_masks[17][i] = tpl_masks[17][i].max(a_u);
+                } else if true_mouth_dil1[i] && !ev.true_mouth_mask[i] {
+                    // Preserve a 1px anti-aliased edge strictly around dark mouth strokes without carving cheek skin.
+                    let px = pix_rgb(rgba, i);
+                    if luma(px) < luma(ev.palette.skin_base) - 10.0 || rgb_dist(px, ev.palette.mouth_line) <= 44.0 {
+                        if v <= ev.mouth_v + 1.0 {
+                            tpl_masks[17][i] = tpl_masks[17][i].max(fg_a);
+                        } else {
+                            tpl_masks[16][i] = tpl_masks[16][i].max(fg_a);
+                        }
                     }
-                } else {
-                    if v >= lip_y - eye_dist * 0.006 && v <= lip_y + cushion_h {
-                        let a_l = sdf_to_alpha((v - (lip_y + cushion_h)).max(lip_y - eye_dist * 0.006 - v));
-                        tpl_masks[16][i] = tpl_masks[16][i].max(a_l);
-                    }
-                    if v >= lip_y - cushion_h && v <= lip_y + upper_overlap {
-                        let a_u = sdf_to_alpha((v - (lip_y + upper_overlap)).max(lip_y - cushion_h - v));
-                        tpl_masks[17][i] = tpl_masks[17][i].max(a_u);
+                }
+            } else {
+                if m_dist <= 1.2 {
+                    tpl_masks[15][i] = tpl_masks[15][i].max(sdf_to_alpha(m_dist));
+                }
+                if mdx.abs() <= 1.18 {
+                    let lip_curve = match mouth_style {
+                        "soft_smile" => -mdx * mdx * eye_dist * 0.015,
+                        "cat_w" => (mdx.abs() * std::f64::consts::PI).cos() * eye_dist * 0.012,
+                        "open_happy" => mdx * mdx * eye_dist * 0.010,
+                        _ => 0.0,
+                    };
+                    let lip_y = ev.mouth_v + lip_curve;
+                    let cushion_h = if mouth_style == "open_o" { m_inner_ry * 1.15 } else { eye_dist * 0.032 };
+                    let upper_overlap = if mouth_style == "open_o" { m_inner_ry * 0.25 } else { eye_dist * 0.008 };
+                    if mouth_style == "open_o" {
+                        if v >= lip_y && v <= lip_y + cushion_h && m_dist >= -1.0 {
+                            let a_l = sdf_to_alpha((v - (lip_y + cushion_h)).max(lip_y - v));
+                            tpl_masks[16][i] = tpl_masks[16][i].max(a_l);
+                        }
+                        if v >= lip_y - cushion_h && v <= lip_y + upper_overlap && m_dist >= -1.0 {
+                            let a_u = sdf_to_alpha((v - (lip_y + upper_overlap)).max(lip_y - cushion_h - v));
+                            tpl_masks[17][i] = tpl_masks[17][i].max(a_u);
+                        }
+                    } else {
+                        if v >= lip_y - eye_dist * 0.006 && v <= lip_y + cushion_h {
+                            let a_l = sdf_to_alpha((v - (lip_y + cushion_h)).max(lip_y - eye_dist * 0.006 - v));
+                            tpl_masks[16][i] = tpl_masks[16][i].max(a_l);
+                        }
+                        if v >= lip_y - cushion_h && v <= lip_y + upper_overlap {
+                            let a_u = sdf_to_alpha((v - (lip_y + upper_overlap)).max(lip_y - cushion_h - v));
+                            tpl_masks[17][i] = tpl_masks[17][i].max(a_u);
+                        }
                     }
                 }
             }
@@ -3946,40 +4429,46 @@ pub fn synthesize_template_bank(
                 tpl_masks[L_HAIR_FRONT][i] = tpl_masks[L_HAIR_FRONT][i].max(a_f);
             }
 
-            // Organic temple-anchored side hair locks strictly from actual foreground hair,
-            // with hidden `fillMask` smoothly feathered upward behind `hair_front` cheek bangs so head/hair sway stays seamless.
-            let side_overlap_top = er_v.min(el_v) - hh * 0.18;
-            let side_feather = (hh * 0.08).max(8.0);
+            // Side hair locks strictly from actual foreground hair (seam underlap added cleanly post-partition).
+            let side_drop = hh * 0.08 * (1.0 - smoothstep(face_rx * 0.55, face_rx * 1.60, u.abs()));
+            let local_side_max_v = side_max_v + side_drop;
+            let side_outer_rx = face_rx * (1.58 - 0.14 * smoothstep(frame.chin_v, side_max_v, v));
             if ev_hair_all[i]
                 && !ev_clothes[i]
                 && !ev_face[i]
-                && v >= side_overlap_top - side_feather
-                && v <= side_max_v
+                && v >= er_v.min(el_v) - hh * 0.04
+                && v <= local_side_max_v
                 && side_style != "minimal"
             {
-                let overlap_t = smoothstep(side_overlap_top, er_v.min(el_v) + hh * 0.14, v);
-                let top_fade = smoothstep(
-                    side_overlap_top - side_feather,
-                    side_overlap_top + side_feather * 0.5,
-                    v,
-                );
-                let side_a = ((fg_a as f64) * top_fade).round().clamp(0.0, 255.0) as u8;
+                let overlap_t = smoothstep(er_v.min(el_v), er_v.min(el_v) + hh * 0.16, v);
                 let inner_u = face_rx
                     * (0.42 + 0.06 * overlap_t + 0.14 * (1.0 - smoothstep(er_v.min(el_v), frame.chin_v, v)));
-                if side_a > 0 {
-                    for (side_slot, sign) in [(L_HAIR_SIDE_R, -1.0f64), (L_HAIR_SIDE_L, 1.0f64)] {
-                        if u * sign <= 0.0 {
-                            continue;
-                        }
-                        let au = u.abs();
-                        if au >= inner_u && au <= face_rx * 1.55 {
-                            tpl_masks[side_slot][i] = tpl_masks[side_slot][i].max(side_a);
-                        }
+                for (side_slot, sign) in [(L_HAIR_SIDE_R, -1.0f64), (L_HAIR_SIDE_L, 1.0f64)] {
+                    if u * sign <= 0.0 {
+                        continue;
+                    }
+                    let au = u.abs();
+                    if au >= inner_u && au <= side_outer_rx {
+                        tpl_masks[side_slot][i] = tpl_masks[side_slot][i].max(fg_a);
                     }
                 }
             }
         }
     }
+
+    // Snapshot untouched canonical SDF masks before Step 4 partitioning/defrag so Stage 1 stays spotless.
+    let canonical_sil_masks: Option<[(&'static str, Vec<u8>); 6]> = if stage == "base_silhouette" {
+        Some([
+            ("mouth_inner", tpl_masks[L_MOUTH_INNER].clone()),
+            ("eyeL_white", tpl_masks[L_EYE_L_BASE].clone()),
+            ("eyeR_white", tpl_masks[L_EYE_R_BASE].clone()),
+            ("face", tpl_masks[L_FACE].clone()),
+            ("neck", tpl_masks[L_NECK].clone()),
+            ("body", tpl_masks[L_BODY].clone()),
+        ])
+    } else {
+        None
+    };
 
     // 4. Partition foreground pixels (`fg_alpha > 0`) strictly cleanly top-to-bottom (`owners <= 1`)!
     // Every visible pixel goes to a non-overlapping visible mask, while hidden/motion geometry goes to `fill_masks`.
@@ -4046,10 +4535,35 @@ pub fn synthesize_template_bank(
                         continue;
                     }
                 }
+                // Never pull dark outer eyelash tips into `eye*_white` sclera geometry.
+                if layer_idx == L_EYE_R_BASE || layer_idx == L_EYE_L_BASE {
+                    let px_rgb = pix_rgb(rgba, i);
+                    let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                    let (cu, cv, rx, ry, is_l) = if layer_idx == L_EYE_R_BASE {
+                        (er_u, er_v, er_rx, er_ry, false)
+                    } else {
+                        (el_u, el_v, el_rx, el_ry, true)
+                    };
+                    let wd = eye_white_sdf(
+                        u,
+                        v,
+                        (cu, cv, rx * 0.96, ry * 0.90),
+                        is_l,
+                        eye_style,
+                        ev.is_sd,
+                    );
+                    if wd > -0.5
+                        && (is_dark_lineart(px_rgb)
+                            || rgb_dist(px_rgb, ev.palette.lash_color) <= 44.0)
+                    {
+                        continue;
+                    }
+                }
                 if !explicit_mouth_override
                     && (layer_idx == L_MOUTH_LOWER || layer_idx == L_MOUTH_UPPER)
                     && ev_mouth_all[i]
                     && (mouth_style == "open_happy" || mouth_style == "open_o")
+                    && ev.metrics.mouth_open_ratio >= 0.25
                     && luma(pix_rgb(rgba, i)) < skin_base_luma_thresh
                 {
                     continue;
@@ -4062,12 +4576,23 @@ pub fn synthesize_template_bank(
         }
     }
 
-    // Keep closed mouth cavity (`mouth_inner`) hidden strictly inside upper/lower lip cushion bounds at rest.
+    // Keep closed mouth cavity (`mouth_inner`) strictly compact behind lips/stroke without requiring cheek slabs.
     if !explicit_mouth_override {
+        let (m_rx, m_ry) = mouth_radii(&ev, eye_dist, mouth_style);
+        let fill_rx = (m_rx * 0.92).max(2.0);
+        let fill_ry = m_ry.max(eye_dist * 0.024);
         for i in 0..n {
             if visible_masks[L_MOUTH_INNER][i] == 0 {
-                let lip_cap = tpl_masks[L_MOUTH_LOWER][i].max(tpl_masks[L_MOUTH_UPPER][i]);
-                tpl_masks[L_MOUTH_INNER][i] = tpl_masks[L_MOUTH_INNER][i].min(lip_cap);
+                if ev.has_true_mouth {
+                    let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
+                    let rn = ((u - ev.mouth_u) / fill_rx).hypot((v - ev.mouth_v) / fill_ry);
+                    if rn > 1.02 {
+                        tpl_masks[L_MOUTH_INNER][i] = 0;
+                    }
+                } else {
+                    let lip_cap = tpl_masks[L_MOUTH_LOWER][i].max(tpl_masks[L_MOUTH_UPPER][i]);
+                    tpl_masks[L_MOUTH_INNER][i] = tpl_masks[L_MOUTH_INNER][i].min(lip_cap);
+                }
             }
         }
     }
@@ -4088,7 +4613,27 @@ pub fn synthesize_template_bank(
             let in_eye_iris_or_lash = in_fitted_iris_interior(u, v, er_u, er_v, er_rx, er_ry, &ev.iris_r, false, eye_style, ev.is_sd)
                 || in_fitted_iris_interior(u, v, el_u, el_v, el_rx, el_ry, &ev.iris_l, true, eye_style, ev.is_sd)
                 || is_dark_upper_lash_band(u, v, px_c, frame, &ev, eye_style);
-            let target = if (ev_clothes[i] && v >= frame.chin_v - hh * 0.08)
+            let is_dark_lash_px = is_dark_lineart(px_c)
+                || rgb_dist(px_c, ev.palette.lash_color) <= 44.0;
+            let in_eye_r_corner = !ev_hair_all[i]
+                && is_dark_lash_px
+                && ((u - er_u) / (er_rx * 1.48).max(1.0)).hypot((v - er_v) / (er_ry * 1.18).max(1.0)) <= 1.0;
+            let in_eye_l_corner = !ev_hair_all[i]
+                && is_dark_lash_px
+                && ((u - el_u) / (el_rx * 1.48).max(1.0)).hypot((v - el_v) / (el_ry * 1.18).max(1.0)) <= 1.0;
+            let target = if in_eye_r_corner {
+                if v <= er_v + er_ry * 0.24 {
+                    L_EYE_R_BASE + 3
+                } else {
+                    L_EYE_R_BASE + 2
+                }
+            } else if in_eye_l_corner {
+                if v <= el_v + el_ry * 0.24 {
+                    L_EYE_L_BASE + 3
+                } else {
+                    L_EYE_L_BASE + 2
+                }
+            } else if (ev_clothes[i] && v >= frame.chin_v - hh * 0.08)
                 || (!ev_hair_all[i]
                     && is_cool_collar
                     && v >= frame.chin_v + hh * 0.04
@@ -4117,7 +4662,11 @@ pub fn synthesize_template_bank(
                 || (face_sdf(u, v, frame, &ev) <= 3.0 && !ev_hair_all[i] && !ev_clothes[i] && !ev_neck[i])
             {
                 L_FACE
-            } else if ev_hair_all[i] && !ev_hair_back[i] && v <= side_max_v && u.abs() <= face_rx * 1.55 {
+            } else if ev_hair_all[i]
+                && !ev_hair_back[i]
+                && v <= side_max_v + hh * 0.08 * (1.0 - smoothstep(face_rx * 0.55, face_rx * 1.60, u.abs()))
+                && u.abs() <= face_rx * (1.58 - 0.14 * smoothstep(frame.chin_v, side_max_v, v))
+            {
                 if u < 0.0 { L_HAIR_SIDE_R } else { L_HAIR_SIDE_L }
             } else {
                 L_HAIR_BACK
@@ -4313,6 +4862,16 @@ pub fn synthesize_template_bank(
             if ga > 0 {
                 for base_mask in &mut visible_masks {
                     base_mask[i] = 0;
+                }
+                let x = i % w;
+                let y = i / w;
+                let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                if stage != "base_silhouette"
+                    && face_sdf(u, v, frame, &ev) <= eye_dist * 0.16
+                    && !ev_clothes[i]
+                    && !ev_hair_back[i]
+                {
+                    tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(ga);
                 }
             }
         }
@@ -4848,7 +5407,10 @@ pub fn synthesize_template_bank(
                     {
                         tpl_masks[L_CLOTHES][i] = tpl_masks[L_CLOTHES][i].max(ev.fg_alpha[i]);
                     }
-                    if !ev_clothes[i] && face_sdf(u, v, frame, &ev) <= 8.0 {
+                    if stage != "base_silhouette"
+                        && !ev_clothes[i]
+                        && face_sdf(u, v, frame, &ev) <= 8.0
+                    {
                         tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(ev.fg_alpha[i]);
                     }
                 }
@@ -4869,28 +5431,30 @@ pub fn synthesize_template_bank(
             }
         }
     }
-    // Keep 3px `fillMask` underlap on `neck` behind collar seam & on hair layers behind `hat` perimeter so zoom/tilt shows zero crack.
+    // Keep smooth rounded `fillMask` underlap on `neck` behind collar seam & on hair layers behind `hat` perimeter so zoom/tilt shows zero crack.
     {
         let clothes_bool: Vec<bool> = visible_masks[L_CLOTHES].iter().map(|&v| v > 0).collect();
         let clothes_dil3 = dilate_mask(&clothes_bool, w, h, 3);
-        let neck_rx = eye_dist * if ev.is_sd { 0.18 } else { 0.30 };
-        let neck_top = frame.chin_v - hh * 0.10;
+        let neck_rx = eye_dist * if ev.is_sd { 0.19 } else { 0.27 };
+        let neck_top = frame.chin_v - hh * 0.06;
         let neck_bot = if ev.is_sd {
-            (frame.chin_v + hh * 0.26)
-                .min(ev.clothes_top_v + hh * 0.12)
-                .max(frame.chin_v + hh * 0.10)
+            (frame.chin_v + hh * 0.26).max(ev.clothes_top_v + hh * 0.08)
         } else {
-            (frame.chin_v + hh * 0.48).max(ev.clothes_top_v + hh * 0.12)
+            (frame.chin_v + hh * 0.46).max(ev.clothes_top_v + hh * 0.12)
         };
+        let half_h = ((neck_bot - neck_top) * 0.5).max(4.0);
+        let cy = (neck_top + neck_bot) * 0.5;
+        let cx = ev.torso_cx_u * 0.35;
         for y in 0..h {
             for x in 0..w {
                 let i = y * w + x;
                 if clothes_dil3[i] && ev.fg_alpha[i] > 0 {
                     let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-                    if (u - ev.torso_cx_u * 0.35).abs() <= neck_rx * 1.35
-                        && v >= neck_top
-                        && v <= neck_bot
-                    {
+                    let cur_rx = neck_rx * 1.25;
+                    let cap_r = (cur_rx * 0.55).min(half_h * 0.65);
+                    let qx = ((u - cx).abs() - (cur_rx - cap_r)).max(0.0);
+                    let qy = ((v - cy).abs() - (half_h - cap_r)).max(0.0);
+                    if qx.hypot(qy) <= cap_r {
                         tpl_masks[L_NECK][i] = tpl_masks[L_NECK][i].max(ev.fg_alpha[i]);
                     }
                 }
@@ -4929,15 +5493,82 @@ pub fn synthesize_template_bank(
         }
     }
 
+    // Extract clean inner cheek-blush & nose `face_detail` overlay for Stage 2 (`features_overlay` / `full`)
+    // so `face` stays a spotless bald SD/LD silhouette while preserving original facial blush/nose strokes.
+    let mut face_detail_vis: Option<Vec<u8>> = None;
+    let mut face_detail_core = vec![false; n];
+    if stage != "base_silhouette" {
+        let nose_mid_v = (er_v.max(el_v) + ev.mouth_v) * 0.5;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if visible_masks[L_FACE][i] == 0 || hole_guard_dil[i] {
+                    continue;
+                }
+                let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                if face_sdf(u, v, frame, &ev) > -(eye_dist * 0.09).max(3.0) {
+                    continue;
+                }
+                if v < er_v.min(el_v) + er_ry.min(el_ry) * 0.10 || v > frame.chin_v - hh * 0.06 {
+                    continue;
+                }
+                let k = i * 4;
+                let orig = [rgba[k], rgba[k + 1], rgba[k + 2]];
+                let base = skin_field.sample(x, y);
+                let is_cool_speck = (orig[2] as i32) > (orig[0] as i32) + 4 && luma(orig) < skin_base_luma * 0.80;
+                if is_cool_speck {
+                    continue;
+                }
+                let dist_to_skin = rgb_dist(orig, base);
+                let near_nose = u.abs() <= eye_dist * 0.14 && (v - nose_mid_v).abs() <= hh * 0.14;
+                let warm_blush = (orig[0] as i32 - orig[2] as i32) >= (base[0] as i32 - base[2] as i32) + 3
+                    && luma(orig) >= skin_base_luma * 0.72;
+                let nose_mark = near_nose && luma(orig) < luma(base) - 7.0 && luma(orig) >= skin_base_luma * 0.40;
+                if (dist_to_skin >= 9.0 && (warm_blush || nose_mark)) || (dist_to_skin >= 14.0 && luma(orig) >= skin_base_luma * 0.68) {
+                    face_detail_core[i] = true;
+                }
+            }
+        }
+        let detail_dil = dilate_mask(&face_detail_core, w, h, 3);
+        let mut detail_vis = vec![0u8; n];
+        let mut detail_px = 0usize;
+        for i in 0..n {
+            if detail_dil[i] && visible_masks[L_FACE][i] > 0 && !hole_guard_dil[i] {
+                let a = visible_masks[L_FACE][i];
+                detail_vis[i] = a;
+                visible_masks[L_FACE][i] = 0;
+                tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(a);
+                detail_px += 1;
+            }
+        }
+        if detail_px >= 8 {
+            face_detail_vis = Some(detail_vis);
+        } else {
+            for (i, &dv) in detail_vis.iter().enumerate() {
+                if dv > 0 {
+                    visible_masks[L_FACE][i] = visible_masks[L_FACE][i].max(dv);
+                }
+            }
+        }
+    }
+
     // Assemble final ordered layer list `(id, visible_mask, tpl_mask)` keeping base Z-order + spliced sublayers.
-    let mut final_layer_ids: Vec<String> = Vec::with_capacity(num_layers + 12);
-    let mut final_visible_masks: Vec<Vec<u8>> = Vec::with_capacity(num_layers + 12);
-    let mut final_tpl_masks: Vec<Vec<u8>> = Vec::with_capacity(num_layers + 12);
+    let mut final_layer_ids: Vec<String> = Vec::with_capacity(num_layers + 14);
+    let mut final_visible_masks: Vec<Vec<u8>> = Vec::with_capacity(num_layers + 14);
+    let mut final_tpl_masks: Vec<Vec<u8>> = Vec::with_capacity(num_layers + 14);
 
     for (base_idx, id) in TEMPLATE_LAYER_ORDER.iter().enumerate() {
         final_layer_ids.push((*id).to_string());
         final_visible_masks.push(std::mem::take(&mut visible_masks[base_idx]));
         final_tpl_masks.push(std::mem::take(&mut tpl_masks[base_idx]));
+
+        if base_idx == L_FACE {
+            if let Some(ref fd_vis) = face_detail_vis {
+                final_layer_ids.push("face_detail".to_string());
+                final_visible_masks.push(fd_vis.clone());
+                final_tpl_masks.push(fd_vis.clone());
+            }
+        }
 
         if let Some(extras) = split_hair_extras.remove(&base_idx) {
             for (sub_id, sub_vis) in extras {
@@ -5002,6 +5633,149 @@ pub fn synthesize_template_bank(
 
     let final_len = final_layer_ids.len();
 
+    // Post-partition defragmentation: absorb tiny detached partition slivers/specks that border
+    // an adjacent part into the majority neighboring part (keeping floating outer curls untouched).
+    {
+        let mut owner = vec![u16::MAX; n];
+        for (p, vm) in final_visible_masks.iter().enumerate() {
+            for i in 0..n {
+                if vm[i] > 8 {
+                    owner[i] = p as u16;
+                }
+            }
+        }
+        let mut visited = vec![false; n];
+        let mut q = VecDeque::new();
+        for p in 0..final_len {
+            let pid = final_layer_ids[p].as_str();
+            let min_keep = if pid == "face_detail" {
+                4usize
+            } else if pid.starts_with("eye") && (pid.ends_with("_upper") || pid.ends_with("_lower")) {
+                ((eye_dist * 0.12).round() as usize).clamp(10, 48)
+            } else if pid.starts_with("eye") || pid.starts_with("brow") || pid.starts_with("mouth") {
+                10usize
+            } else if pid.starts_with("hair_") {
+                64usize
+            } else {
+                96usize
+            };
+            visited.fill(false);
+            for start in 0..n {
+                if owner[start] as usize != p || visited[start] {
+                    continue;
+                }
+                visited[start] = true;
+                q.push_back(start);
+                let mut comp = Vec::new();
+                let mut border_votes: HashMap<usize, usize> = HashMap::new();
+                while let Some(idx) = q.pop_front() {
+                    comp.push(idx);
+                    let x = idx % w;
+                    let y = idx / w;
+                    for ni in [
+                        (x > 0).then(|| idx - 1),
+                        (x + 1 < w).then(|| idx + 1),
+                        (y > 0).then(|| idx - w),
+                        (y + 1 < h).then(|| idx + w),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let no = owner[ni] as usize;
+                        if no == p {
+                            if !visited[ni] {
+                                visited[ni] = true;
+                                q.push_back(ni);
+                            }
+                        } else if no < final_len {
+                            *border_votes.entry(no).or_insert(0) += 1;
+                        }
+                    }
+                }
+                if comp.len() < min_keep && !border_votes.is_empty() {
+                    if let Some((&best_nb, _)) = border_votes
+                        .iter()
+                        .max_by(|(a_id, a_c), (b_id, b_c)| a_c.cmp(b_c).then_with(|| b_id.cmp(a_id)))
+                    {
+                        for idx in comp {
+                            let a = final_visible_masks[p][idx];
+                            final_visible_masks[p][idx] = 0;
+                            final_tpl_masks[p][idx] = 0;
+                            final_visible_masks[best_nb][idx] = final_visible_masks[best_nb][idx].max(a);
+                            final_tpl_masks[best_nb][idx] = final_tpl_masks[best_nb][idx].max(a);
+                            owner[idx] = best_nb as u16;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add organic 10-12px hidden underlap along real hair-to-hair seams (`hair_side` under `hair_front`,
+    // `hair_back` under `hair_side`/`hair_front`) so head turn/sway shows zero tear gaps without rectangular fill slabs.
+    {
+        let idx_by_id = |target: &str| final_layer_ids.iter().position(|id| id == target);
+        let hf_idx = idx_by_id("hair_front");
+        let hsr_idx = idx_by_id("hair_side_R");
+        let hsl_idx = idx_by_id("hair_side_L");
+        let hb_idx = idx_by_id("hair_back");
+        let seam_r = (eye_dist * 0.055).round().clamp(8.0, 14.0) as usize;
+
+        if let Some(fi) = hf_idx {
+            let hf_vis_b: Vec<bool> = final_visible_masks[fi].iter().map(|&v| v > 0).collect();
+            for si in [hsr_idx, hsl_idx].into_iter().flatten() {
+                let s_vis_b: Vec<bool> = final_visible_masks[si].iter().map(|&v| v > 0).collect();
+                let s_dil = dilate_mask(&s_vis_b, w, h, seam_r);
+                for i in 0..n {
+                    if s_dil[i] && hf_vis_b[i] && ev.fg_alpha[i] > 0 {
+                        final_tpl_masks[si][i] = final_tpl_masks[si][i].max(ev.fg_alpha[i]);
+                    }
+                }
+            }
+        }
+        if let Some(bi) = hb_idx {
+            let clothes_idx = idx_by_id("clothes");
+            let neck_idx = idx_by_id("neck");
+            let body_idx = idx_by_id("body");
+            let hb_vis_b: Vec<bool> = final_visible_masks[bi].iter().map(|&v| v > 0).collect();
+            let hb_dil = dilate_mask(&hb_vis_b, w, h, seam_r + 2);
+            for ui in [hf_idx, hsr_idx, hsl_idx, clothes_idx, neck_idx, body_idx]
+                .into_iter()
+                .flatten()
+            {
+                for i in 0..n {
+                    if hb_dil[i] && final_visible_masks[ui][i] > 0 && ev.fg_alpha[i] > 0 {
+                        final_tpl_masks[bi][i] = final_tpl_masks[bi][i].max(ev.fg_alpha[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    // In Stage 1 (`base_silhouette`), replace raw-segmentation cutouts with the pure,
+    // hole-free canonical SD/LD mannequin masks partitioned strictly by silhouette Z-order.
+    if let Some(canonical_sil) = canonical_sil_masks {
+        let mut sil_claimed = vec![false; n];
+        for (sil_id, pure_sil) in canonical_sil {
+            if let Some(idx) = final_layer_ids.iter().position(|id| id == sil_id) {
+                for i in 0..n {
+                    let a = pure_sil[i];
+                    if a == 0 {
+                        final_visible_masks[idx][i] = 0;
+                    } else if !sil_claimed[i] {
+                        final_visible_masks[idx][i] = a;
+                        if a >= 128 {
+                            sil_claimed[i] = true;
+                        }
+                    } else {
+                        final_visible_masks[idx][i] = 0;
+                    }
+                }
+                final_tpl_masks[idx] = pure_sil;
+            }
+        }
+    }
+
     // Build strictly disjoint `fill_masks`: where template geometry exists outside visible `masks`.
     let mut fill_masks = vec![vec![0u8; n]; final_len];
     let mut fill_kinds = Vec::with_capacity(final_len);
@@ -5020,6 +5794,31 @@ pub fn synthesize_template_bank(
         });
     }
 
+    // 4c. 4-Stage hybrid silhouette stacking filter:
+    // `"base_silhouette"` -> `"features_overlay"` -> `"clothes_overlay"` -> `"hair_overlay"` (plus `"base_body"` / `"full"`).
+    if stage != "full" {
+        let mut kept_ids = Vec::with_capacity(final_len);
+        let mut kept_vis = Vec::with_capacity(final_len);
+        let mut kept_tpl = Vec::with_capacity(final_len);
+        let mut kept_fill = Vec::with_capacity(final_len);
+        let mut kept_kinds = Vec::with_capacity(final_len);
+        for idx in 0..final_len {
+            if stage_includes_layer(&final_layer_ids[idx], stage) {
+                kept_ids.push(std::mem::take(&mut final_layer_ids[idx]));
+                kept_vis.push(std::mem::take(&mut final_visible_masks[idx]));
+                kept_tpl.push(std::mem::take(&mut final_tpl_masks[idx]));
+                kept_fill.push(std::mem::take(&mut fill_masks[idx]));
+                kept_kinds.push(std::mem::take(&mut fill_kinds[idx]));
+            }
+        }
+        final_layer_ids = kept_ids;
+        final_visible_masks = kept_vis;
+        let _kept_tpl_unused = kept_tpl;
+        fill_masks = kept_fill;
+        fill_kinds = kept_kinds;
+    }
+    let final_len = final_layer_ids.len();
+
     // 5. Synthesize clean hybrid per-part RGBA PNG textures across all canonical + dynamic layers!
     let mut textures = Vec::with_capacity(final_len);
     for layer_idx in 0..final_len {
@@ -5037,8 +5836,11 @@ pub fn synthesize_template_bank(
         let m_vis = &final_visible_masks[layer_idx];
         let m_fill = &fill_masks[layer_idx];
 
+        let is_mannequin_stage = stage == "base_silhouette";
         match id {
             "face" => {
+                // In Stage 1 (`base_silhouette`), emit pure spotless SD/LD bald head mannequin skin.
+                // In stacked/full runs, keep clean visible non-speck skin while `m_fill` underneath eyes/brows/blush/bangs stays canonical smooth skin.
                 for y in 0..h {
                     for x in 0..w {
                         let i = y * w + x;
@@ -5046,26 +5848,80 @@ pub fn synthesize_template_bank(
                         if ea == 0 {
                             continue;
                         }
-                        let clean = skin_field.sample(x, y);
-                        let is_hole_feature = ev_eye_r_all[i]
-                            || ev_eye_l_all[i]
-                            || ev_mouth_all[i]
-                            || ev_brow_r[i]
-                            || ev_brow_l[i];
-                        let rgb = if m_vis[i] > 0
-                            && (!explicit_face_override || (!is_hole_feature && ev_face[i]))
-                        {
-                            let k = i * 4;
-                            [rgba[k], rgba[k + 1], rgba[k + 2]]
+                        let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        let clean = if is_mannequin_stage {
+                            lerp_rgb(ev.palette.skin_base, skin_field.sample(x, y), 0.25)
                         } else {
-                            let (_, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-                            if v < er_v.min(el_v) - er_ry {
-                                lerp_rgb(clean, ev.palette.skin_shadow, 0.25)
+                            skin_field.sample(x, y)
+                        };
+                        let forehead_t = smoothstep(
+                            er_v.min(el_v) - er_ry * 0.85,
+                            frame.crown_v + hh * 0.08,
+                            v,
+                        );
+                        let jaw_t = if is_mannequin_stage {
+                            smoothstep(ev.mouth_v, frame.chin_v, v) * 0.06
+                        } else {
+                            0.0
+                        };
+                        let smooth_clean = lerp_rgb(
+                            clean,
+                            ev.palette.skin_shadow,
+                            (0.08 * forehead_t + jaw_t).min(0.20),
+                        );
+                        let rgb = if is_mannequin_stage || m_vis[i] == 0 {
+                            smooth_clean
+                        } else {
+                            let in_eye_cavity = ((u - er_u) / (er_rx * 1.42).max(1.0)).hypot((v - er_v) / (er_ry * 1.18).max(1.0)) <= 1.0
+                                || ((u - el_u) / (el_rx * 1.42).max(1.0)).hypot((v - el_v) / (el_ry * 1.18).max(1.0)) <= 1.0;
+                            let k = i * 4;
+                            let orig_rgb = [rgba[k], rgba[k + 1], rgba[k + 2]];
+                            let is_orphan_cavity_speck = in_eye_cavity
+                                && (luma(orig_rgb) < skin_base_luma * 0.78
+                                    || (orig_rgb[2] as i32) > (orig_rgb[0] as i32) + 4
+                                    || (rgb_dist(orig_rgb, ev.palette.skin_base) > 48.0
+                                        && !is_warm_blush_or_skin(orig_rgb, ev.palette.skin_base)));
+                            let is_forehead_hair_speck = v < er_v.min(el_v) + er_ry * 0.25
+                                && !in_eye_cavity
+                                && (luma(orig_rgb) < skin_base_luma * 0.62
+                                    || rgb_dist(orig_rgb, ev.palette.hair_base) <= 44.0
+                                    || (orig_rgb[2] as i32) > (orig_rgb[0] as i32) + 8);
+                            let is_hole_feature = ev_eye_r_all[i]
+                                || ev_eye_l_all[i]
+                                || ev_mouth_all[i]
+                                || ev_brow_r[i]
+                                || ev_brow_l[i];
+                            if !is_orphan_cavity_speck
+                                && !is_forehead_hair_speck
+                                && (!explicit_face_override || (!is_hole_feature && ev_face[i]))
+                            {
+                                orig_rgb
                             } else {
-                                clean
+                                smooth_clean
                             }
                         };
                         let k = i * 4;
+                        tex[k] = rgb[0];
+                        tex[k + 1] = rgb[1];
+                        tex[k + 2] = rgb[2];
+                        tex[k + 3] = 255;
+                    }
+                }
+            }
+            "face_detail" => {
+                // Extracted original cheek blush & nose strokes stacked & clipped onto `face`.
+                for y in 0..h {
+                    for x in 0..w {
+                        let i = y * w + x;
+                        if m_vis[i].max(m_fill[i]) == 0 {
+                            continue;
+                        }
+                        let k = i * 4;
+                        let rgb = if m_vis[i] > 0 {
+                            [rgba[k], rgba[k + 1], rgba[k + 2]]
+                        } else {
+                            skin_field.sample(x, y)
+                        };
                         tex[k] = rgb[0];
                         tex[k + 1] = rgb[1];
                         tex[k + 2] = rgb[2];
@@ -5077,19 +5933,40 @@ pub fn synthesize_template_bank(
                 for y in 0..h {
                     for x in 0..w {
                         let i = y * w + x;
-                        let ea = m_vis[i].max(m_fill[i]);
-                        if ea == 0 {
+                        if m_vis[i].max(m_fill[i]) == 0 {
                             continue;
                         }
-                        let rgb = if m_vis[i] > 0 {
-                            let k = i * 4;
-                            [rgba[k], rgba[k + 1], rgba[k + 2]]
+                        let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        let k = i * 4;
+                        let orig = [rgba[k], rgba[k + 1], rgba[k + 2]];
+                        let (neck_u, neck_v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        let in_under_chin_shadow = neck_v <= frame.chin_v + hh * 0.16
+                            && neck_u.abs() <= eye_dist * 0.42;
+                        let hair_diff = rgb_dist(base_hair_rgb, ev.palette.skin_base);
+                        let is_warm_neck = (orig[0] as i32 + 4 >= orig[2] as i32)
+                            && luma(orig) >= skin_base_luma * 0.42;
+                        let is_hair_speck = ev_hair_all[i]
+                            || (!in_under_chin_shadow
+                                && (orig[2] as i32) > (orig[0] as i32) + 8
+                                && luma(orig) < skin_base_luma * 0.78)
+                            || (hair_diff > 36.0
+                                && rgb_dist(orig, base_hair_rgb)
+                                    <= if in_under_chin_shadow { 28.0 } else { 42.0 }
+                                && !is_warm_neck);
+                        let under_chin = smoothstep(frame.chin_v - hh * 0.05, frame.chin_v + hh * 0.14, v)
+                            * (1.0 - smoothstep(frame.chin_v + hh * 0.14, frame.chin_v + hh * 0.36, v));
+                        let base = if is_mannequin_stage {
+                            lerp_rgb(ev.palette.skin_base, skin_field.sample(x, y), 0.25)
                         } else {
-                            let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-                            let under_chin = smoothstep(frame.chin_v - hh * 0.04, frame.chin_v + hh * 0.14, v)
-                                * (1.0 - smoothstep(frame.chin_v + hh * 0.14, frame.chin_v + hh * 0.28, v));
-                            let base = skin_field.sample(x, y);
-                            lerp_rgb(base, ev.palette.skin_shadow, 0.48 * under_chin * (1.0 - (u.abs() / eye_dist).min(0.6)))
+                            skin_field.sample(x, y)
+                        };
+                        let side_shade = (u.abs() / (eye_dist * 0.35)).clamp(0.0, 1.0) * 0.14;
+                        let chin_shade = 0.56 * under_chin * (1.0 - (u.abs() / eye_dist).min(0.55));
+                        let smooth_neck = lerp_rgb(base, ev.palette.skin_shadow, (chin_shade + side_shade).min(0.68));
+                        let rgb = if !is_mannequin_stage && m_vis[i] > 0 && !is_hair_speck {
+                            orig
+                        } else {
+                            smooth_neck
                         };
                         let k = i * 4;
                         tex[k] = rgb[0];
@@ -5100,18 +5977,28 @@ pub fn synthesize_template_bank(
                 }
             }
             "body" => {
+                let torso_bot = ev.fg_max_v.max(frame.chin_v + hh * 1.05);
+                let torso_top = frame.chin_v + hh * if ev.is_sd { 0.10 } else { 0.18 };
                 for y in 0..h {
                     for x in 0..w {
                         let i = y * w + x;
-                        let ea = m_vis[i].max(m_fill[i]);
-                        if ea == 0 {
+                        if m_vis[i].max(m_fill[i]) == 0 {
                             continue;
                         }
-                        let rgb = if m_vis[i] > 0 {
+                        let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        let base = if is_mannequin_stage {
+                            lerp_rgb(ev.palette.skin_base, skin_field.sample(x, y), 0.25)
+                        } else {
+                            skin_field.sample(x, y)
+                        };
+                        let vert_t = smoothstep(torso_top, torso_bot, v) * 0.12;
+                        let side_t = ((u - ev.torso_cx_u).abs() / (eye_dist * 1.8).max(1.0)).clamp(0.0, 1.0) * 0.10;
+                        let clean_body = lerp_rgb(base, ev.palette.skin_shadow, (vert_t + side_t).min(0.30));
+                        let rgb = if !is_mannequin_stage && m_vis[i] > 0 {
                             let k = i * 4;
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
                         } else {
-                            skin_field.sample(x, y)
+                            clean_body
                         };
                         let k = i * 4;
                         tex[k] = rgb[0];
@@ -5229,7 +6116,7 @@ pub fn synthesize_template_bank(
                             continue;
                         }
                         let k = i * 4;
-                        let rgb = if m_vis[i] > 0 && !explicit_eye_override {
+                        let rgb = if !is_mannequin_stage && m_vis[i] > 0 && !explicit_eye_override {
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
                         } else {
                             let (_, v) = frame.to_local(DVec2::new(x as f64, y as f64));
@@ -5346,18 +6233,19 @@ pub fn synthesize_template_bank(
                         let arch_v = cv - ry * (1.0 - u_rel * u_rel * 0.56) * arch_mult + wing;
                         let k = i * 4;
                         let orig = [rgba[k], rgba[k + 1], rgba[k + 2]];
+                        let is_warm_skin = !ev_hair_all[i]
+                            && !ev_eye_all[i]
+                            && ev_face[i]
+                            && rgb_dist(orig, ev.palette.skin_base) <= 44.0
+                            && (orig[0] as i32 + 6 >= orig[2] as i32);
                         let rgb = if m_vis[i] > 0 && !explicit_eye_override {
                             orig
-                        } else if (v - arch_v).abs() <= lash_half || v >= arch_v {
-                            let core_t = if v >= arch_v {
-                                0.88
-                            } else {
-                                1.0 - ((arch_v - v) / lash_half).clamp(0.0, 1.0)
-                            };
-                            if !ev_hair_all[i] && ev_up[i] && luma(orig) < skin_luma * 0.65 {
+                        } else if (v - arch_v).abs() <= lash_half {
+                            let core_t = 1.0 - ((v - arch_v).abs() / lash_half).clamp(0.0, 1.0);
+                            if m_vis[i] > 0 && !ev_hair_all[i] && ev_up[i] && luma(orig) < skin_luma * 0.65 {
                                 lerp_rgb(orig, dark_lash, 0.55 * core_t)
                             } else {
-                                let bg = if !ev_hair_all[i] && ev.fg_alpha[i] > 128 && !ev_eye_all[i] {
+                                let bg = if is_warm_skin && ev.fg_alpha[i] > 128 {
                                     orig
                                 } else {
                                     skin_field.sample(x, y)
@@ -5368,7 +6256,7 @@ pub fn synthesize_template_bank(
                             orig
                         } else {
                             let crease_d = ((arch_v - ry * 0.30) - v).abs();
-                            let base_skin = if !ev_hair_all[i] && !ev_eye_all[i] && ev_face[i] {
+                            let base_skin = if is_warm_skin {
                                 orig
                             } else {
                                 skin_field.sample(x, y)
@@ -5449,7 +6337,7 @@ pub fn synthesize_template_bank(
                             continue;
                         }
                         let k = i * 4;
-                        let rgb = if m_vis[i] > 0 && !explicit_mouth_override {
+                        let rgb = if !is_mannequin_stage && m_vis[i] > 0 && !explicit_mouth_override {
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
                         } else {
                             let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
@@ -5491,7 +6379,7 @@ pub fn synthesize_template_bank(
                         let lip_y = ev.mouth_v + lip_curve;
                         let k = i * 4;
                         let oval_r = mdx.hypot((v - ev.mouth_v) / m_ry.max(1.0));
-                        let rgb = if m_vis[i] > 0 && !explicit_mouth_override {
+                        let rgb = if !is_mannequin_stage && m_vis[i] > 0 && !explicit_mouth_override {
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
                         } else if mouth_style == "open_o" && (oval_r - 1.0).abs() <= 0.18 {
                             ev.palette.mouth_line
@@ -6101,6 +6989,153 @@ mod tests {
             if rgba[i * 4 + 3] > 0 {
                 let k = i * 4;
                 assert_eq!(comp[k..k + 3], rgba[k..k + 3], "Rest-pose pixel altered at index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn synthesize_template_bank_stages_split_base_and_hair_cleanly() {
+        let w = 256usize;
+        let h = 256usize;
+        let n = w * h;
+        let lm = Landmarks {
+            eye_r: crate::core::Point { x: 96.0, y: 100.0 },
+            eye_l: crate::core::Point { x: 160.0, y: 100.0 },
+            mouth: crate::core::Point { x: 128.0, y: 138.0 },
+            chin: crate::core::Point { x: 128.0, y: 158.0 },
+            crown: crate::core::Point { x: 128.0, y: 38.0 },
+        };
+        let mut rgba = vec![0u8; n * 4];
+        let mut hf_m = vec![0u8; n];
+        let mut face_m = vec![0u8; n];
+        let mut clothes_m = vec![0u8; n];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let k = i * 4;
+                let dx = (x as f64 - 128.0) / 56.0;
+                let dy = (y as f64 - 98.0) / 62.0;
+                if dx * dx + dy * dy <= 1.0 {
+                    if y < 86 {
+                        rgba[k..k + 4].copy_from_slice(&[72, 56, 98, 255]);
+                        hf_m[i] = 255;
+                    } else {
+                        rgba[k..k + 4].copy_from_slice(&[248, 224, 210, 255]);
+                        face_m[i] = 255;
+                    }
+                } else if (158..=238).contains(&y) && (76..=180).contains(&x) {
+                    rgba[k..k + 4].copy_from_slice(&[192, 180, 224, 255]);
+                    clothes_m[i] = 255;
+                }
+            }
+        }
+        let ids = vec!["hair_front".to_string(), "face".to_string(), "clothes".to_string()];
+        let masks = vec![hf_m, face_m, clothes_m];
+        let prov = vec!["model".to_string(); 3];
+        let conf = vec![0.9; 3];
+        let sel = TemplateStyleSelection::default();
+
+        let base = synthesize_template_bank_for_stage(
+            &rgba,
+            w,
+            h,
+            &lm,
+            &[],
+            &ids,
+            &masks,
+            &prov,
+            &conf,
+            &sel,
+            "base_silhouette",
+        );
+        assert!(base.part_ids.iter().all(|id| layer_pipeline_stage(id) == "base_silhouette"));
+        assert!(base.part_ids.iter().any(|id| id == "face"));
+        assert!(base.part_ids.iter().any(|id| id == "body"));
+        assert!(base.part_ids.iter().any(|id| id == "neck"));
+        let face_idx = base.part_ids.iter().position(|id| id == "face").unwrap();
+        let forehead_i = 68 * w + 128;
+        assert!(
+            base.masks[face_idx][forehead_i].max(base.fill_masks[face_idx][forehead_i]) > 0,
+            "Stage 1 base face should fill occluded forehead bald cranium"
+        );
+
+        let features = synthesize_template_bank_for_stage(
+            &rgba,
+            w,
+            h,
+            &lm,
+            &[],
+            &ids,
+            &masks,
+            &prov,
+            &conf,
+            &sel,
+            "features_overlay",
+        );
+        assert!(!features.part_ids.is_empty());
+        assert!(features.part_ids.iter().all(|id| layer_pipeline_stage(id) == "features_overlay"));
+        assert!(features.part_ids.iter().any(|id| id == "eyeL_iris"));
+
+        let clothes = synthesize_template_bank_for_stage(
+            &rgba,
+            w,
+            h,
+            &lm,
+            &[],
+            &ids,
+            &masks,
+            &prov,
+            &conf,
+            &sel,
+            "clothes_overlay",
+        );
+        assert!(!clothes.part_ids.is_empty());
+        assert!(clothes.part_ids.iter().all(|id| layer_pipeline_stage(id) == "clothes_overlay"));
+        assert!(clothes.part_ids.iter().any(|id| id == "clothes"));
+
+        let hair = synthesize_template_bank_for_stage(
+            &rgba,
+            w,
+            h,
+            &lm,
+            &[],
+            &ids,
+            &masks,
+            &prov,
+            &conf,
+            &sel,
+            "hair_overlay",
+        );
+        assert!(!hair.part_ids.is_empty());
+        assert!(hair.part_ids.iter().all(|id| is_hair_stage_layer(id)));
+        assert!(hair.part_ids.iter().any(|id| id == "hair_front"));
+
+        // Ensure 4 stage part sets partition full stage cleanly with zero overlap.
+        let combined: std::collections::HashSet<String> = base
+            .part_ids
+            .iter()
+            .chain(&features.part_ids)
+            .chain(&clothes.part_ids)
+            .chain(&hair.part_ids)
+            .cloned()
+            .collect();
+        let full = synthesize_template_bank_for_stage(
+            &rgba,
+            w,
+            h,
+            &lm,
+            &[],
+            &ids,
+            &masks,
+            &prov,
+            &conf,
+            &sel,
+            "full",
+        );
+        assert_eq!(combined.len(), base.part_ids.len() + features.part_ids.len() + clothes.part_ids.len() + hair.part_ids.len());
+        for pid in &full.part_ids {
+            if pid != "face_detail" {
+                assert!(combined.contains(pid), "Missing full part {pid} across 4 stages");
             }
         }
     }

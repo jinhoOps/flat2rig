@@ -140,20 +140,20 @@ interface HeadFrame {
   crownV: number;
 }
 
-function buildHeadFrame(lm: Landmarks, w: number, h: number): HeadFrame {
+export function buildHeadFrame(lm: Landmarks, w: number, h: number): HeadFrame {
   const originX = (lm.eyeL.x + lm.eyeR.x) / 2;
   const originY = (lm.eyeL.y + lm.eyeR.y) / 2;
   const dx = lm.eyeL.x - lm.eyeR.x;
   const dy = lm.eyeL.y - lm.eyeR.y;
   const rawLen = Math.hypot(dx, dy);
-  const eyeDist = Math.max(w * 0.05, rawLen);
+  const eyeDist = Math.max(1, w * 0.05, rawLen);
   const exX = rawLen > 1e-4 && dx >= 0 ? dx / rawLen : 1;
   const exY = rawLen > 1e-4 && dx >= 0 ? dy / rawLen : 0;
   const eyX = -exY;
   const eyY = exX;
   const crownV = (lm.crown.x - originX) * eyX + (lm.crown.y - originY) * eyY;
   const chinV = (lm.chin.x - originX) * eyX + (lm.chin.y - originY) * eyY;
-  const hh = Math.max(h * 0.12, lm.chin.y - lm.crown.y, chinV - crownV);
+  const hh = Math.max(1, h * 0.12, lm.chin.y - lm.crown.y, chinV - crownV);
   return {
     originX,
     originY,
@@ -166,6 +166,19 @@ function buildHeadFrame(lm: Landmarks, w: number, h: number): HeadFrame {
     chinV,
     crownV,
   };
+}
+
+export function toHeadLocal(hf: HeadFrame, x: number, y: number): [number, number] {
+  const dx = x - hf.originX;
+  const dy = y - hf.originY;
+  return [dx * hf.exX + dy * hf.exY, dx * hf.eyX + dy * hf.eyY];
+}
+
+export function toHeadWorld(hf: HeadFrame, u: number, v: number): [number, number] {
+  return [
+    hf.originX + hf.exX * u + hf.eyX * v,
+    hf.originY + hf.exY * u + hf.eyY * v,
+  ];
 }
 
 /** Geometric starting masks. Not a trained semantic segmentation model. */
@@ -206,6 +219,56 @@ export function separate(
   const [eyeRU, eyeRV] = toLocal(lm.eyeR.x, lm.eyeR.y);
   const [eyeLU, eyeLV] = toLocal(lm.eyeL.x, lm.eyeL.y);
   const [mouthU, mouthV] = toLocal(lm.mouth.x, lm.mouth.y);
+  let skinR = 0,
+    skinG = 0,
+    skinB = 0,
+    skinCnt = 0;
+  const ringR0 = eyeDist * 0.2;
+  const ringR1 = eyeDist * 0.36;
+  const mMinX = Math.max(0, Math.floor(lm.mouth.x - ringR1));
+  const mMaxX = Math.min(w - 1, Math.ceil(lm.mouth.x + ringR1));
+  const mMinY = Math.max(0, Math.floor(lm.mouth.y - ringR1));
+  const mMaxY = Math.min(h - 1, Math.ceil(lm.mouth.y + ringR1));
+  for (let y = mMinY; y <= mMaxY; y++) {
+    for (let x = mMinX; x <= mMaxX; x++) {
+      const idx = y * w + x;
+      if (!fg[idx]) continue;
+      const [u, v] = toLocal(x, y);
+      const du = u - mouthU;
+      const dv = v - mouthV;
+      const d = Math.hypot(du, dv);
+      if (d < ringR0 || d > ringR1 || !ellipse(u, v, 0, faceCv, rx, ry)) continue;
+      skinR += data[idx * 4];
+      skinG += data[idx * 4 + 1];
+      skinB += data[idx * 4 + 2];
+      skinCnt++;
+    }
+  }
+  const hasSkinRef = skinCnt >= 8;
+  const refSkin: [number, number, number] = hasSkinRef
+    ? [skinR / skinCnt, skinG / skinCnt, skinB / skinCnt]
+    : [0, 0, 0];
+  const refLuma = 0.299 * refSkin[0] + 0.587 * refSkin[1] + 0.114 * refSkin[2];
+  let detectedMouthInk = 0;
+  if (hasSkinRef) {
+    for (let y = mMinY; y <= mMaxY; y++) {
+      for (let x = mMinX; x <= mMaxX; x++) {
+        const idx = y * w + x;
+        if (!fg[idx]) continue;
+        const [u, v] = toLocal(x, y);
+        if (!ellipse(u, v, mouthU, mouthV, eyeDist * 0.17, eyeDist * 0.06)) continue;
+        const k = idx * 4;
+        const dist = Math.hypot(
+          data[k] - refSkin[0],
+          data[k + 1] - refSkin[1],
+          data[k + 2] - refSkin[2],
+        );
+        const luma = 0.299 * data[k] + 0.587 * data[k + 1] + 0.114 * data[k + 2];
+        if (dist > 26 || Math.abs(luma - refLuma) > 18) detectedMouthInk++;
+      }
+    }
+  }
+  const filterByMouthInk = hasSkinRef && detectedMouthInk >= 8;
   for (let i = 0; i < fg.length; i++) {
     if (!fg[i]) continue;
     const x = i % w,
@@ -236,13 +299,31 @@ export function separate(
         if (v > ev + eyeHeight * 0.65) id = `eye${side}_lower`;
       }
     }
-    if (ellipse(u, v, mouthU, mouthV, eyeDist * 0.18, eyeDist * 0.065)) {
-      id =
-        v < mouthV - eyeDist * 0.018
-          ? "mouth_upper"
-          : v > mouthV + eyeDist * 0.018
-            ? "mouth_lower"
-            : "mouth_inner";
+    const mouthRx = filterByMouthInk ? eyeDist * 0.17 : eyeDist * 0.13;
+    const mouthRy = filterByMouthInk ? eyeDist * 0.06 : eyeDist * 0.048;
+    if (ellipse(u, v, mouthU, mouthV, mouthRx, mouthRy)) {
+      let isMouthPixel = true;
+      if (filterByMouthInk) {
+        const k = i * 4;
+        const dist = Math.hypot(
+          data[k] - refSkin[0],
+          data[k + 1] - refSkin[1],
+          data[k + 2] - refSkin[2],
+        );
+        const luma = 0.299 * data[k] + 0.587 * data[k + 1] + 0.114 * data[k + 2];
+        isMouthPixel =
+          dist > 24 ||
+          Math.abs(luma - refLuma) > 16 ||
+          ellipse(u, v, mouthU, mouthV, eyeDist * 0.06, eyeDist * 0.02);
+      }
+      if (isMouthPixel) {
+        id =
+          v < mouthV - eyeDist * 0.015
+            ? "mouth_upper"
+            : v > mouthV + eyeDist * 0.015
+              ? "mouth_lower"
+              : "mouth_inner";
+      }
     }
     parts[indices.get(id)!].mask[i] = fg[i];
   }
@@ -1292,10 +1373,10 @@ export function deform(
   params: Parameters,
   shapeDeform?: ShapeDeformInput,
 ): Point {
-  let { x, y } = p;
-  const cx = (lm.eyeL.x + lm.eyeR.x) / 2,
-    headH = Math.max(1, lm.chin.y - lm.crown.y),
-    eyeDist = Math.max(1, Math.hypot(lm.eyeL.x - lm.eyeR.x, lm.eyeL.y - lm.eyeR.y)),
+  const hf = buildHeadFrame(lm, 0, 0);
+  const cx = hf.originX,
+    headH = hf.hh,
+    eyeDist = hf.eyeDist,
     bodyPivotX = cx,
     bodyPivotY = lm.chin.y + headH * 1.15;
   const role = inferPartRole(part.id, part.role);
@@ -1307,63 +1388,118 @@ export function deform(
     part.id === "hands" ||
     part.id.startsWith("hands_")
   ) {
-    return applyBodySway(x, y, bodyPivotX, bodyPivotY, headH, params, 1);
+    return applyBodySway(p.x, p.y, bodyPivotX, bodyPivotY, headH, params, 1);
   }
+  let [pu, pv] = toHeadLocal(hf, p.x, p.y);
+  const [mouthU, mouthV] = toHeadLocal(hf, lm.mouth.x, lm.mouth.y);
+  const [, eyeLV] = toHeadLocal(hf, lm.eyeL.x, lm.eyeL.y);
+  const [, eyeRV] = toHeadLocal(hf, lm.eyeR.x, lm.eyeR.y);
+  const eyeMidV = (eyeLV + eyeRV) * 0.5;
   const isSubLayer = part.id.includes("_sub_");
   if (part.id.startsWith("eye")) {
     const isLeft = part.id.startsWith("eyeL"),
       side = isLeft ? "L" : "R",
       eye = lm[`eye${side}`],
+      [eyeU, eyeV] = toHeadLocal(hf, eye.x, eye.y),
       open = params[`eye${side}`],
       smile = params[`eye${side}Smile`];
     const shape = isLeft ? shapeDeform?.eyeL : shapeDeform?.eyeR;
+    const isIris = part.id.endsWith("_iris");
+    const isUpper = part.id.endsWith("_upper");
+    const isLower = part.id.endsWith("_lower");
     if (shape) {
-      const isIris = part.id.endsWith("_iris");
-      x += shape.offsetX * eyeDist * 0.14;
-      y += shape.offsetY * eyeDist * 0.12;
+      pu += shape.offsetX * eyeDist * 0.14;
+      pv += shape.offsetY * eyeDist * 0.12;
       const widthScale = isIris ? 1 + (shape.width - 1) * 0.45 : shape.width;
-      x = eye.x + (x - eye.x) * widthScale;
-      const nx = (x - eye.x) / Math.max(1, eyeDist * 0.24);
+      pu = eyeU + (pu - eyeU) * widthScale;
+      const nx = (pu - eyeU) / Math.max(1, eyeDist * 0.24);
       const centerArch = Math.max(0, 1 - nx * nx);
       const eyeSign = isLeft ? 1 : -1;
       const outerSigned = clamp(nx * eyeSign, -0.4, 1.2);
-      y -= shape.corner * eyeDist * 0.045 * outerSigned;
-      const upperMask = part.id.endsWith("_upper") || part.id.endsWith("_sub_lid")
+      pv -= shape.corner * eyeDist * 0.045 * outerSigned;
+      if (!isUpper && !part.id.endsWith("_sub_lid")) {
+        const upperMask = clamp(
+          (eyeV + eyeDist * 0.06 - pv) / Math.max(1, eyeDist * 0.14),
+          0,
+          1,
+        );
+        pv -= shape.upperCurveDelta * eyeDist * 0.055 * centerArch * upperMask;
+      } else if (part.id.endsWith("_sub_lid")) {
+        pv -= shape.upperCurveDelta * eyeDist * 0.055 * centerArch;
+      }
+      const lowerMask = isLower
         ? 1
-        : clamp((eye.y + eyeDist * 0.06 - y) / Math.max(1, eyeDist * 0.14), 0, 1);
-      const lowerMask = part.id.endsWith("_lower")
-        ? 1
-        : clamp((y - (eye.y - eyeDist * 0.02)) / Math.max(1, eyeDist * 0.14), 0, 1);
-      y -= shape.upperCurveDelta * eyeDist * 0.055 * centerArch * upperMask;
-      y += shape.lowerCurveDelta * eyeDist * 0.045 * centerArch * lowerMask;
+        : clamp((pv - (eyeV - eyeDist * 0.02)) / Math.max(1, eyeDist * 0.14), 0, 1);
+      pv += shape.lowerCurveDelta * eyeDist * 0.045 * centerArch * lowerMask;
       if (!isIris) {
-        y = eye.y + (y - eye.y) * (1 + shape.roundnessDelta * 0.32 * centerArch);
+        pv = eyeV + (pv - eyeV) * (1 + shape.roundnessDelta * 0.32 * centerArch);
       }
     }
     if (!isSubLayer) {
-      if (part.id.endsWith("_iris")) {
-        x += params.eyeBallX * eyeDist * 0.045;
-        y -= params.eyeBallY * eyeDist * 0.025;
-        y = eye.y + (y - eye.y) * clamp(open, 0.04, 1.3);
-      } else if (part.id.endsWith("_upper")) {
-        const close = clamp(1 - open, 0, 1);
-        const widen = clamp(open - 1, 0, 0.3);
-        const lidAnchorY = eye.y - eyeDist * 0.34;
-        const closeY = eye.y + eyeDist * 0.04;
-        const spanY = Math.max(1, closeY - lidAnchorY);
-        const u = clamp((y - lidAnchorY) / spanY, 0, 1);
-        if (close > 0 && u > 0 && u < 1) {
-          const targetU = 1 - Math.pow(1 - u, 3.6);
-          const closedY = lidAnchorY + spanY * targetU;
-          y += (closedY - y) * close;
-        } else if (widen > 0 && u > 0) {
-          y -= spanY * 0.18 * u * widen;
+      const close = clamp(1 - open, 0, 1);
+      const widen = clamp(open - 1, 0, 0.3);
+      const curveDelta = shape?.upperCurveDelta ?? 0;
+      const nxC = (pu - eyeU) / Math.max(1, eyeDist * 0.25);
+      const arch = Math.max(0, 1 - nxC * nxC);
+      const posCurve = Math.max(0, curveDelta);
+      const negCurve = Math.max(0, -curveDelta);
+      const seamV =
+        eyeV +
+        eyeDist * 0.022 * close -
+        (smile * 0.032 + posCurve * 0.028) * eyeDist * close * arch +
+        negCurve * (0.045 * arch - 0.018 * (1 - arch)) * eyeDist * close;
+      if (isIris) {
+        pu += params.eyeBallX * eyeDist * 0.045;
+        pv -= params.eyeBallY * eyeDist * 0.025;
+        pv = seamV + (pv - eyeV) * clamp(open, 0.03, 1.3);
+      } else if (isUpper) {
+        const lidAnchorV = eyeV - eyeDist * 0.45;
+        const anchorW = clamp(
+          (pv - lidAnchorV) / Math.max(1, eyeDist * 0.12),
+          0,
+          1,
+        );
+        const origPv = pv;
+        if (close > 0 && origPv < seamV) {
+          const closeScale = clamp(
+            0.22 +
+              clamp(
+                0.14 * smile + 0.12 * posCurve - 0.03 * negCurve,
+                -0.03,
+                0.2,
+              ) *
+                arch,
+            0.2,
+            0.42,
+          );
+          const closedV = seamV + (origPv - seamV) * closeScale;
+          pv += (closedV - origPv) * close * anchorW;
+        } else if (widen > 0 && origPv < seamV) {
+          pv -= (seamV - origPv) * 0.28 * widen * anchorW;
         }
+        if (smile !== 0 || curveDelta !== 0) {
+          const vertW =
+            anchorW *
+            clamp(
+              (eyeV + eyeDist * 0.16 - origPv) / Math.max(1, eyeDist * 0.12),
+              0,
+              1,
+            );
+          const liftK = (1 - close) * 0.045 + close * 0.018;
+          const smileLift = smile * liftK * eyeDist * arch;
+          const curveLift = posCurve * liftK * eyeDist * arch;
+          const negDrop =
+            negCurve *
+            ((0.04 + 0.055 * close) * arch - 0.025 * close * (1 - arch)) *
+            eyeDist;
+          pv -= (smileLift + curveLift - negDrop) * vertW;
+        }
+      } else if (isLower) {
+        const openClamp = clamp(open, 0.18, 1.3);
+        pv = eyeV + (pv - eyeV) * openClamp - smile * eyeDist * 0.025 * arch;
       } else {
-        y = eye.y + (y - eye.y) * Math.max(0.04, open);
-        if (part.id.endsWith("_lower")) {
-          y -= smile * eyeDist * 0.032;
-        }
+        const openClamp = clamp(open, 0.08, 1.3);
+        pv = eyeV + (pv - eyeV) * openClamp;
       }
     }
   }
@@ -1371,54 +1507,55 @@ export function deform(
     const isL = part.id.startsWith("browL");
     const browY = isL ? params.browLY : params.browRY;
     const browForm = isL ? params.browLForm : params.browRForm;
-    y -= browY * headH * 0.045;
-    const innerFactor = 1 - clamp(Math.abs(x - cx) / (eyeDist * 0.65), 0, 1);
-    y -= browForm * headH * 0.028 * innerFactor;
+    pv -= browY * headH * 0.045;
+    const innerFactor = 1 - clamp(Math.abs(pu) / (eyeDist * 0.65), 0, 1);
+    pv -= browForm * headH * 0.028 * innerFactor;
   }
   if (part.id.startsWith("mouth")) {
     const mShape = shapeDeform?.mouth;
     if (mShape) {
-      x += mShape.offsetX * eyeDist * 0.12;
-      y += mShape.offsetY * headH * 0.04;
-      x = lm.mouth.x + (x - lm.mouth.x) * mShape.width;
-      const mnx = (x - lm.mouth.x) / Math.max(1, eyeDist * 0.16);
+      pu += mShape.offsetX * eyeDist * 0.12;
+      pv += mShape.offsetY * headH * 0.04;
+      pu = mouthU + (pu - mouthU) * mShape.width;
+      const mnx = (pu - mouthU) / Math.max(1, eyeDist * 0.16);
       const mCenter = Math.max(0, 1 - mnx * mnx);
       const mCornerW = clamp(Math.abs(mnx), 0, 1.2);
-      y -= mShape.corner * headH * 0.028 * mCornerW * mCornerW;
-      y = lm.mouth.y + (y - lm.mouth.y) * (1 + mShape.roundnessDelta * 0.3 * mCenter);
+      pv -= mShape.corner * headH * 0.028 * mCornerW * mCornerW;
+      pv = mouthV + (pv - mouthV) * (1 + mShape.roundnessDelta * 0.3 * mCenter);
       const upperW =
         part.id === "mouth_upper" || part.id === "mouth_sub_lip"
           ? 1
-          : clamp((lm.mouth.y + headH * 0.02 - y) / Math.max(1, headH * 0.04), 0, 1);
+          : clamp((mouthV + headH * 0.02 - pv) / Math.max(1, headH * 0.04), 0, 1);
       const lowerW =
         part.id === "mouth_lower" || part.id === "mouth_sub_lip"
           ? 1
-          : clamp((y - (lm.mouth.y - headH * 0.02)) / Math.max(1, headH * 0.04), 0, 1);
-      y -= mShape.upperCurveDelta * headH * 0.024 * mCenter * upperW;
-      y += mShape.lowerCurveDelta * headH * 0.026 * mCenter * lowerW;
+          : clamp((pv - (mouthV - headH * 0.02)) / Math.max(1, headH * 0.04), 0, 1);
+      pv -= mShape.upperCurveDelta * headH * 0.024 * mCenter * upperW;
+      pv += mShape.lowerCurveDelta * headH * 0.026 * mCenter * lowerW;
     }
     if (!isSubLayer) {
-      const mdx = x - lm.mouth.x;
+      const mdx = pu - mouthU;
       const cornerW = clamp(Math.abs(mdx) / Math.max(1, eyeDist * 0.18), 0, 1.2);
-      x += mdx * params.mouthForm * 0.14;
-      y -= params.mouthForm * headH * 0.016 * cornerW * cornerW;
-      if (part.id === "mouth_upper") y -= params.mouth * headH * 0.012;
-      if (part.id === "mouth_lower") y += params.mouth * headH * 0.045;
+      pu += mdx * params.mouthForm * 0.14;
+      pv -= params.mouthForm * headH * 0.016 * cornerW * cornerW;
+      if (part.id === "mouth_upper") pv -= params.mouth * headH * 0.012;
+      if (part.id === "mouth_lower") pv += params.mouth * headH * 0.045;
       if (part.id === "mouth_inner")
-        y = lm.mouth.y + (y - lm.mouth.y) * (1 + params.mouth * 2);
+        pv = mouthV + (pv - mouthV) * (1 + params.mouth * 2);
     }
   }
   const weight =
     part.id === "neck"
-      ? clamp((lm.chin.y + headH * 0.42 - y) / (headH * 0.42), 0, 1)
+      ? clamp((hf.chinV + headH * 0.42 - pv) / (headH * 0.42), 0, 1)
       : 1;
-  x +=
+  pu +=
     params.angleX *
     headH *
     0.0025 *
     weight *
-    (1 - Math.abs(y - lm.eyeL.y) / (headH * 2));
-  y += params.angleY * headH * 0.0018 * weight;
+    (1 - Math.abs(pv - eyeMidV) / (headH * 2));
+  pv += params.angleY * headH * 0.0018 * weight;
+  let [x, y] = toHeadWorld(hf, pu, pv);
   if (isHairPart(part)) {
     const [amp, rootOffset] = hairSwayProfile(part);
     const roleParam =
@@ -1678,4 +1815,91 @@ export function expandFill(
 ) {
   const res = expandFillSeparated(source, mask, w, h, radius);
   return { data: res.data, mask: res.combinedMask };
+}
+
+/**
+ * Cleanly subtracts `claimedMask` from a sibling part mask without leaving 1px AA halos
+ * or tiny disconnected seam-ring fragments around the subtracted perimeter.
+ */
+export function cleanSubtractedSiblingMask(
+  siblingMask: Uint8Array,
+  claimedMask: Uint8Array,
+  w: number,
+  h: number,
+): { mask: Uint8Array; changed: boolean } {
+  const n = w * h;
+  const out = siblingMask.slice();
+  const claimed = new Uint8Array(n);
+  let changed = false;
+
+  for (let i = 0; i < n; i++) {
+    if (claimedMask[i] >= 64) {
+      claimed[i] = 1;
+      if (out[i] > 0) {
+        out[i] = 0;
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return { mask: siblingMask, changed: false };
+
+  // Strip 1px soft anti-aliased halo bordering claimed pixels.
+  const haloClear: number[] = [];
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (out[i] === 0 || out[i] >= 220) continue;
+      if (
+        (x > 0 && claimed[i - 1]) ||
+        (x + 1 < w && claimed[i + 1]) ||
+        (y > 0 && claimed[i - w]) ||
+        (y + 1 < h && claimed[i + w])
+      ) {
+        haloClear.push(i);
+      }
+    }
+  }
+  for (const i of haloClear) out[i] = 0;
+
+  let remaining = 0;
+  for (let i = 0; i < n; i++) if (out[i] > 8) remaining++;
+  const maxSliverArea = Math.min(160, Math.max(48, Math.floor(remaining * 0.015)));
+
+  // Drop tiny disconnected fragments: <= 8px noise anywhere, or < maxSliverArea touching claimed seam.
+  const visited = new Uint8Array(n);
+  const stack: number[] = [];
+  for (let start = 0; start < n; start++) {
+    if (visited[start] || out[start] <= 8) continue;
+    visited[start] = 1;
+    stack.length = 0;
+    stack.push(start);
+    const comp: number[] = [];
+    let touchesClaimed = false;
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      comp.push(cur);
+      const cx = cur % w;
+      const cy = (cur / w) | 0;
+      const nbs = [
+        cx > 0 ? cur - 1 : -1,
+        cx + 1 < w ? cur + 1 : -1,
+        cy > 0 ? cur - w : -1,
+        cy + 1 < h ? cur + w : -1,
+      ];
+      for (const nb of nbs) {
+        if (nb < 0) continue;
+        if (claimed[nb]) touchesClaimed = true;
+        if (!visited[nb] && out[nb] > 8) {
+          visited[nb] = 1;
+          stack.push(nb);
+        }
+      }
+    }
+    if (comp.length <= 8 || (touchesClaimed && comp.length < maxSliverArea)) {
+      for (const idx of comp) out[idx] = 0;
+    }
+  }
+
+  return { mask: out, changed: true };
 }

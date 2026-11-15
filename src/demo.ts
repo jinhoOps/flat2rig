@@ -109,7 +109,7 @@ export function demoFile() {
 }
 
 /**
- * Renders a visual preparation sprite sheet explaining recommended input illustration layout
+ * Renders a visual preparation texture-atlas sheet explaining recommended input illustration layout
  * alongside the 21 motion-ready silhouette layers matched by flat2rig.
  */
 export function renderSpriteGuideCanvas(width = 1860, height = 1170): HTMLCanvasElement {
@@ -127,7 +127,7 @@ export function renderSpriteGuideCanvas(width = 1860, height = 1170): HTMLCanvas
   // Header strip
   g.fillStyle = "#0f172a";
   g.font = "700 24px system-ui, -apple-system, 'Malgun Gothic', sans-serif";
-  g.fillText("flat2rig 일러스트 · LD / SD 실루엣 파츠 스프라이트 준비 가이드", 28, 42);
+  g.fillText("flat2rig 일러스트 · LD / SD 실루엣 파츠 텍스처 아틀라스 준비 가이드", 28, 42);
   g.fillStyle = "#475569";
   g.font = "500 14px system-ui, -apple-system, 'Malgun Gothic', sans-serif";
   g.fillText(
@@ -205,7 +205,7 @@ export function renderSpriteGuideCanvas(width = 1860, height = 1170): HTMLCanvas
 
   g.fillStyle = "#1d4ed8";
   g.font = "700 15px system-ui, -apple-system, 'Malgun Gothic', sans-serif";
-  g.fillText("2. 실루엣 뱅크가 만들어내는 모션용 파츠 스프라이트 구성", 452, 120);
+  g.fillText("2. 실루엣 뱅크가 만들어내는 모션용 파츠 텍스처 아틀라스 구성", 452, 120);
 
   const tiles: { title: string; sub: string; draw: (cx: number, cy: number) => void }[] = [
     {
@@ -444,7 +444,7 @@ export function downloadSpriteGuide(): string {
   const url = renderSpriteGuideCanvas().toDataURL("image/png");
   const a = document.createElement("a");
   a.href = url;
-  a.download = "flat2rig-sprite-guide.png";
+  a.download = "flat2rig-texture-atlas-guide.png";
   a.click();
   return url;
 }

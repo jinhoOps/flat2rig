@@ -294,6 +294,33 @@ input[type="checkbox"] {
 .layer-group-header:first-child {
   margin-top: 2px;
 }
+.layer-group-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.layer-group-eye {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 5px;
+  color: inherit;
+  cursor: pointer;
+}
+.layer-group-eye:hover {
+  background: rgba(15, 23, 42, 0.08);
+  color: var(--ink-primary);
+}
+.layer-group-eye.is-partial {
+  opacity: 0.55;
+}
+.layer-group-eye.is-hidden {
+  opacity: 0.42;
+}
 button.layer-group-header:hover:not(:disabled) {
   background: rgba(15, 23, 42, 0.07);
   border-color: var(--line-control);

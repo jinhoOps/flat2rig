@@ -5,14 +5,18 @@ import {
   createDefaultProjectRigState,
   describeDynamicPart,
   HAIR_ROLE_META,
+  isHairStageLayer,
   PART_DEFS,
+  partPipelineStage,
   PARAM_DEFS,
   PARAM_GROUPS,
   REST,
+  stageIncludesLayer,
   type ExpressionPreset,
   type HairRole,
   type Parameters,
   type PartRole,
+  type PipelineStage,
   type PlaybackSettings,
   type Project,
   type Part,
@@ -194,6 +198,7 @@ function migrateLegacyToV3(
     analysisNote:
       typeof p.analysisNote === "string" ? p.analysisNote : undefined,
     detailMode: p.detailMode as Project["detailMode"],
+    rigStage: p.rigStage as Project["rigStage"],
     styleMatch: p.styleMatch as Project["styleMatch"],
     styleSelection: p.styleSelection as Project["styleSelection"],
     ...defaults,
@@ -1412,4 +1417,200 @@ export function mergePreservedParts(
   }
 
   return { parts: merged, preservedCount };
+}
+
+export { isHairStageLayer, partPipelineStage, stageIncludesLayer };
+
+const STAGE_ORDER_RANK: Record<PipelineStage | "base_body", number> = {
+  base_silhouette: 1,
+  features_overlay: 2,
+  clothes_overlay: 3,
+  base_body: 3,
+  hair_overlay: 4,
+  full: 4,
+};
+
+const CANONICAL_STAGE_Z: Record<string, number> = {
+  hair_back: 0,
+  body: 10,
+  neck: 20,
+  clothes: 30,
+  clothes_inner: 32,
+  clothes_collar: 34,
+  clothes_outer: 36,
+  clothes_acc: 38,
+  clothes_hands: 39,
+  hands: 39,
+  face: 40,
+  face_detail: 42,
+  eyeR_white: 50,
+  eyeR_iris: 51,
+  eyeR_lower: 52,
+  eyeR_upper: 53,
+  eyeR_all: 54,
+  eyeL_white: 60,
+  eyeL_iris: 61,
+  eyeL_lower: 62,
+  eyeL_upper: 63,
+  eyeL_all: 64,
+  browR: 70,
+  browL: 71,
+  mouth_inner: 80,
+  mouth_lower: 81,
+  mouth_upper: 82,
+  mouth_all: 83,
+  acc_glasses: 90,
+  hair_side_R: 100,
+  hair_side_L: 101,
+  hair_front: 110,
+  hat: 120,
+  acc_hairpin: 130,
+  acc_ribbon: 140,
+};
+
+function stageLayerZRank(id: string): number {
+  if (id in CANONICAL_STAGE_Z) return CANONICAL_STAGE_Z[id];
+  if (id.startsWith("hair_back")) return 1;
+  if (id.startsWith("clothes_hands") || id.startsWith("hands_")) return 39;
+  if (id.startsWith("clothes_")) return 35;
+  if (id.startsWith("hair_side_R")) return 100;
+  if (id.startsWith("hair_side_L") || id.startsWith("hair_side")) return 101;
+  if (id.startsWith("hair_front") || id.startsWith("hair_")) return 111;
+  if (id.startsWith("hat")) return 121;
+  if (id.startsWith("acc_")) return 135;
+  return 150;
+}
+
+function collectClaimedMask(parts: Part[], len: number): Uint8Array {
+  const claimed = new Uint8Array(len);
+  for (const part of parts) {
+    const n = Math.min(len, part.mask.length);
+    for (let i = 0; i < n; i++) {
+      if (part.mask[i] > claimed[i]) claimed[i] = part.mask[i];
+    }
+  }
+  return claimed;
+}
+
+function demoteOverlappingMask(part: Part, claimed: Uint8Array): Part {
+  const n = Math.min(claimed.length, part.mask.length);
+  let hasOverlap = false;
+  for (let i = 0; i < n; i++) {
+    if (claimed[i] > 0 && part.mask[i] > 0) {
+      hasOverlap = true;
+      break;
+    }
+  }
+  if (!hasOverlap) return part;
+  const nextMask = part.mask.slice();
+  const nextFill = part.fillMask
+    ? part.fillMask.slice()
+    : new Uint8Array(part.mask.length);
+  for (let i = 0; i < n; i++) {
+    if (claimed[i] > 0 && nextMask[i] > 0) {
+      if (nextMask[i] > nextFill[i]) nextFill[i] = nextMask[i];
+      nextMask[i] = 0;
+    }
+  }
+  return {
+    ...part,
+    mask: nextMask,
+    fillMask: nextFill,
+    fillKind:
+      part.fillKind && part.fillKind !== "none"
+        ? part.fillKind
+        : ("template" as const),
+  };
+}
+
+/**
+ * Merges a generated pipeline stage cleanly onto existing layers across any of the 4 hybrid stacking stages:
+ * - Replaces only the incoming stage's parts while keeping earlier/later stages and approved user edits.
+ * - Shifts overlapped pixels on lower-stage bases from `mask` into `fillMask` so visible masks stay strictly disjoint.
+ * - Rebuilds canonical Z-order (`hair_back* < body < neck < clothes* < face < face_detail < eyes/brows/mouth < glasses < hair_side/front/hat`).
+ */
+export function mergeStageParts(
+  prevParts: Part[],
+  incomingParts: Part[],
+  targetStage: PipelineStage | "base_body",
+  preserveApproved = true,
+): { parts: Part[]; preservedCount: number } {
+  if (targetStage === "full") {
+    return preserveApproved
+      ? mergePreservedParts(prevParts, incomingParts)
+      : { parts: incomingParts, preservedCount: 0 };
+  }
+
+  const keptOther = prevParts.filter(
+    (p) => !stageIncludesLayer(p.id, targetStage),
+  );
+  const incomingTarget = incomingParts.filter((p) =>
+    stageIncludesLayer(p.id, targetStage),
+  );
+  const prevTargetById = new Map(
+    prevParts
+      .filter((p) => stageIncludesLayer(p.id, targetStage))
+      .map((p) => [p.id, p]),
+  );
+
+  let preservedCount = 0;
+  const mergedTarget: Part[] = incomingTarget.map((next) => {
+    const prev = prevTargetById.get(next.id);
+    if (preserveApproved && prev && isPreservedPart(prev)) {
+      preservedCount += 1;
+      return prev;
+    }
+    return next;
+  });
+  if (preserveApproved) {
+    const mergedIds = new Set(mergedTarget.map((p) => p.id));
+    for (const prev of prevTargetById.values()) {
+      if (!mergedIds.has(prev.id) && isPreservedPart(prev)) {
+        preservedCount += 1;
+        mergedTarget.push(prev);
+      }
+    }
+  }
+
+  const incomingRank = STAGE_ORDER_RANK[targetStage];
+  const earlierParts = keptOther.filter(
+    (p) => STAGE_ORDER_RANK[partPipelineStage(p.id)] < incomingRank,
+  );
+  const laterParts = keptOther.filter(
+    (p) => STAGE_ORDER_RANK[partPipelineStage(p.id)] > incomingRank,
+  );
+
+  const len =
+    mergedTarget[0]?.mask.length ??
+    keptOther[0]?.mask.length ??
+    0;
+  const laterClaimed = collectClaimedMask(laterParts, len);
+  const adjustedIncoming = mergedTarget.map((p) =>
+    demoteOverlappingMask(p, laterClaimed),
+  );
+  const combinedUpperClaimed = collectClaimedMask(
+    [...adjustedIncoming, ...laterParts],
+    len,
+  );
+  const adjustedEarlier = earlierParts.map((p) =>
+    demoteOverlappingMask(p, combinedUpperClaimed),
+  );
+
+  const combined = [...adjustedEarlier, ...adjustedIncoming, ...laterParts]
+    .map((part, idx) => ({ part, idx, rank: stageLayerZRank(part.id) }))
+    .sort((a, b) => a.rank - b.rank || a.idx - b.idx)
+    .map((entry, idx) => ({ ...entry.part, compositeOrder: idx }));
+
+  return { parts: combined, preservedCount };
+}
+
+/**
+ * Legacy helper preserving Stage-2 hair composition onto Stage-1 base layers.
+ */
+export function mergeStage2HairParts(
+  baseParts: Part[],
+  hairParts: Part[],
+  preserveApproved = true,
+): { parts: Part[]; preservedCount: number } {
+  return mergeStageParts(baseParts, hairParts, "hair_overlay", preserveApproved);
 }

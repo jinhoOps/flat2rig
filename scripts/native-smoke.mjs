@@ -134,7 +134,7 @@ try {
     `(()=>{const dt=new DataTransfer();dt.items.add(new File(['invalid'],'notes.txt',{type:'text/plain'}));document.querySelector('.app').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:dt}));})()`,
   );
   await waitFor(
-    "document.querySelector('[role=alert]')?.textContent.includes('PNG 또는 JPG')",
+    "document.querySelector('[role=alert]')?.textContent.includes('PNG, JPG')",
   );
   await evaluate(
     `(()=>{const dt=new DataTransfer();dt.items.add(new File([Uint8Array.from(atob('${png}'),c=>c.charCodeAt(0))],'dropped-character.png',{type:'image/png'}));window.__smokeDrop=dt;document.querySelector('.app').dispatchEvent(new DragEvent('dragenter',{bubbles:true,cancelable:true,dataTransfer:dt}));})()`,
@@ -150,7 +150,7 @@ try {
     "Drag/drop import, drop highlight and invalid type rejection passed",
   );
   await evaluate(
-    "[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='파츠 초안 생성').click()",
+    "[...document.querySelectorAll('button')].find(b=>b.textContent.trim().includes('전체 한 번에 생성')||b.textContent.trim().includes('파츠 초안'))?.click()",
   );
   await waitFor(
     "document.querySelectorAll('.layer').length>=18 && !document.querySelector('.busy-overlay')",

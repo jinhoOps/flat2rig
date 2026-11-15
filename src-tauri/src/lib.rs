@@ -7,7 +7,7 @@ use analysis::{
     landmarks::{detect_landmarks, Landmark28Point, RigLandmarkProvenance},
     models::{atomic_write_bytes, download_and_install_model, ModelRole, ModelStatusEntry},
     parts::{
-        propose_parts_auto, propose_parts_auto_with_template, refine_part_with_prompts,
+        propose_parts_auto, propose_parts_auto_with_template_stage, refine_part_with_prompts,
         PartProposalMeta,
     },
     segmentation::PromptInput,
@@ -419,6 +419,7 @@ async fn propose_parts(
     detail_mode: Option<String>,
     hair_split: Option<bool>,
     template_mode: Option<bool>,
+    pipeline_stage: Option<String>,
     style_overrides: Option<TemplateStyleSelection>,
     job_id: Option<u64>,
 ) -> Result<ProposePartsResponse, String> {
@@ -440,7 +441,7 @@ async fn propose_parts(
         let mode = detail_mode.unwrap_or_else(|| "detail".into());
         let hs = hair_split.unwrap_or(true);
         let use_tpl = template_mode.unwrap_or(hs && mode == "detail");
-        let out = propose_parts_auto_with_template(
+        let out = propose_parts_auto_with_template_stage(
             &state,
             &data,
             width,
@@ -454,6 +455,7 @@ async fn propose_parts(
             hs,
             use_tpl,
             style_overrides.as_ref(),
+            pipeline_stage.as_deref(),
         )?;
         if state.is_stale_or_cancelled(my_job) {
             return Err("CANCELLED".into());

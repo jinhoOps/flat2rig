@@ -3,7 +3,7 @@ use flat2rig_lib::analysis::{
     detector::{detect_faces, DEFAULT_FACE_SCORE_THRESHOLD},
     landmarks::detect_landmarks,
     models::{ModelRegistry, ModelRole},
-    parts::{propose_parts_auto_with_template, propose_parts_with_sam_with_options},
+    parts::{propose_parts_auto_with_template_stage, propose_parts_with_sam_with_options},
     state::AnalysisState,
     templates::TemplateStyleSelection,
 };
@@ -267,12 +267,24 @@ fn parse_proportion_override(raw: &str) -> Result<String, Box<dyn std::error::Er
     }
 }
 
+fn parse_stage_override(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" | "base_silhouette" | "features_overlay" | "clothes_overlay" | "hair_overlay"
+        | "base_body" => Ok(raw.trim().to_ascii_lowercase()),
+        other => Err(format!(
+            "Unsupported --stage '{other}' (expected full, base_silhouette, features_overlay, clothes_overlay, hair_overlay, or base_body)"
+        )
+        .into()),
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|s| s.as_str()) == Some("--analyze") {
         return run_analyze(&args[1..]);
     }
     let mut proportion: Option<String> = None;
+    let mut stage: Option<String> = None;
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -285,6 +297,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .get(i)
                 .ok_or("Missing value for --proportion (expected auto, ld, or sd)")?;
             proportion = Some(parse_proportion_override(val)?);
+        } else if let Some(val) = arg.strip_prefix("--stage=") {
+            stage = Some(parse_stage_override(val)?);
+        } else if arg == "--stage" {
+            i += 1;
+            let val = args.get(i).ok_or(
+                "Missing value for --stage (expected full, base_silhouette, features_overlay, clothes_overlay, hair_overlay, or base_body)",
+            )?;
+            stage = Some(parse_stage_override(val)?);
         } else if arg.starts_with("--") {
             return Err(format!("Unknown flag: {arg}").into());
         } else {
@@ -294,7 +314,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if positional.len() < 2 {
         return Err(
-            "Usage: flat2rig-cli [--proportion auto|ld|sd] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
+            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
         );
     }
     let start = std::time::Instant::now();
@@ -386,7 +406,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         mouth_style: None,
         clothes_style: None,
     });
-    let proposed = propose_parts_auto_with_template(
+    let proposed = propose_parts_auto_with_template_stage(
         &state,
         img.as_raw(),
         w as usize,
@@ -400,6 +420,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         true,
         true,
         style_overrides.as_ref(),
+        stage.as_deref(),
     )?;
 
     let mut meshes = Vec::new();

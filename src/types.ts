@@ -338,6 +338,13 @@ export interface ExpressionPreset {
   shortcutKey?: string;
 }
 
+export type PipelineStage =
+  | "base_silhouette"
+  | "features_overlay"
+  | "clothes_overlay"
+  | "hair_overlay"
+  | "full";
+
 export interface RigProfile {
   proportionMode: RigProportionMode;
   defaultShapeIds: {
@@ -392,6 +399,7 @@ export interface Project {
   analysisStatus?: AnalysisStatus;
   analysisNote?: string;
   detailMode?: "detail" | "parent";
+  rigStage?: PipelineStage | "base_body";
   styleMatch?: StyleMatchReport;
   styleSelection?: TemplateStyleSelection;
   rigProfile: RigProfile;
@@ -826,7 +834,7 @@ export function inferPartRole(id: string, explicitRole?: PartRole): PartRole {
   if (id === "body") return "body";
   if (id === "clothes" || id.startsWith("clothes_")) return "clothes";
   if (id === "neck") return "neck";
-  if (id === "face") return "face";
+  if (id === "face" || id === "face_detail") return "face";
   if (id.startsWith("eye")) return "eye";
   if (id.startsWith("brow")) return "brow";
   if (id.startsWith("mouth")) return "mouth";
@@ -844,6 +852,50 @@ export function isHairPart(partOrId: string | Pick<Part, "id" | "role">): boolea
     inferred === "hair_back" ||
     id.startsWith("hair")
   );
+}
+
+export function isHairStageLayer(id: string): boolean {
+  return (
+    id.startsWith("hair_") ||
+    id === "hat" ||
+    id === "acc_hairpin" ||
+    id === "acc_ribbon"
+  );
+}
+
+export function partPipelineStage(
+  id: string,
+): Exclude<PipelineStage, "full"> {
+  if (isHairStageLayer(id)) return "hair_overlay";
+  if (
+    id === "clothes" ||
+    id.startsWith("clothes_") ||
+    id === "hands" ||
+    id.startsWith("hands_") ||
+    id === "acc_glasses"
+  ) {
+    return "clothes_overlay";
+  }
+  if (
+    id === "body" ||
+    id === "neck" ||
+    id === "face" ||
+    id === "eyeR_white" ||
+    id === "eyeL_white" ||
+    id === "mouth_inner"
+  ) {
+    return "base_silhouette";
+  }
+  return "features_overlay";
+}
+
+export function stageIncludesLayer(
+  id: string,
+  stage: PipelineStage | "base_body",
+): boolean {
+  if (stage === "full") return true;
+  if (stage === "base_body") return !isHairStageLayer(id);
+  return partPipelineStage(id) === stage;
 }
 
 const WEARABLE_ID_META: Record<
@@ -867,6 +919,14 @@ export function describeDynamicPart(id: string): {
   color: string;
   role: PartRole;
 } {
+  if (id === "face_detail") {
+    return {
+      name: "얼굴 디테일 (볼터치·코)",
+      group: "얼굴",
+      color: "#fb7185",
+      role: "face",
+    };
+  }
   if (id in WEARABLE_ID_META) {
     return WEARABLE_ID_META[id];
   }
@@ -1029,8 +1089,8 @@ function makeEyeShapePresets(
       handles: {
         ...DEFAULT_EYE_HANDLES,
         open: 0,
-        roundness: 0.2,
-        upperCurve: -0.2,
+        roundness: 0.25,
+        upperCurve: 0,
         lowerCurve: 0,
         interiorVisibility: 0,
       },
@@ -1048,9 +1108,9 @@ function makeEyeShapePresets(
         ...DEFAULT_EYE_HANDLES,
         open: 0,
         roundness: 0.65,
-        corner: 0.35,
-        upperCurve: 0.85,
-        lowerCurve: 0.4,
+        corner: 0.28,
+        upperCurve: 0.9,
+        lowerCurve: 0.35,
         interiorVisibility: 0,
       },
       parameterOverrides: { [openKey]: 0, [smileKey]: 1 },
@@ -1210,15 +1270,17 @@ export function createDefaultExpressionPresets(): ExpressionPreset[] {
       shapeIds: {
         eye_L: "eye_L_smiling",
         eye_R: "eye_R_smiling",
-        mouth: "mouth_i",
+        mouth: "mouth_closed",
       },
       parameters: {
-        eyeLSmile: 0.85,
-        eyeRSmile: 0.85,
+        eyeL: 0,
+        eyeR: 0,
+        eyeLSmile: 0.9,
+        eyeRSmile: 0.9,
         browLY: 0.15,
         browRY: 0.15,
         mouthForm: 0.55,
-        mouth: 0.12,
+        mouth: 0.08,
       },
       strength: 1,
       transitionMs: 180,
@@ -1234,6 +1296,8 @@ export function createDefaultExpressionPresets(): ExpressionPreset[] {
         mouth: "mouth_a",
       },
       parameters: {
+        eyeL: 0,
+        eyeR: 0,
         eyeLSmile: 1,
         eyeRSmile: 1,
         browLY: 0.3,
@@ -1273,20 +1337,26 @@ export function createDefaultExpressionPresets(): ExpressionPreset[] {
       name: "슬픔",
       builtIn: true,
       shapeIds: {
-        eye_L: "eye_L_half_closed",
-        eye_R: "eye_R_half_closed",
+        eye_L: "eye_L_closed",
+        eye_R: "eye_R_closed",
         mouth: "mouth_closed",
       },
       parameters: {
-        eyeL: 0.65,
-        eyeR: 0.65,
+        eyeL: 0,
+        eyeR: 0,
+        eyeLSmile: 0,
+        eyeRSmile: 0,
         browLY: 0.35,
         browRY: 0.35,
-        browLForm: -0.45,
-        browRForm: -0.45,
-        mouthForm: -0.55,
-        mouth: 0.05,
-        angleY: -5,
+        browLForm: -0.65,
+        browRForm: -0.65,
+        mouthForm: -0.65,
+        mouth: 0.02,
+        angleY: -6,
+      },
+      handleTweaks: {
+        eye_L: { upperCurve: -0.95 },
+        eye_R: { upperCurve: -0.95 },
       },
       strength: 1,
       transitionMs: 220,
@@ -1386,6 +1456,7 @@ export function createDefaultRigProfile(
     clippingTargets: {
       eyeL_iris: "eyeL_white",
       eyeR_iris: "eyeR_white",
+      face_detail: "face",
     },
   };
 }

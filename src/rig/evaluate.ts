@@ -72,6 +72,8 @@ export interface EvaluatedRigFrame {
   hiddenBasePartIds: Set<string>;
   mouthInteriorAlpha: number;
   eyeIrisAlpha: { L: number; R: number };
+  eyeWhiteAlpha: { L: number; R: number };
+  eyeLowerAlpha: { L: number; R: number };
   eyeClosedOrSmiling: { L: boolean; R: boolean };
   nextPhysicsState: HairPhysicsState;
   isRest: boolean;
@@ -571,18 +573,29 @@ export function evaluateRigFrame(input: EvaluateRigInput): EvaluatedRigFrame {
     }
   }
 
-  const eyeIrisAlpha = {
-    L:
-      eyeClosedOrSmiling.L || blinkAssist.L || finalPose.eyeL <= 0.14
-        ? 0
-        : clamp((finalPose.eyeL - 0.14) / 0.18, 0, 1) *
-          clamp(activeHandles.eye_L.interiorVisibility, 0, 1),
-    R:
-      eyeClosedOrSmiling.R || blinkAssist.R || finalPose.eyeR <= 0.14
-        ? 0
-        : clamp((finalPose.eyeR - 0.14) / 0.18, 0, 1) *
-          clamp(activeHandles.eye_R.interiorVisibility, 0, 1),
+  const hasLegacyEyeAsset = {
+    L: Boolean(activeShapes.eye_L.assetId && shapeAssets?.[activeShapes.eye_L.assetId]),
+    R: Boolean(activeShapes.eye_R.assetId && shapeAssets?.[activeShapes.eye_R.assetId]),
   };
+  const computeEyeAlphas = (side: "L" | "R", eyeVal: number) => {
+    const region = side === "L" ? "eye_L" : "eye_R";
+    if (hasLegacyEyeAsset[side] && (eyeClosedOrSmiling[side] || blinkAssist[side])) {
+      return { iris: 0, white: 0, lower: 0 };
+    }
+    const iris =
+      eyeVal <= 0.06
+        ? 0
+        : clamp((eyeVal - 0.06) / 0.14, 0, 1) *
+          clamp(activeHandles[region].interiorVisibility, 0, 1);
+    const white = eyeVal <= 0.03 ? 0 : clamp((eyeVal - 0.03) / 0.11, 0, 1);
+    const lower = eyeVal <= 0.15 ? 0 : clamp((eyeVal - 0.15) / 0.35, 0, 1);
+    return { iris, white, lower };
+  };
+  const leftEyeAlphas = computeEyeAlphas("L", finalPose.eyeL);
+  const rightEyeAlphas = computeEyeAlphas("R", finalPose.eyeR);
+  const eyeIrisAlpha = { L: leftEyeAlphas.iris, R: rightEyeAlphas.iris };
+  const eyeWhiteAlpha = { L: leftEyeAlphas.white, R: rightEyeAlphas.white };
+  const eyeLowerAlpha = { L: leftEyeAlphas.lower, R: rightEyeAlphas.lower };
   const mouthInteriorAlpha =
     finalPose.mouth <= 0.03
       ? 0
@@ -607,6 +620,8 @@ export function evaluateRigFrame(input: EvaluateRigInput): EvaluatedRigFrame {
     hiddenBasePartIds,
     mouthInteriorAlpha,
     eyeIrisAlpha,
+    eyeWhiteAlpha,
+    eyeLowerAlpha,
     eyeClosedOrSmiling,
     nextPhysicsState,
     isRest,

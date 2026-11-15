@@ -6,6 +6,7 @@ import {
   PARENT_PART_DEFS,
   PARENT_TO_DETAIL_IDS,
   PART_DEFS,
+  stageIncludesLayer,
   type AnalysisStatus,
   type FaceCandidate,
   type FillKind,
@@ -16,6 +17,7 @@ import {
   type ModelStatusEntry,
   type Part,
   type PartProvenance,
+  type PipelineStage,
   type Point,
   type PromptPoint,
   type StyleMatchReport,
@@ -213,6 +215,7 @@ export async function proposeParts(
     detailMode?: "detail" | "parent";
     hairSplit?: boolean;
     templateMode?: boolean;
+    pipelineStage?: PipelineStage | "base_body";
     styleOverrides?: TemplateStyleSelection | null;
     jobId?: number | null;
   },
@@ -221,6 +224,7 @@ export async function proposeParts(
   const detailMode = options.detailMode ?? "detail";
   const hairSplit = options.hairSplit ?? true;
   const templateMode = options.templateMode ?? detailMode === "detail";
+  const pipelineStage = options.pipelineStage ?? "full";
   if (desktop) {
     const res = await invoke<{
       jobId: number;
@@ -253,6 +257,7 @@ export async function proposeParts(
       detailMode,
       hairSplit,
       templateMode,
+      pipelineStage,
       styleOverrides: options.styleOverrides ?? null,
       jobId: options.jobId ?? null,
     });
@@ -311,7 +316,7 @@ export async function proposeParts(
     options.modelPath ?? null,
     signal,
   );
-  const parts =
+  const rawParts =
     detailMode === "parent"
       ? collapseDetailPartsToParents(fallback.parts, width * height)
       : fallback.parts.map((p, i) => ({
@@ -319,6 +324,17 @@ export async function proposeParts(
           provenance: "geometry" as const,
           compositeOrder: i,
         }));
+  const fallbackParts = fillBrowserFallbackParts(
+    rawParts,
+    pixels,
+    width,
+    height,
+    landmarks,
+  );
+  const parts =
+    pipelineStage === "full"
+      ? fallbackParts
+      : fallbackParts.filter((p) => stageIncludesLayer(p.id, pipelineStage));
   return {
     parts,
     provider: fallback.provider,
@@ -326,6 +342,97 @@ export async function proposeParts(
     postprocessVersion: "geometry-template-v1",
     imageHash: "",
   };
+}
+
+function encodeRgbaDataUrl(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+): string | undefined {
+  if (typeof document === "undefined") return undefined;
+  const c = document.createElement("canvas");
+  c.width = width;
+  c.height = height;
+  const ctx = c.getContext("2d");
+  if (!ctx) return undefined;
+  ctx.putImageData(
+    new ImageData(new Uint8ClampedArray(rgba), width, height),
+    0,
+    0,
+  );
+  return c.toDataURL("image/png");
+}
+
+function fillBrowserFallbackParts(
+  parts: Part[],
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+  landmarks: Landmarks,
+): Part[] {
+  if (typeof document === "undefined") return parts;
+  const eyeDist = Math.max(
+    12,
+    Math.hypot(landmarks.eyeL.x - landmarks.eyeR.x, landmarks.eyeL.y - landmarks.eyeR.y),
+  );
+  const faceSupport = new Uint8Array(width * height);
+  const supportIds = new Set([
+    "face",
+    "eyeL_white",
+    "eyeL_iris",
+    "eyeL_upper",
+    "eyeL_lower",
+    "eyeR_white",
+    "eyeR_iris",
+    "eyeR_upper",
+    "eyeR_lower",
+    "browL",
+    "browR",
+    "mouth_upper",
+    "mouth_lower",
+    "mouth_inner",
+    "mouth_all",
+  ]);
+  for (const p of parts) {
+    if (!supportIds.has(p.id)) continue;
+    for (let i = 0; i < faceSupport.length; i++) {
+      if (p.mask[i] > faceSupport[i]) faceSupport[i] = p.mask[i];
+    }
+  }
+  const fillConfigs: Record<string, { radius: number; support?: Uint8Array }> = {
+    face: { radius: Math.max(18, Math.round(eyeDist * 0.45)), support: faceSupport },
+    eyeL_white: { radius: Math.max(8, Math.round(eyeDist * 0.22)) },
+    eyeR_white: { radius: Math.max(8, Math.round(eyeDist * 0.22)) },
+    mouth_inner: { radius: Math.max(4, Math.round(eyeDist * 0.08)) },
+  };
+  return parts.map((part) => {
+    const cfg = fillConfigs[part.id];
+    if (!cfg) return part;
+    const filled = expandFillSeparated(
+      rgba,
+      part.mask,
+      width,
+      height,
+      cfg.radius,
+      part.id,
+    );
+    if (cfg.support) {
+      for (let i = 0; i < filled.fillMask.length; i++) {
+        if (cfg.support[i] <= 16) {
+          filled.fillMask[i] = 0;
+          if (part.mask[i] === 0) filled.data[i * 4 + 3] = 0;
+        }
+      }
+    }
+    const texture = encodeRgbaDataUrl(filled.data, width, height);
+    return {
+      ...part,
+      fillMask: filled.fillMask,
+      fillKind: filled.fillKind,
+      ...(texture ? { texture } : {}),
+      generated: true,
+    };
+  });
 }
 
 export async function refinePartPrompt(
@@ -591,11 +698,11 @@ export type UpdateDownloadEvent =
   | { event: "Finished" };
 
 export async function getAppVersion(): Promise<string> {
-  if (!desktop) return "0.2.0-2";
+  if (!desktop) return "0.2.0-3";
   try {
     return await invoke<string>("get_app_version");
   } catch {
-    return "0.2.0-2";
+    return "0.2.0-3";
   }
 }
 
@@ -605,7 +712,7 @@ export async function checkAppUpdate(
   if (!desktop) {
     return {
       status: "unavailable",
-      currentVersion: "0.2.0-2",
+      currentVersion: "0.2.0-3",
       latestVersion: null,
       signed: false,
       endpointUsed: customEndpoint || "",
