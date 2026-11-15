@@ -10,10 +10,24 @@ import type {
   Part,
   Point,
   Project,
+  ShapeHandleValues,
+  ShapeRegion,
   Tool,
 } from "./types";
 import { canvas, loadImage, pixels, pixelsCanvas } from "./images";
-import { clamp, compositePartTexture, deform, effectiveMask, meshForPart } from "./engine";
+import { clamp, compositePartTexture, effectiveMask, meshForPart } from "./engine";
+import {
+  createPhysicsState,
+  evaluateRigFrame,
+  type HairPhysicsState,
+} from "./rig/evaluate";
+import {
+  buildProjectSubstituteTextures,
+  renderCharacterFrame,
+  type RenderScratch,
+  type SubstituteLayerTexture,
+} from "./rig/render";
+import type { ProjectTextureSet } from "./rig/useProjectTextures";
 
 interface Props {
   project: Project;
@@ -29,8 +43,12 @@ interface Props {
   solo: boolean;
   preview: boolean;
   playing: boolean;
+  cleanStage?: boolean;
   parameters: Parameters;
   meshes: Map<string, Mesh>;
+  sharedTextures?: ProjectTextureSet;
+  overrideShapeIds?: Partial<Record<ShapeRegion, string>>;
+  overrideHandles?: Partial<Record<ShapeRegion, Partial<ShapeHandleValues>>>;
   onStart: (point: Point, exclude?: boolean) => void;
   onMove: (point: Point) => void;
   onEnd: (point: Point) => void;
@@ -42,41 +60,6 @@ const landmarkLabels: Record<LandmarkId, string> = {
   chin: "턱",
   crown: "얼굴 상단",
 };
-function triangle(
-  ctx: CanvasRenderingContext2D,
-  texture: HTMLCanvasElement,
-  src: Point[],
-  dst: Point[],
-) {
-  const [a, b, c] = src,
-    [p, q, r] = dst;
-  const det = a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y);
-  if (Math.abs(det) < 0.01) return;
-  const aa = (p.x * (b.y - c.y) + q.x * (c.y - a.y) + r.x * (a.y - b.y)) / det;
-  const bb = (p.y * (b.y - c.y) + q.y * (c.y - a.y) + r.y * (a.y - b.y)) / det;
-  const cc = (p.x * (c.x - b.x) + q.x * (a.x - c.x) + r.x * (b.x - a.x)) / det;
-  const dd = (p.y * (c.x - b.x) + q.y * (a.x - c.x) + r.y * (b.x - a.x)) / det;
-  const ee =
-    (p.x * (b.x * c.y - c.x * b.y) +
-      q.x * (c.x * a.y - a.x * c.y) +
-      r.x * (a.x * b.y - b.x * a.y)) /
-    det;
-  const ff =
-    (p.y * (b.x * c.y - c.x * b.y) +
-      q.y * (c.x * a.y - a.x * c.y) +
-      r.y * (a.x * b.y - b.x * a.y)) /
-    det;
-  ctx.save();
-  ctx.beginPath();
-  ctx.moveTo(p.x, p.y);
-  ctx.lineTo(q.x, q.y);
-  ctx.lineTo(r.x, r.y);
-  ctx.closePath();
-  ctx.clip();
-  ctx.transform(aa, bb, cc, dd, ee, ff);
-  ctx.drawImage(texture, 0, 0);
-  ctx.restore();
-}
 export default function Viewport(props: Props) {
   const {
     project: p,
@@ -92,15 +75,31 @@ export default function Viewport(props: Props) {
   const root = useRef<HTMLDivElement>(null),
     element = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 600, h: 700 });
-  const [textures, setTextures] = useState<HTMLCanvasElement[]>([]),
-    [source, setSource] = useState<HTMLImageElement>();
+  const [localPartTextures, setLocalPartTextures] = useState<Map<string, HTMLCanvasElement>>(
+      () => new Map(),
+    ),
+    [localSubTextures, setLocalSubTextures] = useState<Map<string, SubstituteLayerTexture>>(
+      () => new Map(),
+    ),
+    [localSource, setLocalSource] = useState<HTMLImageElement>();
+  const partTextures = props.sharedTextures?.partTextures ?? localPartTextures;
+  const subTextures = props.sharedTextures?.substituteTextures ?? localSubTextures;
+  const source = props.sharedTextures?.sourceImage ?? localSource;
   const [cursor, setCursor] = useState<Point | null>(null),
     [frame, setFrame] = useState(0);
-  const physics = useRef({ position: 0, velocity: 0, previous: 0 });
-  const clipWorkCanvas = useRef<{
-    white: HTMLCanvasElement;
-    iris: HTMLCanvasElement;
-  } | null>(null);
+  const physics = useRef<HairPhysicsState>(createPhysicsState());
+  const renderScratch = useRef<RenderScratch | undefined>(undefined);
+  useEffect(
+    () => () => {
+      renderScratch.current?.gl?.dispose();
+    },
+    [],
+  );
+  const exprTransition = useRef<{
+    currentId: string;
+    prevId: string | null;
+    startedAt: number;
+  }>({ currentId: p.activeExpressionId, prevId: null, startedAt: 0 });
   const fallbackMeshes = useMemo(
     () =>
       new Map(
@@ -127,23 +126,26 @@ export default function Viewport(props: Props) {
     return () => observer.disconnect();
   }, []);
   useEffect(() => {
-    let active = true;
     textureCache.current.clear();
+    physics.current = createPhysicsState();
+    setFrame(0);
+    if (props.sharedTextures) return;
+    let active = true;
     loadImage(p.source).then((img) => {
-      if (active) setSource(img);
+      if (active) setLocalSource(img);
     });
     return () => {
       active = false;
     };
-  }, [p.source]);
+  }, [p.source, props.sharedTextures]);
   useEffect(() => {
-    if (!source || source.src !== p.source) return;
+    if (props.sharedTextures || !localSource || localSource.src !== p.source) return;
     let active = true;
-    const data = pixels(source, p.width, p.height);
+    const data = pixels(localSource, p.width, p.height);
     Promise.all(
       p.parts.map(async (part) => {
         const cached = textureCache.current.get(part.id);
-        if (cached?.part === part) return cached.canvas;
+        if (cached?.part === part) return [part.id, cached.canvas] as const;
         const texPixels = part.texture
           ? pixels(await loadImage(part.texture), p.width, p.height)
           : undefined;
@@ -153,15 +155,58 @@ export default function Viewport(props: Props) {
           p.height,
         );
         if (active) textureCache.current.set(part.id, { part, canvas: result });
-        return result;
+        return [part.id, result] as const;
       }),
-    ).then((images) => {
-      if (active) setTextures(images);
+    ).then((entries) => {
+      if (active) setLocalPartTextures(new Map(entries));
     });
     return () => {
       active = false;
     };
-  }, [source, p.parts, p.width, p.height]);
+  }, [props.sharedTextures, localSource, p.source, p.parts, p.width, p.height]);
+  useEffect(() => {
+    if (props.sharedTextures) return;
+    if (!p.shapeAssets) {
+      setLocalSubTextures(new Map());
+      return;
+    }
+    let active = true;
+    buildProjectSubstituteTextures(p).then((entries) => {
+      if (active) setLocalSubTextures(entries);
+    });
+    return () => {
+      active = false;
+    };
+  }, [props.sharedTextures, p.shapeAssets, p.width, p.height, p.landmarks]);
+  const [transitionElapsedMs, setTransitionElapsedMs] = useState(0);
+  useEffect(() => {
+    if (p.activeExpressionId === exprTransition.current.currentId) return;
+    const prevId = exprTransition.current.currentId;
+    const targetExp = p.expressions.find((e) => e.id === p.activeExpressionId);
+    const dur = targetExp?.transitionMs ?? 0;
+    exprTransition.current = {
+      currentId: p.activeExpressionId,
+      prevId,
+      startedAt: performance.now(),
+    };
+    if (dur <= 0 || playing) {
+      setTransitionElapsedMs(dur);
+      return;
+    }
+    let raf = 0;
+    const tickTransition = (now: number) => {
+      const elapsed = now - exprTransition.current.startedAt;
+      if (elapsed >= dur) {
+        setTransitionElapsedMs(dur);
+        return;
+      }
+      setTransitionElapsedMs(elapsed);
+      raf = requestAnimationFrame(tickTransition);
+    };
+    setTransitionElapsedMs(0);
+    raf = requestAnimationFrame(tickTransition);
+    return () => cancelAnimationFrame(raf);
+  }, [p.activeExpressionId, p.expressions, playing]);
   const tint = useMemo(() => {
     const part = p.parts.find((t) => t.id === selected);
     if (!part) return null;
@@ -204,7 +249,12 @@ export default function Viewport(props: Props) {
     return c;
   }, [p.parts, p.revision, p.width, p.height, selected, props.solo]);
   useEffect(() => {
-    if (!playing || !preview) return;
+    if (!playing || !preview) {
+      // Explicit physics & frame reset when paused, exited preview, or stopped
+      physics.current = createPhysicsState();
+      setFrame(0);
+      return;
+    }
     let id = 0;
     const start = performance.now();
     let last = 0;
@@ -224,178 +274,41 @@ export default function Viewport(props: Props) {
     const el = element.current;
     if (!el) return;
     const ctx = el.getContext("2d")!;
-    ctx.clearRect(0, 0, p.width, p.height);
-    const pose = { ...parameters };
-    if (playing && preview) {
-      pose.angleX += Math.sin(frame * 0.9) * 7;
-      pose.angleY += Math.sin(frame * 0.65) * 4;
-      pose.angleZ += Math.sin(frame * 0.45) * 2.5;
-      const blink = Math.pow(Math.max(0, Math.cos(frame * 1.5)), 24);
-      pose.eyeL *= 1 - blink;
-      pose.eyeR *= 1 - blink;
-      pose.eyeBallX = clamp(pose.eyeBallX + Math.sin(frame * 0.55) * 0.35, -1, 1);
-      pose.eyeBallY = clamp(pose.eyeBallY + Math.sin(frame * 0.8 + 1.0) * 0.18, -1, 1);
-      pose.browLY = clamp(pose.browLY + Math.sin(frame * 0.9) * 0.18, -1, 1);
-      pose.browRY = clamp(pose.browRY + Math.sin(frame * 0.9) * 0.18, -1, 1);
-      pose.mouth = Math.max(pose.mouth, Math.max(0, Math.sin(frame * 2)) * 0.5);
-      pose.mouthForm = clamp(pose.mouthForm + Math.sin(frame * 0.7) * 0.25, -1, 1);
-      pose.breath = Math.max(pose.breath, 0.5 + 0.5 * Math.sin(frame * 1.4));
-      pose.bodyAngleX = clamp(pose.bodyAngleX + Math.sin(frame * 0.45) * 3.5, -10, 10);
-      pose.bodyAngleZ = clamp(pose.bodyAngleZ + Math.sin(frame * 0.45 + 0.4) * 2.0, -10, 10);
-      const ph = physics.current;
-      const dt = clamp(frame - ph.previous, 0, 0.05);
-      ph.previous = frame;
-      ph.velocity +=
-        ((Math.sin(frame * 0.9) * 0.6 - ph.position) * 35 - ph.velocity * 7) *
-        dt;
-      ph.position += ph.velocity * dt;
-      pose.hair += ph.position;
-      pose.hairSide = clamp(pose.hairSide + ph.position * 0.85, -1, 1);
-      pose.hairBack = clamp(pose.hairBack + ph.position * 0.65, -1, 1);
-    }
-    const moving =
-      preview &&
-      Object.entries(pose).some(([k, v]) =>
-        k === "eyeL" || k === "eyeR" ? v !== 1 : v !== 0,
-      );
-    const ensureClipCanvases = () => {
-      if (
-        !clipWorkCanvas.current ||
-        clipWorkCanvas.current.white.width !== p.width ||
-        clipWorkCanvas.current.white.height !== p.height
-      ) {
-        clipWorkCanvas.current = {
-          white: canvas(p.width, p.height),
-          iris: canvas(p.width, p.height),
-        };
-      }
-      return clipWorkCanvas.current;
-    };
-    const renderedSclera = new Map<string, HTMLCanvasElement>();
-    if (props.original || !p.parts.length) {
-      if (source) ctx.drawImage(source, 0, 0);
-    } else
-      [...p.parts]
-        .map((part, i) => ({ part, i }))
-        .sort(
-          (a, b) =>
-            (a.part.compositeOrder ?? a.i) - (b.part.compositeOrder ?? b.i),
-        )
-        .forEach(({ part, i }) => {
-          if (
-            !part.visible ||
-            part.status === "missing" ||
-            (props.solo && part.id !== selected) ||
-            !textures[i]
-          )
-            return;
-          const mesh = meshes.get(part.id) ?? fallbackMeshes.get(part.id);
-          const drawDeformed = (targetCtx: CanvasRenderingContext2D) => {
-            if (moving && mesh && mesh.triangles.length) {
-              for (let t = 0; t < mesh.triangles.length; t += 3) {
-                const ids = mesh.triangles.slice(t, t + 3);
-                const src = ids.map((j) => mesh.vertices[j]);
-                triangle(
-                  targetCtx,
-                  textures[i],
-                  src,
-                  src.map((pt) => deform(pt, part, p.landmarks, pose)),
-                );
-              }
-            } else {
-              targetCtx.drawImage(textures[i], 0, 0);
-            }
-          };
+    const trElapsed = playing
+      ? performance.now() - exprTransition.current.startedAt
+      : transitionElapsedMs;
+    const evaluated = evaluateRigFrame({
+      project: p,
+      timeSec: preview && playing ? frame : 0,
+      playing: preview && playing,
+      previousExpressionId: exprTransition.current.prevId,
+      transitionElapsedMs: trElapsed,
+      userParameters: preview ? parameters : undefined,
+      overrideShapeIds: preview ? props.overrideShapeIds : undefined,
+      overrideHandles: preview ? props.overrideHandles : undefined,
+      physicsState: physics.current,
+      deterministic: !preview,
+    });
+    physics.current = evaluated.nextPhysicsState;
 
-          const compositeOp: GlobalCompositeOperation =
-            part.blendMode === "multiply"
-              ? "multiply"
-              : part.blendMode === "additive"
-                ? "lighter"
-                : "source-over";
-          ctx.globalCompositeOperation = compositeOp;
-          if (part.id === "eyeR_white" || part.id === "eyeL_white") {
-            drawDeformed(ctx);
-            if (moving && !props.solo) {
-              const pair = ensureClipCanvases();
-              const wCtx = pair.white.getContext("2d")!;
-              wCtx.clearRect(0, 0, p.width, p.height);
-              wCtx.globalCompositeOperation = "source-over";
-              drawDeformed(wCtx);
-              renderedSclera.set(part.id, pair.white);
-            }
-          } else if (
-            (part.id === "eyeR_iris" || part.id === "eyeL_iris") &&
-            moving &&
-            !props.solo
-          ) {
-            const sclera =
-              renderedSclera.get(
-                part.id === "eyeR_iris" ? "eyeR_white" : "eyeL_white",
-              ) ?? null;
-            if (sclera) {
-              const pair = ensureClipCanvases();
-              const iCtx = pair.iris.getContext("2d")!;
-              iCtx.clearRect(0, 0, p.width, p.height);
-              iCtx.globalCompositeOperation = "source-over";
-              drawDeformed(iCtx);
-              iCtx.globalCompositeOperation = "destination-in";
-              iCtx.drawImage(sclera, 0, 0);
-              iCtx.globalCompositeOperation = "source-over";
-              ctx.drawImage(pair.iris, 0, 0);
-            } else {
-              drawDeformed(ctx);
-            }
-          } else {
-            drawDeformed(ctx);
-          }
-          ctx.globalCompositeOperation = "source-over";
-          if (props.wire && mesh && mesh.triangles.length) {
-            const posed = preview
-              ? mesh.vertices.map((pt) => deform(pt, part, p.landmarks, pose))
-              : mesh.vertices;
-            const edgeCounts = new Map<string, [number, number, number]>();
-            const addEdge = (u: number, v: number) => {
-              const lo = Math.min(u, v);
-              const hi = Math.max(u, v);
-              const key = `${lo}:${hi}`;
-              const prev = edgeCounts.get(key);
-              if (prev) prev[2]++;
-              else edgeCounts.set(key, [lo, hi, 1]);
-            };
-            for (let t = 0; t < mesh.triangles.length; t += 3) {
-              const a = mesh.triangles[t];
-              const b = mesh.triangles[t + 1];
-              const c = mesh.triangles[t + 2];
-              addEdge(a, b);
-              addEdge(b, c);
-              addEdge(c, a);
-            }
-            ctx.save();
-            ctx.beginPath();
-            ctx.strokeStyle = part.id === selected ? "#49efcc" : "#9faecb";
-            ctx.globalAlpha = part.id === selected ? 0.42 : 0.28;
-            ctx.lineWidth = Math.max(0.5, 0.8 / scale);
-            for (const [u, v, cnt] of edgeCounts.values()) {
-              if (cnt <= 1) continue;
-              ctx.moveTo(posed[u].x, posed[u].y);
-              ctx.lineTo(posed[v].x, posed[v].y);
-            }
-            ctx.stroke();
+    renderScratch.current = renderCharacterFrame({
+      ctx,
+      project: p,
+      evaluated,
+      partTextures,
+      meshes: fallbackMeshes,
+      substituteTextures: subTextures,
+      sourceImage: source,
+      showOriginal: props.original,
+      soloPartId: props.solo ? selected : undefined,
+      previewDeform: preview,
+      wireframe: props.wire,
+      selectedPartId: selected,
+      scale,
+      scratch: renderScratch.current,
+      enableGpu: true,
+    });
 
-            ctx.beginPath();
-            ctx.strokeStyle = part.id === selected ? "#49efcc" : "#8fb0e0";
-            ctx.globalAlpha = part.id === selected ? 0.95 : 0.72;
-            ctx.lineWidth = Math.max(0.85, 1.35 / scale);
-            for (const [u, v, cnt] of edgeCounts.values()) {
-              if (cnt !== 1) continue;
-              ctx.moveTo(posed[u].x, posed[u].y);
-              ctx.lineTo(posed[v].x, posed[v].y);
-            }
-            ctx.stroke();
-            ctx.restore();
-          }
-        });
     if (!preview && !props.original && props.compareDiff && source && p.parts.length)
       drawDiffOverlay(ctx, source, p.width, p.height);
     if (!preview && props.overlay && tint) ctx.drawImage(tint, 0, 0);
@@ -433,7 +346,8 @@ export default function Viewport(props: Props) {
     }
   }, [
     p,
-    textures,
+    partTextures,
+    subTextures,
     source,
     parameters,
     props.original,
@@ -441,6 +355,8 @@ export default function Viewport(props: Props) {
     props.fillOverlay,
     props.compareDiff,
     props.wire,
+    props.overrideShapeIds,
+    props.overrideHandles,
     fallbackMeshes,
     tint,
     fillTint,
@@ -452,7 +368,7 @@ export default function Viewport(props: Props) {
     radius,
     meshes,
     frame,
-    tint,
+    transitionElapsedMs,
     cursor,
     scale,
   ]);
@@ -475,7 +391,7 @@ export default function Viewport(props: Props) {
     <div className="viewport" ref={root}>
       <div className="canvas-space">
         <div
-          className="canvas-frame"
+          className={props.cleanStage ? "canvas-frame clean" : "canvas-frame"}
           style={{ width: p.width * scale, height: p.height * scale }}
         >
           <canvas
@@ -514,10 +430,14 @@ export default function Viewport(props: Props) {
             onPointerCancel={(e) => props.onEnd(point(e))}
             onPointerLeave={() => setCursor(null)}
           />
-          <span className="corner tl" />
-          <span className="corner tr" />
-          <span className="corner bl" />
-          <span className="corner br" />
+          {!props.cleanStage && (
+            <>
+              <span className="corner tl" />
+              <span className="corner tr" />
+              <span className="corner bl" />
+              <span className="corner br" />
+            </>
+          )}
         </div>
       </div>
     </div>

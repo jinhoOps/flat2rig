@@ -736,8 +736,24 @@ async fn save_artifact(
     name: String,
     bytes: Vec<u8>,
 ) -> Result<Option<String>, String> {
-    if bytes.len() > 512 * 1024 * 1024 || name.contains(['/', '\\']) {
+    if bytes.len() > 512 * 1024 * 1024
+        || name.is_empty()
+        || name.contains(['/', '\\'])
+        || name.contains("..")
+    {
         return Err("Invalid artifact".into());
+    }
+    if std::env::var_os("FLAT2RIG_HEADLESS_SMOKE").is_some() {
+        if let Some(dir) = std::env::var_os("FLAT2RIG_HEADLESS_SAVE_DIR") {
+            let file_name = std::path::Path::new(&name)
+                .file_name()
+                .ok_or_else(|| "Invalid artifact".to_string())?;
+            let dir_path = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir_path).map_err(|e| e.to_string())?;
+            let path = dir_path.join(file_name);
+            atomic_write_bytes(&path, &bytes)?;
+            return Ok(Some(path.to_string_lossy().into_owned()));
+        }
     }
     tauri::async_runtime::spawn_blocking(move || {
         let Some(selected) = app

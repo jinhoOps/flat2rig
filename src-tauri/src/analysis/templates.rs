@@ -312,6 +312,45 @@ fn erode_mask(src: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
         .collect()
 }
 
+/// Dilates boolean mask outward up to `radius` pixels (Manhattan/4-connected BFS).
+fn dilate_mask(src: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
+    let n = w * h;
+    if radius == 0 {
+        return src.to_vec();
+    }
+    let mut dist = vec![u16::MAX; n];
+    let mut q = VecDeque::new();
+    for i in 0..n {
+        if src[i] {
+            dist[i] = 0;
+            q.push_back(i);
+        }
+    }
+    while let Some(i) = q.pop_front() {
+        let next_d = dist[i] + 1;
+        if next_d as usize > radius {
+            continue;
+        }
+        let x = i % w;
+        let y = i / w;
+        for nb in [
+            (x > 0).then(|| i - 1),
+            (x + 1 < w).then(|| i + 1),
+            (y > 0).then(|| i - w),
+            (y + 1 < h).then(|| i + w),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if dist[nb] == u16::MAX {
+                dist[nb] = next_d;
+                q.push_back(nb);
+            }
+        }
+    }
+    (0..n).map(|i| dist[i] as usize <= radius).collect()
+}
+
 /// Builds a fast multi-grid harmonic color field from clean interior seed pixels.
 fn build_color_field(
     rgba: &[u8],
@@ -1546,6 +1585,82 @@ fn sample_fg_bounds(ev: &AnalyzedEvidence, frame: HeadFrame, v: f64) -> (f64, f6
     (min_u, max_u)
 }
 
+/// Returns whether `(u, v)` lies strictly inside the fitted iris body below the upper eyelid arch.
+#[allow(clippy::too_many_arguments)]
+fn in_fitted_iris_interior(
+    u: f64,
+    v: f64,
+    cu: f64,
+    cv: f64,
+    rx: f64,
+    ry: f64,
+    iris_fit: &IrisFit,
+    is_left: bool,
+    eye_style: &str,
+    is_sd: bool,
+) -> bool {
+    let u_rel = (u - cu) / (rx * 1.06).max(1.0);
+    let outer_sign = if is_left { 1.0 } else { -1.0 };
+    let wing = match eye_style {
+        "almond_sharp" => -u_rel * outer_sign * ry * 0.16,
+        "droopy_gentle" | "tareme_large" => u_rel * outer_sign * ry * 0.12,
+        _ => 0.0,
+    };
+    let arch_v = cv - ry * (1.0 - u_rel * u_rel * 0.56) * if is_sd { 0.90 } else { 0.84 } + wing;
+    let clamped_rx = iris_fit.rx.min(rx * if is_sd { 0.94 } else { 0.66 });
+    let clamped_ry = iris_fit.ry.min(ry * if is_sd { 1.12 } else { 1.14 });
+    let clamped_cv = iris_fit.center_v.clamp(cv - ry * 0.16, cv + ry * 0.14);
+    let iris_rel = ((u - iris_fit.center_u) / clamped_rx.max(1.0))
+        .hypot((v - clamped_cv) / clamped_ry.max(1.0));
+    iris_rel <= 1.02 && v >= arch_v + 0.5
+}
+
+/// Returns whether `(u, v)` sits directly on a dark upper eyelash arch so bangs never steal lashes.
+#[allow(clippy::too_many_arguments)]
+fn is_dark_upper_lash_band(
+    u: f64,
+    v: f64,
+    px_rgb: [u8; 3],
+    frame: HeadFrame,
+    ev: &AnalyzedEvidence,
+    eye_style: &str,
+) -> bool {
+    if !(is_dark_lineart(px_rgb) || rgb_dist(px_rgb, ev.palette.lash_color) <= 44.0) {
+        return false;
+    }
+    if rgb_dist(px_rgb, ev.palette.hair_base) <= 22.0 {
+        return false;
+    }
+    let _ = frame;
+    let arch_mult = if ev.is_sd { 0.90 } else { 0.84 };
+    for (cu, cv, rx, ry, iris_fit, is_left) in [
+        (ev.eye_r_center.0, ev.eye_r_center.1, ev.eye_r_rx, ev.eye_r_ry, &ev.iris_r, false),
+        (ev.eye_l_center.0, ev.eye_l_center.1, ev.eye_l_rx, ev.eye_l_ry, &ev.iris_l, true),
+    ] {
+        let u_rel = (u - cu) / (rx * 1.06).max(1.0);
+        if u_rel.abs() > 1.16 {
+            continue;
+        }
+        let outer_sign = if is_left { 1.0 } else { -1.0 };
+        let wing = match eye_style {
+            "almond_sharp" => -u_rel * outer_sign * ry * 0.16,
+            "droopy_gentle" | "tareme_large" => u_rel * outer_sign * ry * 0.12,
+            _ => 0.0,
+        };
+        let arch_v = cv - ry * (1.0 - u_rel * u_rel * 0.56) * arch_mult + wing;
+        let lash_drop = if ev.is_sd { (rx * 0.09).clamp(2.0, 12.0) } else { (ry * 0.12).max(1.8) };
+        let clamped_rx = iris_fit.rx.min(rx * if ev.is_sd { 0.94 } else { 0.66 });
+        let clamped_ry = iris_fit.ry.min(ry * if ev.is_sd { 1.12 } else { 1.14 });
+        let clamped_cv = iris_fit.center_v.clamp(cv - ry * 0.16, cv + ry * 0.14);
+        let iris_rel = ((u - iris_fit.center_u) / clamped_rx.max(1.0))
+            .hypot((v - clamped_cv) / clamped_ry.max(1.0));
+        if (v - arch_v).abs() <= lash_drop * 0.78 && iris_rel > 0.72 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Computes the lower bang silhouette boundary `v_bang(u)` according to `hair_front_style`.
 fn bang_tip_v(style: &str, u_norm: f64, frame: HeadFrame) -> f64 {
     let eye_top = frame.crown_v + frame.hh * 0.52;
@@ -1908,6 +2023,15 @@ fn attach_adjacent_outline(
     }
 }
 
+fn is_glasses_skin_or_blush(c: [u8; 3], skin_base: [u8; 3]) -> bool {
+    let skin_rb = skin_base[0] as i32 - skin_base[2] as i32;
+    let c_rb = c[0] as i32 - c[2] as i32;
+    if skin_rb >= 8 && c_rb <= 3 && luma(c) >= 165.0 {
+        return false;
+    }
+    is_warm_blush_or_skin(c, skin_base)
+}
+
 struct WearableExtractionCtx<'a> {
     rgba: &'a [u8],
     w: usize,
@@ -1918,6 +2042,10 @@ struct WearableExtractionCtx<'a> {
     ev_hair_all: &'a [bool],
     ev_eye_r_all: &'a [bool],
     ev_eye_l_all: &'a [bool],
+    ev_iris_r: &'a [bool],
+    ev_iris_l: &'a [bool],
+    ev_upper_r: &'a [bool],
+    ev_upper_l: &'a [bool],
     ev_mouth_all: &'a [bool],
     ev_brow_r: &'a [bool],
     ev_brow_l: &'a [bool],
@@ -1952,7 +2080,12 @@ fn extract_glasses_mask(ctx: &WearableExtractionCtx<'_>, true_hair_rgb: [u8; 3])
     for y in 0..ctx.h {
         for x in 0..ctx.w {
             let i = y * ctx.w + x;
-            if ctx.ev.fg_alpha[i] <= 32 {
+            if ctx.ev.fg_alpha[i] <= 32
+                || ctx.ev_upper_r[i]
+                || ctx.ev_upper_l[i]
+                || ctx.ev_iris_r[i]
+                || ctx.ev_iris_l[i]
+            {
                 continue;
             }
             let c = pix_rgb(ctx.rgba, i);
@@ -1960,7 +2093,7 @@ fn extract_glasses_mask(ctx: &WearableExtractionCtx<'_>, true_hair_rgb: [u8; 3])
 
             // Bridge band: narrow strip between left & right eye inner corners.
             if u.abs() <= eye_dist * 0.22 && (v - eye_mid_v).abs() <= eye_dist * 0.14 {
-                if !is_warm_blush_or_skin(c, skin) {
+                if !is_glasses_skin_or_blush(c, skin) {
                     let is_solid_hair = ctx.ev_hair_all[i] && rgb_dist(c, true_hair_rgb) <= 32.0;
                     if !is_solid_hair {
                         bridge_cnt += 1;
@@ -1972,28 +2105,29 @@ fn extract_glasses_mask(ctx: &WearableExtractionCtx<'_>, true_hair_rgb: [u8; 3])
             } else if u.abs() <= eye_dist * 0.20
                 && v < eye_mid_v - eye_dist * 0.16
                 && v >= eye_mid_v - eye_dist * 0.34
-                && !is_warm_blush_or_skin(c, skin)
+                && !is_glasses_skin_or_blush(c, skin)
                 && rgb_dist(c, true_hair_rgb) <= 38.0
             {
                 upper_gap_hair_cnt += 1;
             }
 
-            // Bilateral lower-orbit rim arcs outside iris & sclera interior (checks `[0.76..=1.42]` for wide SD/LD sockets).
+            // Bilateral lower-orbit rim arcs outside iris & sclera interior (checks `[0.82..=1.42]` for wide SD/LD sockets).
             let iris_r_rn = ((u - ctx.ev.iris_r.center_u) / ctx.ev.iris_r.rx.max(2.0))
                 .hypot((v - ctx.ev.iris_r.center_v) / ctx.ev.iris_r.ry.max(2.0));
             let iris_l_rn = ((u - ctx.ev.iris_l.center_u) / ctx.ev.iris_l.rx.max(2.0))
                 .hypot((v - ctx.ev.iris_l.center_v) / ctx.ev.iris_l.ry.max(2.0));
-            for (is_left, cu, cv, rx, ry, irn) in [
-                (false, er_u, er_v, er_rx, er_ry, iris_r_rn),
-                (true, el_u, el_v, el_rx, el_ry, iris_l_rn),
+            for (is_left, cu, cv, rx, ry, irn, ev_eye) in [
+                (false, er_u, er_v, er_rx, er_ry, iris_r_rn, ctx.ev_eye_r_all[i]),
+                (true, el_u, el_v, el_rx, el_ry, iris_l_rn, ctx.ev_eye_l_all[i]),
             ] {
                 let rn = ((u - cu) / rx).hypot((v - cv) / ry);
-                if (0.76..=1.42).contains(&rn)
-                    && irn >= 0.96
-                    && v >= cv + ry * 0.22
+                if (0.82..=1.42).contains(&rn)
+                    && irn >= 1.00
+                    && !(ev_eye && rn < 0.96)
+                    && v >= cv + ry * 0.32
                     && v <= cv + ry * 1.48
                 {
-                    if is_warm_blush_or_skin(c, skin) || rgb_dist(c, true_hair_rgb) <= 28.0 {
+                    if is_glasses_skin_or_blush(c, skin) || rgb_dist(c, true_hair_rgb) <= 28.0 {
                         continue;
                     }
                     if rim_seed_rgb.len() < 400 && !is_dark_lineart(c) {
@@ -2035,7 +2169,7 @@ fn extract_glasses_mask(ctx: &WearableExtractionCtx<'_>, true_hair_rgb: [u8; 3])
             return 1.08;
         }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        v[v.len() / 2].clamp(0.92, 1.24)
+        v[v.len() / 2].clamp(0.94, 1.24)
     };
     let r_est = median_rn(r_radii);
     let l_est = median_rn(l_radii);
@@ -2053,14 +2187,23 @@ fn extract_glasses_mask(ctx: &WearableExtractionCtx<'_>, true_hair_rgb: [u8; 3])
         [rs[mid], gs[mid], bs[mid]]
     };
 
-    let sclera_luma = luma(ctx.ev.palette.sclera_white);
+    let skin_luma = luma(skin);
+    let skin_rb = skin[0] as i32 - skin[2] as i32;
     let mut cand = vec![false; n];
     let mut seeds = vec![false; n];
+    let mut ring_zone = vec![false; n];
     for y in 0..ctx.h {
         for x in 0..ctx.w {
             let i = y * ctx.w + x;
             let fg_a = ctx.ev.fg_alpha[i];
-            if fg_a <= 32 || ctx.ev_brow_r[i] || ctx.ev_brow_l[i] {
+            if fg_a <= 32
+                || ctx.ev_brow_r[i]
+                || ctx.ev_brow_l[i]
+                || ctx.ev_upper_r[i]
+                || ctx.ev_upper_l[i]
+                || ctx.ev_iris_r[i]
+                || ctx.ev_iris_l[i]
+            {
                 continue;
             }
             let c = pix_rgb(ctx.rgba, i);
@@ -2069,56 +2212,160 @@ fn extract_glasses_mask(ctx: &WearableExtractionCtx<'_>, true_hair_rgb: [u8; 3])
                 .hypot((v - ctx.ev.iris_r.center_v) / ctx.ev.iris_r.ry.max(2.0));
             let iris_l_rn = ((u - ctx.ev.iris_l.center_u) / ctx.ev.iris_l.rx.max(2.0))
                 .hypot((v - ctx.ev.iris_l.center_v) / ctx.ev.iris_l.ry.max(2.0));
-            if iris_r_rn < 0.92 || iris_l_rn < 0.92 {
+            if iris_r_rn < 1.04 || iris_l_rn < 1.04 {
                 continue;
             }
 
-            let is_skin = is_warm_blush_or_skin(c, skin);
-            if is_skin {
+            let r_rn = ((u - er_u) / er_rx).hypot((v - er_v) / er_ry);
+            let l_rn = ((u - el_u) / el_rx).hypot((v - el_v) / el_ry);
+            let on_lower_fit = (((r_rn - r_est).abs() <= 0.085 && v >= er_v + er_ry * 0.28)
+                || ((l_rn - l_est).abs() <= 0.085 && v >= el_v + el_ry * 0.28))
+                && (r_rn.min(l_rn) <= 1.36);
+            let in_lower_band = ((0.94..=1.36).contains(&r_rn) && v >= er_v + er_ry * 0.28)
+                || ((0.94..=1.36).contains(&l_rn) && v >= el_v + el_ry * 0.28);
+            let c_rb = c[0] as i32 - c[2] as i32;
+            let true_hair_luma = luma(true_hair_rgb);
+            let is_hair_color_px = rgb_dist(c, true_hair_rgb) <= 52.0
+                || (chroma_normalized_dist(c, true_hair_rgb) <= 16.0
+                    && luma(c) <= true_hair_luma + 8.0);
+            let is_bright_wire_in_hair = ctx.ev_hair_all[i]
+                && !ctx.ev_face[i]
+                && luma(c) >= (true_hair_luma + 42.0).max(182.0)
+                && rgb_dist(c, true_hair_rgb) > 32.0;
+            let lower_wire_over_blush = in_lower_band
+                && ((luma(c) < skin_luma - 10.0 && c_rb <= 12)
+                    || (luma(c) < skin_luma - 18.0
+                        && c_rb <= skin_rb + 4
+                        && (rgb_dist(c, frame_color) <= 78.0
+                            || is_dark_lineart(c)
+                            || luma(c) < skin_luma * 0.85))
+                    || (on_lower_fit && luma(c) < skin_luma - 10.0 && c_rb <= skin_rb + 14));
+            let upper_in_ring = (v < er_v && ((r_est - 0.16).max(0.90)..=(r_est + 0.48).min(1.68)).contains(&r_rn))
+                || (v < el_v && ((l_est - 0.16).max(0.90)..=(l_est + 0.48).min(1.68)).contains(&l_rn));
+            if is_glasses_skin_or_blush(c, skin)
+                && !lower_wire_over_blush
+                && !(is_bright_wire_in_hair && upper_in_ring)
+            {
                 continue;
             }
-            let in_bridge = u.abs() <= eye_dist * 0.25
-                && (v - eye_mid_v).abs() <= eye_dist * 0.16
-                && rgb_dist(c, true_hair_rgb) > 28.0;
+            let is_cool_silver_rim = (c[2] as i32) >= (c[0] as i32) - 2
+                && luma(c) >= 165.0
+                && !ctx.ev_eye_r_all[i]
+                && !ctx.ev_eye_l_all[i]
+                && !(ctx.ev_hair_all[i] && rgb_dist(c, true_hair_rgb) <= 44.0);
+            let in_bridge = u.abs() <= eye_dist * 0.16
+                && v >= eye_mid_v - eye_dist * 0.18
+                && v <= eye_mid_v + eye_dist * 0.08
+                && (!ctx.ev_hair_all[i]
+                    || is_cool_silver_rim
+                    || is_bright_wire_in_hair
+                    || (rgb_dist(c, true_hair_rgb) > 26.0
+                        && luma(c) >= true_hair_luma + 18.0
+                        && (rgb_dist(c, frame_color) <= 72.0
+                            || chroma_normalized_dist(c, frame_color) <= 18.0)));
+            let on_fitted_rim_arc = ((r_rn - r_est).abs() <= 0.12 && r_rn >= 0.88)
+                || ((l_rn - l_est).abs() <= 0.12 && l_rn >= 0.88)
+                || upper_in_ring
+                || in_bridge;
+            let is_actual_hair_tint = luma(c) >= 115.0
+                && luma(c) <= 192.0
+                && c_rb >= 4
+                && (rgb_dist(c, true_hair_rgb) <= 48.0
+                    || chroma_normalized_dist(c, true_hair_rgb) <= 18.0);
+            let is_upper_wire_over_hair = ctx.ev_hair_all[i]
+                && on_fitted_rim_arc
+                && !ctx.ev_eye_r_all[i]
+                && !ctx.ev_eye_l_all[i]
+                && rgb_dist(c, true_hair_rgb) > 26.0
+                && !is_actual_hair_tint
+                && (is_bright_wire_in_hair
+                    || is_cool_silver_rim
+                    || (luma(c) >= true_hair_luma + 18.0
+                        && (rgb_dist(c, frame_color) <= 72.0
+                            || chroma_normalized_dist(c, frame_color) <= 18.0))
+                    || ((c[2] as i32) >= (c[0] as i32) && luma(c) >= 144.0));
+            let is_side_hair_fill = (ctx.ev_hair_all[i] || is_actual_hair_tint)
+                && !is_cool_silver_rim
+                && !is_upper_wire_over_hair
+                && (rgb_dist(c, true_hair_rgb) <= 56.0
+                    || is_actual_hair_tint
+                    || (chroma_normalized_dist(c, true_hair_rgb) <= 18.0 && luma(c) <= 182.0)
+                    || (ctx.ev_hair_all[i] && luma(frame_color) >= 135.0 && luma(c) < 115.0 && !on_fitted_rim_arc));
+            let matches_rim_stroke = !is_side_hair_fill
+                && !is_actual_hair_tint
+                && (rgb_dist(c, frame_color) <= 68.0
+                    || chroma_normalized_dist(c, frame_color) <= 20.0
+                    || (!ctx.ev_hair_all[i] && luma(c) < skin_luma * 0.78)
+                    || is_dark_lineart(c)
+                    || is_cool_silver_rim
+                    || is_upper_wire_over_hair
+                    || lower_wire_over_blush);
 
-            let matches_rim_stroke = rgb_dist(c, frame_color) <= 72.0
-                || chroma_normalized_dist(c, frame_color) <= 22.0
-                || (!ctx.ev_hair_all[i] && luma(c) < sclera_luma * 0.90)
-                || is_dark_lineart(c);
-
-            let check_rim = |cu: f64, cv: f64, rx: f64, ry: f64, est_r: f64, temple_cond: bool| -> (bool, bool) {
-                let rn = ((u - cu) / rx).hypot((v - cv) / ry);
-                let in_ring = ((est_r - 0.20).max(0.84)..=(est_r + 0.18).min(1.30)).contains(&rn);
-                let in_lower = (0.78..=1.34).contains(&rn) && v >= cv + ry * 0.14;
-                if !in_ring && !in_lower && !temple_cond {
-                    return (false, false);
+            let check_rim = |cu: f64, rn: f64, cv: f64, ry: f64, est_r: f64, temple_cond: bool, ev_eye: bool| -> (bool, bool, bool) {
+                let ring_max = if v < cv {
+                    (est_r + 0.48).min(1.68)
+                } else {
+                    (est_r + 0.24).min(1.38)
+                };
+                let in_ring = ((est_r - 0.16).max(0.90)..=ring_max).contains(&rn);
+                let in_lower = (0.90..=1.36).contains(&rn) && v >= cv + ry * 0.28;
+                let in_zone = in_ring || in_lower || temple_cond;
+                if !in_zone {
+                    return (false, false, false);
+                }
+                // Keep eye sclera & inner lash sockets separate from lens rims.
+                if ev_eye && !is_cool_silver_rim && rn < (est_r + 0.02).max(1.08) {
+                    return (false, false, false);
+                }
+                let on_inner_lash_side = (u - cu) * cu.signum() < 0.0
+                    && !is_cool_silver_rim
+                    && !is_upper_wire_over_hair
+                    && ((luma(c) < 130.0 && v < cv + ry * 0.35 && rn < (est_r - 0.02).max(1.06))
+                        || (ctx.ev_hair_all[i] && is_hair_color_px && rn < est_r - 0.03));
+                if on_inner_lash_side {
+                    return (false, false, false);
+                }
+                if !temple_cond && v < cv + ry * 0.18 && rn < (est_r - 0.10).max(0.94) {
+                    return (false, false, false);
                 }
                 if !matches_rim_stroke {
-                    return (false, false);
+                    return (false, false, true);
                 }
-                // Guard upper-interior bangs (`rn < est_r - 0.12 && v < cv`) so thick bangs don't leak into rim.
-                if !temple_cond && v < cv && rn < est_r - 0.10 && ctx.ev_hair_all[i] && rgb_dist(c, true_hair_rgb) <= 44.0 {
-                    return (false, false);
+                // Guard bangs/hair in upper lens or temple hinge so hair chunks never enter acc_glasses.
+                if (temple_cond || (v < cv + ry * 0.12 && rn < est_r - 0.06)) && is_side_hair_fill {
+                    return (false, false, false);
                 }
-                let is_seed = in_lower && rgb_dist(c, true_hair_rgb) > 28.0;
-                (true, is_seed)
+                let is_seed = (in_lower
+                    || (temple_cond && is_cool_silver_rim && rgb_dist(c, true_hair_rgb) > 48.0))
+                    && rgb_dist(c, true_hair_rgb) > 28.0
+                    && !is_side_hair_fill;
+                (true, is_seed, !temple_cond)
             };
 
-            let r_temple = v >= er_v - er_ry * 0.30
-                && v <= er_v + er_ry * 0.35
-                && u <= er_u - er_rx * 0.85
-                && u >= -ctx.face_rx * 1.18;
-            let l_temple = v >= el_v - el_ry * 0.30
-                && v <= el_v + el_ry * 0.35
-                && u >= el_u + el_rx * 0.85
-                && u <= ctx.face_rx * 1.18;
+            let lug_half_h = (eye_dist * 0.105).clamp(6.0, 24.0);
+            let temple_hair_guard = ((ctx.ev_hair_all[i] && is_hair_color_px)
+                || is_actual_hair_tint)
+                && !is_cool_silver_rim
+                && !is_upper_wire_over_hair;
+            let r_temple = (v - (er_v - er_ry * 0.15)).abs() <= lug_half_h
+                && u <= er_u - er_rx * 0.92
+                && u >= (er_u - er_rx * 1.85).max(-ctx.face_rx * 1.06)
+                && !temple_hair_guard;
+            let l_temple = (v - (el_v - el_ry * 0.15)).abs() <= lug_half_h
+                && u >= el_u + el_rx * 0.92
+                && u <= (el_u + el_rx * 1.50).min(ctx.face_rx * 1.04)
+                && !temple_hair_guard;
 
-            let (r_ok, r_seed) = check_rim(er_u, er_v, er_rx, er_ry, r_est, r_temple);
-            let (l_ok, l_seed) = check_rim(el_u, el_v, el_rx, el_ry, l_est, l_temple);
+            let (r_ok, r_seed, r_zone) = check_rim(er_u, r_rn, er_v, er_ry, r_est, r_temple, ctx.ev_eye_r_all[i]);
+            let (l_ok, l_seed, l_zone) = check_rim(el_u, l_rn, el_v, el_ry, l_est, l_temple, ctx.ev_eye_l_all[i]);
 
-            if in_bridge || r_ok || l_ok {
+            let bridge_ok = in_bridge && matches_rim_stroke && !is_side_hair_fill;
+            if in_bridge || r_zone || l_zone {
+                ring_zone[i] = true;
+            }
+            if bridge_ok || r_ok || l_ok {
                 cand[i] = true;
-                if in_bridge || r_seed || l_seed {
+                if bridge_ok || r_seed || l_seed {
                     seeds[i] = true;
                 }
             }
@@ -2161,6 +2408,67 @@ fn extract_glasses_mask(ctx: &WearableExtractionCtx<'_>, true_hair_rgb: [u8; 3])
                     q.push_back(ni);
                 }
             }
+        }
+    }
+    // Fill narrow (<=6px) silver/white core strips sandwiched between inner & outer dark rim borders.
+    if count >= min_rim_px * 2 {
+        let mut rim_fill = Vec::new();
+        let max_gap = (eye_dist * 0.025).round().clamp(3.0, 7.0) as isize;
+        for y in 0..ctx.h {
+            for x in 0..ctx.w {
+                let i = y * ctx.w + x;
+                if out[i] > 0 || !ring_zone[i] || ctx.ev.fg_alpha[i] <= 32 {
+                    continue;
+                }
+                if ctx.ev_eye_r_all[i] || ctx.ev_eye_l_all[i] || ctx.ev_brow_r[i] || ctx.ev_brow_l[i] {
+                    continue;
+                }
+                let mut bracketed = false;
+                for (dx, dy) in [(1isize, 0isize), (0, 1), (1, 1), (1, -1)] {
+                    let mut hit_pos = false;
+                    let mut hit_neg = false;
+                    for step in 1..=max_gap {
+                        let px = x as isize + dx * step;
+                        let py = y as isize + dy * step;
+                        if px >= 0
+                            && px < ctx.w as isize
+                            && py >= 0
+                            && py < ctx.h as isize
+                            && out[py as usize * ctx.w + px as usize] > 0
+                        {
+                            hit_pos = true;
+                            break;
+                        }
+                    }
+                    if !hit_pos {
+                        continue;
+                    }
+                    for step in 1..=max_gap {
+                        let nx = x as isize - dx * step;
+                        let ny = y as isize - dy * step;
+                        if nx >= 0
+                            && nx < ctx.w as isize
+                            && ny >= 0
+                            && ny < ctx.h as isize
+                            && out[ny as usize * ctx.w + nx as usize] > 0
+                        {
+                            hit_neg = true;
+                            break;
+                        }
+                    }
+                    if hit_pos && hit_neg {
+                        bracketed = true;
+                        break;
+                    }
+                }
+                if bracketed {
+                    rim_fill.push(i);
+                }
+            }
+        }
+        for i in rim_fill {
+            out[i] = ctx.ev.fg_alpha[i];
+            count += 1;
         }
     }
     (count >= min_rim_px * 2).then_some(out)
@@ -2311,9 +2619,62 @@ fn extract_hat_and_head_acc(
         }
     }
 
-    // Absorb smaller detached hat pieces split by ribbons/straps before assigning head ornaments.
-    for (pxs, mean, med_u, med_v, min_v, cw, ch, interior_frac) in leftover {
+    // Absorb smaller detached hat pieces split by ribbons/straps and crown-level hat bows before assigning head ornaments,
+    // while keeping detached bright hairpins on bangs (`∞`, `X`) separate from `hat`.
+    let mut crown_deferred = leftover;
+    if has_hat {
+        for _pass in 0..2 {
+            let hat_near = dilate_mask(&hat_bool, ctx.w, ctx.h, 8);
+            let mut next_deferred = Vec::with_capacity(crown_deferred.len());
+            let mut absorbed_any = false;
+            for item in crown_deferred {
+                let (ref pxs, mean, _, med_v, min_v, _, _, interior_frac) = item;
+                let near_hat = pxs.iter().any(|&pi| hat_near[pi]);
+                let min_hair_rgb = hair_palette
+                    .iter()
+                    .map(|&hc| rgb_dist(mean, hc))
+                    .fold(f64::INFINITY, f64::min);
+                let min_hair_chr = hair_palette
+                    .iter()
+                    .map(|&hc| chroma_normalized_dist(mean, hc))
+                    .fold(f64::INFINITY, f64::min);
+                let matches_hair_body = min_hair_rgb < 72.0 && min_hair_chr < 22.0;
+                if near_hat
+                    && interior_frac >= 0.30
+                    && min_v <= ctx.frame.crown_v + hh * 0.14
+                    && med_v <= ctx.frame.crown_v + hh * 0.24
+                    && !matches_hair_body
+                {
+                    for &pi in pxs {
+                        hat_bool[pi] = true;
+                    }
+                    absorbed_any = true;
+                } else {
+                    next_deferred.push(item);
+                }
+            }
+            crown_deferred = next_deferred;
+            if !absorbed_any {
+                break;
+            }
+        }
+    }
+    for (pxs, mean, med_u, med_v, min_v, cw, ch, interior_frac) in crown_deferred {
+        let touches_hat = has_hat
+            && pxs.iter().any(|&pi| {
+                let x = pi % ctx.w;
+                let y = pi / ctx.w;
+                (x > 0 && hat_bool[pi - 1])
+                    || (x + 1 < ctx.w && hat_bool[pi + 1])
+                    || (y > 0 && hat_bool[pi - ctx.w])
+                    || (y + 1 < ctx.h && hat_bool[pi + ctx.w])
+            });
+        let is_split_hat_crown = touches_hat
+            || (min_v <= ctx.frame.crown_v + hh * 0.02
+                && pxs.len() >= hat_min_area / 3
+                && cw >= eye_dist * 0.22);
         if has_hat
+            && is_split_hat_crown
             && min_v <= eye_min_v
             && med_v <= eye_max_v + hh * 0.06
             && (rgb_dist(mean, hat_primary) <= 72.0
@@ -2328,15 +2689,6 @@ fn extract_hat_and_head_acc(
         if med_v > ctx.frame.chin_v + hh * 0.06 || interior_frac < 0.32 {
             continue;
         }
-        let touches_hat = has_hat
-            && pxs.iter().any(|&pi| {
-                let x = pi % ctx.w;
-                let y = pi / ctx.w;
-                (x > 0 && hat_bool[pi - 1])
-                    || (x + 1 < ctx.w && hat_bool[pi + 1])
-                    || (y > 0 && hat_bool[pi - ctx.w])
-                    || (y + 1 < ctx.h && hat_bool[pi + ctx.w])
-            });
 
         if !touches_hat && (med_v > eye_max_v + hh * 0.02 || med_u.abs() > ctx.face_rx * 1.28) {
             continue;
@@ -2460,9 +2812,54 @@ fn extract_hat_and_head_acc(
                 }
             }
         }
-        for i in 0..n {
-            if enclosed_free[i] && !reachable[i] {
-                hat_bool[i] = true;
+        let max_enclosed_area = ((eye_dist * 0.14).powi(2) as usize).max(220);
+        let max_enclosed_v = eye_min_v - ctx.ev.eye_r_ry * 0.85;
+        let mut enc_seen = vec![false; n];
+        for start in 0..n {
+            if !enclosed_free[start] || reachable[start] || enc_seen[start] {
+                continue;
+            }
+            enc_seen[start] = true;
+            let mut stack = vec![start];
+            let mut comp = Vec::new();
+            let mut comp_max_v = f64::NEG_INFINITY;
+            let mut adj_hat = 0usize;
+            let mut adj_other = 0usize;
+            while let Some(cur) = stack.pop() {
+                comp.push(cur);
+                let cx = cur % ctx.w;
+                let cy = cur / ctx.w;
+                let (_, pv) = ctx.frame.to_local(DVec2::new(cx as f64, cy as f64));
+                comp_max_v = comp_max_v.max(pv);
+                for nb in [
+                    (cx > 0).then(|| cur - 1),
+                    (cx + 1 < ctx.w).then(|| cur + 1),
+                    (cy > 0).then(|| cur - ctx.w),
+                    (cy + 1 < ctx.h).then(|| cur + ctx.w),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if enclosed_free[nb] && !reachable[nb] {
+                        if !enc_seen[nb] {
+                            enc_seen[nb] = true;
+                            stack.push(nb);
+                        }
+                    } else if hat_bool[nb] || ribbon_bool[nb] {
+                        adj_hat += 1;
+                    } else {
+                        adj_other += 1;
+                    }
+                }
+            }
+            if comp.len() <= max_enclosed_area
+                && comp_max_v <= max_enclosed_v
+                && adj_hat > 0
+                && adj_other == 0
+            {
+                for pi in comp {
+                    hat_bool[pi] = true;
+                }
             }
         }
 
@@ -2507,8 +2904,8 @@ fn extract_hat_and_head_acc(
             &blk,
             ctx.w,
             ctx.h,
-            1,
-            118.0,
+            2,
+            140.0,
         );
     }
 
@@ -2865,9 +3262,10 @@ fn extract_outfit_sublayers(
         if k == primary_k || final_counts[k] < min_cluster_px {
             continue;
         }
-        // Reject scattered 1-3px fold/crease shading bands that lack cohesive garment components.
+        // Reject scattered 1-3px fold/crease shading bands that lack cohesive garment components,
+        // and keep small isolated surface emblems (e.g. chest flowers/badges) attached to `clothes`.
         let mut interior_cnt = 0usize;
-        let mut cc_sizes: Vec<usize> = Vec::new();
+        let mut comps: Vec<Vec<usize>> = Vec::new();
         for (i, &ca) in clothes_vis.iter().enumerate() {
             if ca == 0 || labels[i] as usize != k {
                 continue;
@@ -2888,9 +3286,9 @@ fn extract_outfit_sublayers(
             if !cc_seen[i] {
                 cc_seen[i] = true;
                 let mut stack = vec![i];
-                let mut sz = 0usize;
+                let mut comp_px = Vec::new();
                 while let Some(cur) = stack.pop() {
-                    sz += 1;
+                    comp_px.push(cur);
                     let cx_i = cur % ctx.w;
                     let cy_i = cur / ctx.w;
                     for nb in [
@@ -2908,13 +3306,24 @@ fn extract_outfit_sublayers(
                         }
                     }
                 }
-                cc_sizes.push(sz);
+                comps.push(comp_px);
             }
         }
+        let mut cc_sizes: Vec<usize> = comps.iter().map(|c| c.len()).collect();
         cc_sizes.sort_by_key(|a| std::cmp::Reverse(*a));
         let top2_cc: usize = cc_sizes.iter().take(2).sum();
         if interior_cnt * 100 < final_counts[k] * 56 || top2_cc * 100 < final_counts[k] * 72 {
             continue;
+        }
+        let max_cc = cc_sizes.first().copied().unwrap_or(0);
+        let min_sub_cc = (max_cc * 12 / 100).max(min_cluster_px / 3);
+        let mut keep_in_sub = vec![false; n];
+        for comp in comps {
+            if comp.len() >= min_sub_cc {
+                for px in comp {
+                    keep_in_sub[px] = true;
+                }
+            }
         }
         let frac = final_counts[k] as f64 / total_cl.max(1) as f64;
         let med_u = u_sum[k] / final_counts[k] as f64;
@@ -2946,7 +3355,7 @@ fn extract_outfit_sublayers(
         taken_names.push(final_name.clone());
         let mask_entry = extra_masks.entry(final_name).or_insert_with(|| vec![0u8; n]);
         for (i, ca) in clothes_vis.iter_mut().enumerate() {
-            if *ca > 0 && labels[i] as usize == k {
+            if *ca > 0 && labels[i] as usize == k && keep_in_sub[i] {
                 mask_entry[i] = *ca;
                 *ca = 0;
             }
@@ -3069,7 +3478,11 @@ pub fn synthesize_template_bank(
     }
 
     // 2. Build clean harmonic color fields from inward-eroded seeds so hidden layers have zero smear.
-    let mut pure_face_seeds = erode_mask(&ev_face, w, h, 3);
+    let face_erosion_r = (eye_dist * 0.024).round().clamp(3.0, 8.0) as usize;
+    let mut pure_face_seeds = erode_mask(&ev_face, w, h, face_erosion_r);
+    if pure_face_seeds.iter().filter(|&&v| v).count() < 16 {
+        pure_face_seeds = erode_mask(&ev_face, w, h, 2);
+    }
     let skin_base_luma = luma(ev.palette.skin_base);
     for i in 0..n {
         if ev_hair_all[i]
@@ -3084,27 +3497,14 @@ pub fn synthesize_template_bank(
         }
         let k = i * 4;
         let rgb = [rgba[k], rgba[k + 1], rgba[k + 2]];
-        if luma(rgb) < skin_base_luma * 0.70 {
+        if luma(rgb) < skin_base_luma * 0.78
+            || (!is_warm_blush_or_skin(rgb, ev.palette.skin_base)
+                && rgb_dist(rgb, ev.palette.skin_base) > 54.0)
+        {
             pure_face_seeds[i] = false;
         }
     }
     let skin_field = build_color_field(rgba, &pure_face_seeds, w, h, ev.palette.skin_base);
-
-    let hair_seed_src: Vec<bool> = (0..n)
-        .map(|i| {
-            if !ev_hair_all[i] || ev_clothes[i] || ev_face[i] {
-                return false;
-            }
-            let k = i * 4;
-            let rgb = [rgba[k], rgba[k + 1], rgba[k + 2]];
-            luma(rgb) >= 44.0
-        })
-        .collect();
-    let mut hair_eroded = erode_mask(&hair_seed_src, w, h, 2);
-    if hair_eroded.iter().filter(|&&v| v).count() < 16 {
-        hair_eroded = erode_mask(&ev_hair_all, w, h, 2);
-    }
-    let hair_field = build_color_field(rgba, &hair_eroded, w, h, ev.palette.hair_base);
 
     // 3. Evaluate template SDF masks (`tpl_masks[layer]`, 0..=255) across all 21 layers in Z-order.
     let num_layers = TEMPLATE_LAYER_ORDER.len();
@@ -3115,11 +3515,12 @@ pub fn synthesize_template_bank(
         eye_dist * 0.96,
         eye_dist * if ev.is_sd { 1.44 } else { 1.24 },
     );
+    let dynamic_side_reach = (ev.metrics.side_hair_reach + 0.24).min(0.88);
     let side_max_v = match side_style {
-        "chest_locks" => frame.chin_v + hh * 0.72,
-        "chin_bob" => frame.chin_v + hh * 0.28,
-        "short_tuck" => frame.chin_v + hh * 0.08,
-        "twin_frame" => frame.chin_v + hh * 0.85,
+        "chest_locks" => frame.chin_v + hh * dynamic_side_reach.max(0.76),
+        "chin_bob" => frame.chin_v + hh * dynamic_side_reach.max(0.58),
+        "short_tuck" => frame.chin_v + hh * dynamic_side_reach.max(0.28),
+        "twin_frame" => frame.chin_v + hh * 0.88,
         _ => frame.chin_v - hh * 0.02,
     };
     let back_max_v = match back_style {
@@ -3239,10 +3640,19 @@ pub fn synthesize_template_bank(
                 let nd = ((u - ev.torso_cx_u * 0.35).abs() - (neck_rx + flare))
                     .max(neck_top - v)
                     .max(v - neck_bot);
+                let neck_c = pix_rgb(rgba, i);
+                let is_cool_collar = (neck_c[2] as i32) > (neck_c[0] as i32) + 4
+                    && luma(neck_c) < luma(ev.palette.skin_base) * 0.78;
+                let is_neck_skin = !is_cool_collar
+                    && (is_warm_blush_or_skin(neck_c, ev.palette.skin_base)
+                        || rgb_dist(neck_c, ev.palette.skin_shadow) <= 46.0
+                        || (luma(neck_c) < luma(ev.palette.skin_base) * 0.65
+                            && (neck_c[0] as i32 - neck_c[2] as i32) >= -2));
                 let accept_ev_neck = ev_neck[i]
                     && !ev.is_sd
                     && !ev_clothes[i]
-                    && u.abs() <= neck_rx + eye_dist * 0.14
+                    && is_neck_skin
+                    && u.abs() <= neck_rx + eye_dist * 0.08
                     && v <= neck_bot;
                 if nd <= 1.2 || accept_ev_neck {
                     let ta = sdf_to_alpha(nd).min(fg_a);
@@ -3275,10 +3685,17 @@ pub fn synthesize_template_bank(
             } else if fd <= 1.5 && (fg_a > 16 || in_socket_interior) {
                 let cap = if fg_a > 16 { fg_a } else { 255 };
                 tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(sdf_to_alpha(fd).min(cap));
+            } else if fd <= 14.0
+                && fg_a > 0
+                && in_socket_interior
+                && !ev_clothes[i]
+                && !ev_hair_back[i]
+            {
+                tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(fg_a);
             }
 
             // --- Layers 5..12: Eyes (R: 5..8, L: 9..12) ---
-            let iris_max_rx_mult = if ev.is_sd { 0.82 } else { 0.56 };
+            let iris_max_rx_mult = if ev.is_sd { 0.94 } else { 0.66 };
             let px_luma = luma(pix_rgb(rgba, i));
             for (side_idx, (cu, cv, rx, ry, iris_fit, is_left, ev_iris_s, ev_up_s, ev_lo_s, ev_all_s)) in [
                 (
@@ -3303,7 +3720,7 @@ pub fn synthesize_template_bank(
                     tpl_masks[side_idx][i] = tpl_masks[side_idx][i].max(ta);
                 }
                 // Full round behind-lid iris (`iris`) tucked beneath upper eyelid crescent
-                let clamped_ry = iris_fit.ry.min(ry * if ev.is_sd { 1.08 } else { 1.12 });
+                let clamped_ry = iris_fit.ry.min(ry * if ev.is_sd { 1.12 } else { 1.14 });
                 let clamped_rx = iris_fit.rx.min(rx * iris_max_rx_mult);
                 let clamped_cv = iris_fit.center_v.clamp(cv - ry * 0.16, cv + ry * 0.14);
                 let id_dist = (((u - iris_fit.center_u) / clamped_rx.max(1.0))
@@ -3345,7 +3762,7 @@ pub fn synthesize_template_bank(
                     "droopy_gentle" | "tareme_large" => u_rel * outer_sign * ry * 0.12,
                     _ => 0.0,
                 };
-                let arch_mult = if ev.is_sd { 0.86 } else { 0.80 };
+                let arch_mult = if ev.is_sd { 0.90 } else { 0.84 };
                 let arch_v = cv - ry * (1.0 - u_rel * u_rel * 0.56) * arch_mult + wing;
                 let lash_drop = if ev.is_sd { (rx * 0.09).clamp(2.0, 12.0) } else { (ry * 0.12).max(1.8) };
                 let px_rgb = pix_rgb(rgba, i);
@@ -3353,10 +3770,26 @@ pub fn synthesize_template_bank(
                     .max(px_rgb[1])
                     .max(px_rgb[2])
                     .saturating_sub(px_rgb[0].min(px_rgb[1]).min(px_rgb[2]));
+                let is_dark_lash_px = is_dark_lineart(px_rgb)
+                    || rgb_dist(px_rgb, ev.palette.lash_color) <= 44.0;
+                let iris_rel = ((u - iris_fit.center_u) / clamped_rx.max(1.0))
+                    .hypot((v - clamped_cv) / clamped_ry.max(1.0));
+                let in_fitted_iris_body = iris_rel <= 1.02
+                    && v >= arch_v + 0.5
+                    && !(is_dark_lineart(px_rgb) && v < arch_v + lash_drop * 0.65);
+                let in_iris_opening = !explicit_eye_override
+                    && ((ev_iris_s[i]
+                        && iris_rel <= 1.02
+                        && v >= cv - ry * 0.85
+                        && !(is_dark_lineart(px_rgb) && v < arch_v - 1.0))
+                        || in_fitted_iris_body);
                 let is_open_eye_core_color = v >= arch_v - 1.5
-                    && ((px_chroma >= 24 && px_luma >= 95.0) || px_luma >= sclera_luma_thresh);
+                    && ((px_chroma >= 24 && px_luma >= 95.0)
+                        || px_luma >= sclera_luma_thresh
+                        || (in_iris_opening && !is_dark_lineart(px_rgb)));
                 let is_exposed_eye_core = !explicit_eye_override
-                    && ((ev_iris_s[i] && (!ev_up_s[i] || is_open_eye_core_color))
+                    && (in_fitted_iris_body
+                        || (ev_iris_s[i] && (!ev_up_s[i] || is_open_eye_core_color || in_iris_opening))
                         || (ev_all_s[i] && (!ev_up_s[i] && px_luma >= sclera_luma_thresh || is_open_eye_core_color)));
                 if u_rel.abs() <= 1.08 && !is_exposed_eye_core {
                     let top_cover = (cv - eye_dist * 0.28).min(
@@ -3364,6 +3797,8 @@ pub fn synthesize_template_bank(
                     );
                     let bot_lash = if explicit_eye_override {
                         arch_v + lash_drop * (0.45 + 0.55 * corner_taper)
+                    } else if is_dark_lash_px {
+                        arch_v + lash_drop * 0.65 * corner_taper
                     } else {
                         arch_v + 1.4 * corner_taper
                     };
@@ -3375,11 +3810,30 @@ pub fn synthesize_template_bank(
                         tpl_masks[side_idx + 3][i] = tpl_masks[side_idx + 3][i].max(sdf_to_alpha(ud));
                     }
                 }
-                if ev_up_s[i]
+                let outer_u_signed = u_rel * outer_sign;
+                let is_outer_lash_tip = !explicit_eye_override
+                    && (0.85..=1.42).contains(&outer_u_signed)
+                    && (v - arch_v).abs() <= ry * 0.28
+                    && !ev_hair_all[i]
+                    && !ev_iris_s[i]
+                    && is_dark_lash_px;
+                let in_lash_arch_px = !explicit_eye_override
+                    && !is_exposed_eye_core
+                    && !ev_iris_s[i]
+                    && !ev_brow_r[i]
+                    && !ev_brow_l[i]
+                    && u_rel.abs() <= 1.16
+                    && (v - arch_v).abs() <= lash_drop * 0.78
+                    && is_dark_lash_px
+                    && (rgb_dist(px_rgb, ev.palette.hair_base) > 22.0 || !ev_hair_front[i]);
+                if (ev_up_s[i]
                     && !ev_hair_all[i]
                     && !is_open_eye_core_color
-                    && u_rel.abs() <= 1.12
-                    && (v - arch_v).abs() <= ry * 0.65
+                    && !in_iris_opening
+                    && u_rel.abs() <= 1.28
+                    && (v - arch_v).abs() <= ry * 0.65)
+                    || is_outer_lash_tip
+                    || in_lash_arch_px
                 {
                     tpl_masks[side_idx + 3][i] = tpl_masks[side_idx + 3][i].max(fg_a);
                 }
@@ -3470,8 +3924,18 @@ pub fn synthesize_template_bank(
             } else {
                 has_front_ev && in_front_zone
             };
-            let near_upper_lash = (ev_upper_r[i] || ev_upper_l[i]) && !ev_hair_front[i];
-            if !near_upper_lash
+            let in_eye_iris_core = in_fitted_iris_interior(u, v, er_u, er_v, er_rx, er_ry, &ev.iris_r, false, eye_style, ev.is_sd)
+                || in_fitted_iris_interior(u, v, el_u, el_v, el_rx, el_ry, &ev.iris_l, true, eye_style, ev.is_sd);
+            let in_upper_lash_band = !explicit_front_override
+                && is_dark_upper_lash_band(u, v, pix_rgb(rgba, i), frame, &ev, eye_style);
+            let in_eye_feature = ev_upper_r[i]
+                || ev_upper_l[i]
+                || ev_iris_r[i]
+                || ev_iris_l[i]
+                || ((ev_eye_r_all[i] || ev_eye_l_all[i]) && !ev_hair_front[i])
+                || (!explicit_front_override && in_eye_iris_core)
+                || in_upper_lash_band;
+            if !in_eye_feature
                 && (is_template_front
                     || ((ev_hair_front[i] || is_head_accessory)
                         && u.abs() <= front_half_w
@@ -3483,25 +3947,34 @@ pub fn synthesize_template_bank(
             }
 
             // Organic temple-anchored side hair locks strictly from actual foreground hair,
-            // with hidden `fillMask` extending upward behind `hair_front` cheek bangs so head/hair sway stays seamless.
+            // with hidden `fillMask` smoothly feathered upward behind `hair_front` cheek bangs so head/hair sway stays seamless.
             let side_overlap_top = er_v.min(el_v) - hh * 0.18;
+            let side_feather = (hh * 0.08).max(8.0);
             if ev_hair_all[i]
                 && !ev_clothes[i]
                 && !ev_face[i]
-                && v >= side_overlap_top
+                && v >= side_overlap_top - side_feather
                 && v <= side_max_v
                 && side_style != "minimal"
             {
                 let overlap_t = smoothstep(side_overlap_top, er_v.min(el_v) + hh * 0.14, v);
+                let top_fade = smoothstep(
+                    side_overlap_top - side_feather,
+                    side_overlap_top + side_feather * 0.5,
+                    v,
+                );
+                let side_a = ((fg_a as f64) * top_fade).round().clamp(0.0, 255.0) as u8;
                 let inner_u = face_rx
                     * (0.42 + 0.06 * overlap_t + 0.14 * (1.0 - smoothstep(er_v.min(el_v), frame.chin_v, v)));
-                for (side_slot, sign) in [(L_HAIR_SIDE_R, -1.0f64), (L_HAIR_SIDE_L, 1.0f64)] {
-                    if u * sign <= 0.0 {
-                        continue;
-                    }
-                    let au = u.abs();
-                    if au >= inner_u && au <= face_rx * 1.55 {
-                        tpl_masks[side_slot][i] = tpl_masks[side_slot][i].max(fg_a);
+                if side_a > 0 {
+                    for (side_slot, sign) in [(L_HAIR_SIDE_R, -1.0f64), (L_HAIR_SIDE_L, 1.0f64)] {
+                        if u * sign <= 0.0 {
+                            continue;
+                        }
+                        let au = u.abs();
+                        if au >= inner_u && au <= face_rx * 1.55 {
+                            tpl_masks[side_slot][i] = tpl_masks[side_slot][i].max(side_a);
+                        }
                     }
                 }
             }
@@ -3519,10 +3992,18 @@ pub fn synthesize_template_bank(
                 if fg_a == 0 || owner_assigned[i] {
                     continue;
                 }
-                if layer_idx == L_NECK && ev.is_sd {
-                    let (u, _) = frame.to_local(DVec2::new(x as f64, y as f64));
-                    if u.abs() > eye_dist * 0.36 {
+                if layer_idx == L_NECK {
+                    let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                    if ev.is_sd && u.abs() > eye_dist * 0.36 {
                         continue;
+                    }
+                    if !explicit_face_override {
+                        let nc = pix_rgb(rgba, i);
+                        let is_cool_collar = (nc[2] as i32) > (nc[0] as i32) + 4
+                            && luma(nc) < luma(ev.palette.skin_base) * 0.78;
+                        if is_cool_collar && v >= frame.chin_v {
+                            continue;
+                        }
                     }
                 }
                 if !explicit_face_override && layer_idx == L_FACE {
@@ -3544,24 +4025,25 @@ pub fn synthesize_template_bank(
                         .max(px_rgb[2])
                         .saturating_sub(px_rgb[0].min(px_rgb[1]).min(px_rgb[2]));
                     let is_open_color = (px_chroma >= 24 && px_luma >= 95.0) || px_luma >= sclera_luma_thresh;
-                    if layer_idx == L_EYE_R_BASE + 3 || layer_idx == L_EYE_R_BASE + 2 {
-                        let (_, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-                        let in_socket_opening = v >= er_v - er_ry * 0.55;
-                        let is_open_r = (ev_iris_r[i] || (ev_eye_r_all[i] && is_open_color))
-                            && (!ev_upper_r[i] || (in_socket_opening && is_open_color))
-                            && !(ev_lower_r[i] && !ev_iris_r[i]);
-                        if is_open_r {
-                            continue;
-                        }
-                    } else if layer_idx == L_EYE_L_BASE + 3 || layer_idx == L_EYE_L_BASE + 2 {
-                        let (_, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-                        let in_socket_opening = v >= el_v - el_ry * 0.55;
-                        let is_open_l = (ev_iris_l[i] || (ev_eye_l_all[i] && is_open_color))
-                            && (!ev_upper_l[i] || (in_socket_opening && is_open_color))
-                            && !(ev_lower_l[i] && !ev_iris_l[i]);
-                        if is_open_l {
-                            continue;
-                        }
+                    let is_open_side = |cu: f64, cv: f64, rx: f64, ry: f64, iris_fit: &IrisFit, is_left: bool, ev_iris: bool, ev_all: bool, ev_up: bool, ev_lo: bool| -> bool {
+                        let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        let in_socket_opening = v >= cv - ry * 0.78;
+                        let in_iris_core = ev_iris
+                            && in_socket_opening
+                            && !(is_dark_lineart(px_rgb) && v < cv - ry * 0.58);
+                        let in_fitted_iris_core = in_fitted_iris_interior(u, v, cu, cv, rx, ry, iris_fit, is_left, eye_style, ev.is_sd)
+                            && !(is_dark_lineart(px_rgb) && v < cv - ry * 0.45);
+                        in_fitted_iris_core
+                            || ((ev_iris || (ev_all && is_open_color))
+                                && (!ev_up || in_iris_core || (in_socket_opening && is_open_color))
+                                && !(ev_lo && !ev_iris))
+                    };
+                    if ((layer_idx == L_EYE_R_BASE + 3 || layer_idx == L_EYE_R_BASE + 2)
+                        && is_open_side(er_u, er_v, er_rx, er_ry, &ev.iris_r, false, ev_iris_r[i], ev_eye_r_all[i], ev_upper_r[i], ev_lower_r[i]))
+                        || ((layer_idx == L_EYE_L_BASE + 3 || layer_idx == L_EYE_L_BASE + 2)
+                            && is_open_side(el_u, el_v, el_rx, el_ry, &ev.iris_l, true, ev_iris_l[i], ev_eye_l_all[i], ev_upper_l[i], ev_lower_l[i]))
+                    {
+                        continue;
                     }
                 }
                 if !explicit_mouth_override
@@ -3599,13 +4081,35 @@ pub fn synthesize_template_bank(
                 continue;
             }
             let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-            let target = if ev_clothes[i] && v >= frame.chin_v - hh * 0.08 {
+            let neck_bound_u = eye_dist * if ev.is_sd { 0.36 } else { 0.40 };
+            let px_c = pix_rgb(rgba, i);
+            let is_cool_collar = (px_c[2] as i32) > (px_c[0] as i32) + 4
+                && luma(px_c) < luma(ev.palette.skin_base) * 0.78;
+            let in_eye_iris_or_lash = in_fitted_iris_interior(u, v, er_u, er_v, er_rx, er_ry, &ev.iris_r, false, eye_style, ev.is_sd)
+                || in_fitted_iris_interior(u, v, el_u, el_v, el_rx, el_ry, &ev.iris_l, true, eye_style, ev.is_sd)
+                || is_dark_upper_lash_band(u, v, px_c, frame, &ev, eye_style);
+            let target = if (ev_clothes[i] && v >= frame.chin_v - hh * 0.08)
+                || (!ev_hair_all[i]
+                    && is_cool_collar
+                    && v >= frame.chin_v + hh * 0.04
+                    && !is_warm_blush_or_skin(px_c, ev.palette.skin_base))
+            {
                 L_CLOTHES
             } else if ev_body[i] {
                 L_BODY
-            } else if ev_neck[i] && !ev_clothes[i] && v <= frame.chin_v + hh * 0.48 && (!ev.is_sd || u.abs() <= eye_dist * 0.36) {
+            } else if ev_neck[i]
+                && !ev_clothes[i]
+                && !is_cool_collar
+                && v <= frame.chin_v + hh * 0.48
+                && u.abs() <= neck_bound_u
+                && (is_warm_blush_or_skin(px_c, ev.palette.skin_base)
+                    || rgb_dist(px_c, ev.palette.skin_shadow) <= 46.0
+                    || (luma(px_c) < luma(ev.palette.skin_base) * 0.65
+                        && (px_c[0] as i32 - px_c[2] as i32) >= -2))
+            {
                 L_NECK
-            } else if (ev_hair_front[i] || (ev_hair_all[i] && v <= er_v.max(el_v) + hh * 0.14 && !ev_hair_back[i]))
+            } else if !in_eye_iris_or_lash
+                && (ev_hair_front[i] || (ev_hair_all[i] && v <= er_v.max(el_v) + hh * 0.14 && !ev_hair_back[i]))
                 && !(ev_upper_r[i] || ev_upper_l[i])
             {
                 L_HAIR_FRONT
@@ -3662,6 +4166,126 @@ pub fn synthesize_template_bank(
             hair_palette.push(hc);
         }
     }
+    if !explicit_front_override && !explicit_face_override {
+        let mut q = VecDeque::new();
+        let mut visited = vec![false; n];
+        for i in 0..n {
+            if visible_masks[L_HAIR_FRONT][i] > 0 || (ev_hair_front[i] && ev.fg_alpha[i] > 32) {
+                visited[i] = true;
+                q.push_back(i);
+            }
+        }
+        let max_bang_v = er_v.min(el_v) + hh * 0.06;
+        let skin_luma = luma(ev.palette.skin_base);
+        let is_bang_pixel = |ni: usize| -> bool {
+            if ev_eye_r_all[ni] || ev_eye_l_all[ni] {
+                return false;
+            }
+            let (u, v) = frame.to_local(DVec2::new((ni % w) as f64, (ni / w) as f64));
+            if v > max_bang_v {
+                return false;
+            }
+            let in_eye_r = ((u - er_u) / (er_rx * 1.15).max(1.0))
+                .hypot((v - er_v) / (er_ry * 1.15).max(1.0))
+                < 1.0;
+            let in_eye_l = ((u - el_u) / (el_rx * 1.15).max(1.0))
+                .hypot((v - el_v) / (el_ry * 1.15).max(1.0))
+                < 1.0;
+            if in_eye_r || in_eye_l {
+                return false;
+            }
+            let c = pix_rgb(rgba, ni);
+            !is_warm_blush_or_skin(c, ev.palette.skin_base)
+                && (hair_palette.iter().any(|&hc| rgb_dist(c, hc) <= 56.0)
+                    || is_dark_lineart(c)
+                    || luma(c) < skin_luma * 0.68)
+        };
+        while let Some(cur) = q.pop_front() {
+            let x = cur % w;
+            let y = cur / w;
+            for dy in -1isize..=1 {
+                let ny = y as isize + dy;
+                if ny < 0 || ny >= h as isize {
+                    continue;
+                }
+                for dx in -1isize..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = x as isize + dx;
+                    if nx < 0 || nx >= w as isize {
+                        continue;
+                    }
+                    let ni = ny as usize * w + nx as usize;
+                    if visited[ni] || visible_masks[L_FACE][ni] == 0 {
+                        continue;
+                    }
+                    if is_bang_pixel(ni) {
+                        visited[ni] = true;
+                        q.push_back(ni);
+                        visible_masks[L_HAIR_FRONT][ni] = visible_masks[L_FACE][ni];
+                        tpl_masks[L_HAIR_FRONT][ni] =
+                            tpl_masks[L_HAIR_FRONT][ni].max(visible_masks[L_FACE][ni]);
+                        visible_masks[L_FACE][ni] = 0;
+                    }
+                }
+            }
+        }
+        // Also promote any cohesive non-skin forehead bang island left inside `L_FACE`
+        // above the eye sockets even when separated from main bangs by a highlight or brow gap.
+        let forehead_cutoff_v = er_v.min(el_v) - hh * 0.02;
+        let mut comp_visited = vec![false; n];
+        for start in 0..n {
+            if comp_visited[start] || visible_masks[L_FACE][start] == 0 || !is_bang_pixel(start) {
+                continue;
+            }
+            let (_, sv) = frame.to_local(DVec2::new((start % w) as f64, (start / w) as f64));
+            if sv > forehead_cutoff_v {
+                continue;
+            }
+            comp_visited[start] = true;
+            let mut stack = vec![start];
+            let mut comp = Vec::new();
+            while let Some(cur) = stack.pop() {
+                comp.push(cur);
+                let x = cur % w;
+                let y = cur / w;
+                for dy in -1isize..=1 {
+                    let ny = y as isize + dy;
+                    if ny < 0 || ny >= h as isize {
+                        continue;
+                    }
+                    for dx in -1isize..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = x as isize + dx;
+                        if nx < 0 || nx >= w as isize {
+                            continue;
+                        }
+                        let ni = ny as usize * w + nx as usize;
+                        if comp_visited[ni] || visible_masks[L_FACE][ni] == 0 {
+                            continue;
+                        }
+                        let (_, nv) = frame.to_local(DVec2::new(nx as f64, ny as f64));
+                        if nv <= forehead_cutoff_v && is_bang_pixel(ni) {
+                            comp_visited[ni] = true;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            if comp.len() >= 24 {
+                for ni in comp {
+                    visible_masks[L_HAIR_FRONT][ni] = visible_masks[L_FACE][ni];
+                    tpl_masks[L_HAIR_FRONT][ni] =
+                        tpl_masks[L_HAIR_FRONT][ni].max(visible_masks[L_FACE][ni]);
+                    visible_masks[L_FACE][ni] = 0;
+                }
+            }
+        }
+    }
+
     let wearable_ctx = WearableExtractionCtx {
         rgba,
         w,
@@ -3672,6 +4296,10 @@ pub fn synthesize_template_bank(
         ev_hair_all: &ev_hair_all,
         ev_eye_r_all: &ev_eye_r_all,
         ev_eye_l_all: &ev_eye_l_all,
+        ev_iris_r: &ev_iris_r,
+        ev_iris_l: &ev_iris_l,
+        ev_upper_r: &ev_upper_r,
+        ev_upper_l: &ev_upper_l,
         ev_mouth_all: &ev_mouth_all,
         ev_brow_r: &ev_brow_r,
         ev_brow_l: &ev_brow_l,
@@ -3690,39 +4318,96 @@ pub fn synthesize_template_bank(
         }
     }
 
-    let (mut hat_layer, hairpin_layer, mut ribbon_layer) =
+    let (mut hat_layer, mut hairpin_layer, mut ribbon_layer) =
         extract_hat_and_head_acc(&wearable_ctx, &hair_palette, glasses_layer.as_deref());
     let mut hat_fill_extra = vec![0u8; n];
     if let Some(ref mut hat_m) = hat_layer {
-        // Pull any thin outer hat-rim fringe in upper head into `hat` so `hair_front` never keeps a silhouette halo.
-        let mut fringe = Vec::new();
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                if hat_m[i] > 0 || ev.fg_alpha[i] == 0 {
-                    continue;
-                }
-                if glasses_layer.as_ref().is_some_and(|g| g[i] > 0)
-                    || hairpin_layer.as_ref().is_some_and(|hp| hp[i] > 0)
-                    || ribbon_layer.as_ref().is_some_and(|r| r[i] > 0)
-                {
-                    continue;
-                }
-                let touches_hat = (x > 0 && hat_m[i - 1] > 0)
-                    || (x + 1 < w && hat_m[i + 1] > 0)
-                    || (y > 0 && hat_m[i - w] > 0)
-                    || (y + 1 < h && hat_m[i + w] > 0);
-                if touches_hat {
-                    let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-                    if (u.abs() > face_rx * 0.96 || v < frame.crown_v + hh * 0.12) && !ev_face[i] {
-                        fringe.push(i);
+        // Pull any thin 8-connected outer hat-rim fringe into `hat` so `hair_front` never keeps a silhouette halo.
+        for _pass in 0..4 {
+            let mut fringe = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if hat_m[i] > 0 || ev.fg_alpha[i] == 0 {
+                        continue;
+                    }
+                    if glasses_layer.as_ref().is_some_and(|g| g[i] > 0)
+                        || hairpin_layer.as_ref().is_some_and(|hp| hp[i] > 0)
+                        || ribbon_layer.as_ref().is_some_and(|r| r[i] > 0)
+                    {
+                        continue;
+                    }
+                    let touches_hat = (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|nx| {
+                        (y.saturating_sub(1)..=(y + 1).min(h - 1))
+                            .any(|ny| hat_m[ny * w + nx] > 0)
+                    });
+                    if touches_hat {
+                        let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        let c = pix_rgb(rgba, i);
+                        let is_real_bang_body = rgb_dist(c, base_hair_rgb) <= 36.0
+                            && ev.fg_alpha[i] >= 160
+                            && v >= frame.crown_v + hh * 0.02;
+                        if (u.abs() > face_rx * 0.96
+                            || v < frame.crown_v + hh * 0.12
+                            || (v < frame.crown_v + hh * 0.08
+                                && (ev.fg_alpha[i] < 200 || !is_real_bang_body)))
+                            && !ev_face[i]
+                            && !is_real_bang_body
+                        {
+                            fringe.push(i);
+                        }
                     }
                 }
             }
+            if fringe.is_empty() {
+                break;
+            }
+            for i in fringe {
+                hat_m[i] = ev.fg_alpha[i];
+            }
         }
-        for i in fringe {
-            hat_m[i] = ev.fg_alpha[i];
+        // Walk outward along outer background-facing hat ink silhouette (`<= 10px` from `bg`) without cutting inner forehead bangs.
+        let bg_zero: Vec<bool> = ev.fg_alpha.iter().map(|&a| a == 0).collect();
+        let bg_near10 = dilate_mask(&bg_zero, w, h, 10);
+        for _pass in 0..8 {
+            let mut outer_rim = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if hat_m[i] > 0 || ev.fg_alpha[i] == 0 || !bg_near10[i] || ev_face[i] {
+                        continue;
+                    }
+                    if glasses_layer.as_ref().is_some_and(|g| g[i] > 0)
+                        || hairpin_layer.as_ref().is_some_and(|hp| hp[i] > 0)
+                        || ribbon_layer.as_ref().is_some_and(|r| r[i] > 0)
+                    {
+                        continue;
+                    }
+                    let touches_hat = (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|nx| {
+                        (y.saturating_sub(1)..=(y + 1).min(h - 1))
+                            .any(|ny| hat_m[ny * w + nx] > 0)
+                    });
+                    if touches_hat {
+                        let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        let c = pix_rgb(rgba, i);
+                        if u.abs() > face_rx * 1.05
+                            && v <= -hh * 0.02
+                            && (luma(c) < 122.0 || ev.fg_alpha[i] < 200)
+                        {
+                            outer_rim.push(i);
+                        }
+                    }
+                }
+            }
+            if outer_rim.is_empty() {
+                break;
+            }
+            for i in outer_rim {
+                hat_m[i] = ev.fg_alpha[i];
+            }
         }
+        let hat_bool_vis: Vec<bool> = hat_m.iter().map(|&v| v > 0).collect();
+        let hat_deep = erode_mask(&hat_bool_vis, w, h, 5);
         for y in 0..h {
             for x in 0..w {
                 let i = y * w + x;
@@ -3730,8 +4415,8 @@ pub fn synthesize_template_bank(
                     for base_mask in &mut visible_masks {
                         base_mask[i] = 0;
                     }
-                    let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
-                    if u.abs() > face_rx * 1.05 || v < frame.crown_v + hh * 0.04 {
+                    let (_, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                    if hat_deep[i] || v < frame.crown_v - hh * 0.02 {
                         tpl_masks[L_HAIR_FRONT][i] = 0;
                         tpl_masks[L_HAIR_BACK][i] = 0;
                     }
@@ -3752,7 +4437,42 @@ pub fn synthesize_template_bank(
             }
         }
     }
-    if let Some(ref hp_m) = hairpin_layer {
+    if let Some(ref mut hp_m) = hairpin_layer {
+        for _pass in 0..2 {
+            let mut ring = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if hp_m[i] > 0 || ev.fg_alpha[i] == 0 || ev_face[i] {
+                        continue;
+                    }
+                    if hat_layer.as_ref().is_some_and(|hm| hm[i] > 0)
+                        || ribbon_layer.as_ref().is_some_and(|rm| rm[i] > 0)
+                        || glasses_layer.as_ref().is_some_and(|gm| gm[i] > 0)
+                    {
+                        continue;
+                    }
+                    let touches_hp = (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|nx| {
+                        (y.saturating_sub(1)..=(y + 1).min(h - 1))
+                            .any(|ny| hp_m[ny * w + nx] > 0)
+                    });
+                    if touches_hp {
+                        let c = pix_rgb(rgba, i);
+                        if rgb_dist(c, base_hair_rgb) > 26.0
+                            && (luma(c) < 176.0 || ev.fg_alpha[i] < 190)
+                        {
+                            ring.push(i);
+                        }
+                    }
+                }
+            }
+            if ring.is_empty() {
+                break;
+            }
+            for i in ring {
+                hp_m[i] = ev.fg_alpha[i];
+            }
+        }
         for (i, &ha) in hp_m.iter().enumerate() {
             if ha > 0 {
                 if let Some(ref mut hat_m) = hat_layer {
@@ -3800,7 +4520,264 @@ pub fn synthesize_template_bank(
             it.next().unwrap(),
         ]
     };
+    if let Some(ref mut hat_m) = hat_layer {
+        // Move tiny disconnected upper-hood silhouette shards & outer headband ink borders out of `hair_front` into `hat` before `hair_field`/`hf_dil3`.
+        let hat_near6 = dilate_mask(&hat_m.iter().map(|&v| v > 0).collect::<Vec<_>>(), w, h, 6);
+        let mut hf_seen = vec![false; n];
+        for start in 0..n {
+            if hf_seen[start] || m_hf[start] == 0 {
+                continue;
+            }
+            hf_seen[start] = true;
+            let mut stack = vec![start];
+            let mut comp = Vec::new();
+            let mut min_v = f64::INFINITY;
+            let mut sum_v = 0.0;
+            let mut touches_hat = false;
+            let mut touches_hat_near = false;
+            let mut bg_edges = 0usize;
+            while let Some(cur) = stack.pop() {
+                comp.push(cur);
+                let cx = cur % w;
+                let cy = cur / w;
+                let (_, pv) = frame.to_local(DVec2::new(cx as f64, cy as f64));
+                min_v = min_v.min(pv);
+                sum_v += pv;
+                if hat_near6[cur] {
+                    touches_hat_near = true;
+                }
+                if cx == 0
+                    || cx + 1 == w
+                    || cy == 0
+                    || cy + 1 == h
+                    || ev.fg_alpha[cur - 1] == 0
+                    || ev.fg_alpha[cur + 1] == 0
+                    || ev.fg_alpha[cur - w] == 0
+                    || ev.fg_alpha[cur + w] == 0
+                {
+                    bg_edges += 1;
+                }
+                for nx in cx.saturating_sub(1)..=(cx + 1).min(w - 1) {
+                    for ny in cy.saturating_sub(1)..=(cy + 1).min(h - 1) {
+                        let nb = ny * w + nx;
+                        if m_hf[nb] > 0 {
+                            if !hf_seen[nb] {
+                                hf_seen[nb] = true;
+                                stack.push(nb);
+                            }
+                        } else if hat_m[nb] > 0 {
+                            touches_hat = true;
+                        }
+                    }
+                }
+            }
+            let med_v = sum_v / comp.len().max(1) as f64;
+            let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
+            for &pi in &comp {
+                let c = pix_rgb(rgba, pi);
+                r += c[0] as u64;
+                g += c[1] as u64;
+                b += c[2] as u64;
+            }
+            let cnt = comp.len().max(1) as u64;
+            let avg_rgb = [(r / cnt) as u8, (g / cnt) as u8, (b / cnt) as u8];
+            let is_solid_bang_chunk = comp.len() >= 320
+                || (rgb_dist(avg_rgb, base_hair_rgb) <= 30.0
+                    && med_v >= frame.crown_v + hh * 0.04);
+            let is_thin_hood_border = comp.len() < 900
+                && bg_edges * 5 >= comp.len()
+                && touches_hat_near
+                && luma(avg_rgb) < 140.0
+                && rgb_dist(avg_rgb, base_hair_rgb) > 22.0
+                && med_v <= hh * 0.28;
+            if is_thin_hood_border
+                || (comp.len() < 320
+                    && !is_solid_bang_chunk
+                    && (touches_hat || rgb_dist(avg_rgb, base_hair_rgb) > 26.0)
+                    && (min_v < frame.crown_v + hh * 0.06
+                        || (touches_hat && med_v <= hh * 0.22)))
+            {
+                for pi in comp {
+                    m_hf[pi] = 0;
+                    tpl_masks[L_HAIR_FRONT][pi] = 0;
+                    hat_m[pi] = ev.fg_alpha[pi];
+                }
+            }
+        }
+    }
     let outfit_subs = extract_outfit_sublayers(&wearable_ctx, &mut m_clothes, &mut m_face, &mut m_neck);
+    // Keep only the single chin-connected main `neck` component so stray collar/jaw slivers never fragment or flip.
+    {
+        let mut neck_visited = vec![false; n];
+        let mut neck_comps: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+        for start in 0..n {
+            if neck_visited[start] || (m_neck[start] == 0 && tpl_masks[L_NECK][start] == 0) {
+                continue;
+            }
+            neck_visited[start] = true;
+            let mut stack = vec![start];
+            let mut comp = Vec::new();
+            let mut core_hits = 0usize;
+            while let Some(cur) = stack.pop() {
+                comp.push(cur);
+                let cx = cur % w;
+                let cy = cur / w;
+                let (u, v) = frame.to_local(DVec2::new(cx as f64, cy as f64));
+                if u.abs() <= eye_dist * 0.35
+                    && v >= frame.chin_v - hh * 0.08
+                    && v <= frame.chin_v + hh * 0.48
+                {
+                    core_hits += 1;
+                }
+                for dy in -1isize..=1 {
+                    let ny = cy as isize + dy;
+                    if ny < 0 || ny >= h as isize {
+                        continue;
+                    }
+                    for dx in -1isize..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = cx as isize + dx;
+                        if nx < 0 || nx >= w as isize {
+                            continue;
+                        }
+                        let ni = ny as usize * w + nx as usize;
+                        if !neck_visited[ni] && (m_neck[ni] > 0 || tpl_masks[L_NECK][ni] > 0) {
+                            neck_visited[ni] = true;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            neck_comps.push((core_hits, comp.len(), comp));
+        }
+        if neck_comps.len() > 1 {
+            let best_idx = neck_comps
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (core, len, _))| (*core, *len))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            for (idx, (_, _, comp)) in neck_comps.into_iter().enumerate() {
+                if idx == best_idx {
+                    continue;
+                }
+                for i in comp {
+                    tpl_masks[L_NECK][i] = 0;
+                    let na = m_neck[i];
+                    if na > 0 {
+                        m_neck[i] = 0;
+                        let x = i % w;
+                        let y = i / w;
+                        let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        if v >= frame.chin_v + hh * 0.08 {
+                            m_clothes[i] = m_clothes[i].max(na);
+                        } else if face_sdf(u, v, frame, &ev) <= 4.0 {
+                            m_face[i] = m_face[i].max(na);
+                        } else {
+                            m_hair_back[i] = m_hair_back[i].max(na);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Strip orphaned tiny (<48px) high collar fringe islands right beside the neck so clothes silhouettes stay smooth.
+    {
+        let mut cl_seen = vec![false; n];
+        let collar_fringe_bot = frame.chin_v + hh * 0.14;
+        for start in 0..n {
+            if cl_seen[start] || m_clothes[start] == 0 {
+                continue;
+            }
+            cl_seen[start] = true;
+            let mut stack = vec![start];
+            let mut comp = Vec::new();
+            let mut max_v = f64::NEG_INFINITY;
+            while let Some(cur) = stack.pop() {
+                comp.push(cur);
+                let cx = cur % w;
+                let cy = cur / w;
+                let (_, pv) = frame.to_local(DVec2::new(cx as f64, cy as f64));
+                max_v = max_v.max(pv);
+                for dy in -1isize..=1 {
+                    let ny = cy as isize + dy;
+                    if ny < 0 || ny >= h as isize {
+                        continue;
+                    }
+                    for dx in -1isize..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = cx as isize + dx;
+                        if nx < 0 || nx >= w as isize {
+                            continue;
+                        }
+                        let ni = ny as usize * w + nx as usize;
+                        if !cl_seen[ni] && m_clothes[ni] > 0 {
+                            cl_seen[ni] = true;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            if comp.len() < 48 && max_v < collar_fringe_bot {
+                for i in comp {
+                    let ca = m_clothes[i];
+                    m_clothes[i] = 0;
+                    let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
+                    if ev_hair_all[i] && !ev_hair_back[i] && u.abs() <= face_rx * 1.55 && v <= side_max_v {
+                        if u < 0.0 {
+                            m_hsr[i] = m_hsr[i].max(ca);
+                        } else {
+                            m_hsl[i] = m_hsl[i].max(ca);
+                        }
+                    } else if v < frame.chin_v && face_sdf(u, v, frame, &ev) <= 4.0 {
+                        m_face[i] = m_face[i].max(ca);
+                    } else {
+                        m_hair_back[i] = m_hair_back[i].max(ca);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build hair & clothes color fields after removing wearables/sublayers so hats never taint hair fills.
+    let is_wearable_px = |i: usize| -> bool {
+        hat_layer.as_ref().is_some_and(|m| m[i] > 0)
+            || hairpin_layer.as_ref().is_some_and(|m| m[i] > 0)
+            || ribbon_layer.as_ref().is_some_and(|m| m[i] > 0)
+            || glasses_layer.as_ref().is_some_and(|m| m[i] > 0)
+    };
+    let hair_seed_src: Vec<bool> = (0..n)
+        .map(|i| {
+            (m_hf[i] > 128 || m_hsr[i] > 128 || m_hsl[i] > 128 || m_hair_back[i] > 128)
+                && !is_wearable_px(i)
+                && !ev_clothes[i]
+                && !ev_face[i]
+                && luma(pix_rgb(rgba, i)) >= 44.0
+        })
+        .collect();
+    let mut hair_eroded = erode_mask(&hair_seed_src, w, h, 2);
+    if hair_eroded.iter().filter(|&&v| v).count() < 16 {
+        hair_eroded = erode_mask(&hair_seed_src, w, h, 1);
+    }
+    let hair_field = if hair_eroded.iter().any(|&v| v) {
+        build_color_field(rgba, &hair_eroded, w, h, base_hair_rgb)
+    } else {
+        let mut fallback_seeds = hair_seed_src;
+        if !fallback_seeds.iter().any(|&v| v) {
+            for (i, s) in fallback_seeds.iter_mut().enumerate() {
+                if ev_hair_all[i] && !is_wearable_px(i) && !ev_clothes[i] && !ev_face[i] {
+                    *s = true;
+                }
+            }
+        }
+        build_color_field(rgba, &fallback_seeds, w, h, base_hair_rgb)
+    };
+
     // Build clothes color field after separating `clothes_inner`/collar/acc so occluded fill extends underlying fabric rather than ribbon colors.
     let clothes_seed_src: Vec<bool> = (0..n)
         .map(|i| m_clothes[i] > 128 && !is_dark_lineart(pix_rgb(rgba, i)))
@@ -3856,11 +4833,98 @@ pub fn synthesize_template_bank(
         m_el_i, m_el_l, m_el_u, m_br, m_bl, m_mi, m_ml, m_mu, m_hsr, m_hsl, m_hf,
     ];
     for (sub_id, sub_mask) in &outfit_subs {
-        if sub_id != "clothes_hands" {
-            for (i, &sa) in sub_mask.iter().enumerate() {
-                if sa > 0 {
-                    tpl_masks[L_CLOTHES][i] = tpl_masks[L_CLOTHES][i].max(ev.fg_alpha[i]);
+        let sub_bool: Vec<bool> = sub_mask.iter().map(|&v| v > 0).collect();
+        let sub_dil3 = dilate_mask(&sub_bool, w, h, 3);
+        if sub_id == "clothes_hands" {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if !(sub_bool[i] || (sub_dil3[i] && ev.fg_alpha[i] > 0)) {
+                        continue;
+                    }
+                    let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                    if v >= ev.clothes_top_v - hh * 0.02
+                        || (sub_bool[i] && v >= frame.chin_v + hh * 0.06 && !ev_face[i])
+                    {
+                        tpl_masks[L_CLOTHES][i] = tpl_masks[L_CLOTHES][i].max(ev.fg_alpha[i]);
+                    }
+                    if !ev_clothes[i] && face_sdf(u, v, frame, &ev) <= 8.0 {
+                        tpl_masks[L_FACE][i] = tpl_masks[L_FACE][i].max(ev.fg_alpha[i]);
+                    }
                 }
+            }
+        } else {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if sub_bool[i] {
+                        tpl_masks[L_CLOTHES][i] = tpl_masks[L_CLOTHES][i].max(ev.fg_alpha[i]);
+                    } else if sub_dil3[i] && ev.fg_alpha[i] > 0 && visible_masks[L_NECK][i] == 0 {
+                        let (_, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                        if v >= frame.chin_v {
+                            tpl_masks[L_CLOTHES][i] = tpl_masks[L_CLOTHES][i].max(ev.fg_alpha[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Keep 3px `fillMask` underlap on `neck` behind collar seam & on hair layers behind `hat` perimeter so zoom/tilt shows zero crack.
+    {
+        let clothes_bool: Vec<bool> = visible_masks[L_CLOTHES].iter().map(|&v| v > 0).collect();
+        let clothes_dil3 = dilate_mask(&clothes_bool, w, h, 3);
+        let neck_rx = eye_dist * if ev.is_sd { 0.18 } else { 0.30 };
+        let neck_top = frame.chin_v - hh * 0.10;
+        let neck_bot = if ev.is_sd {
+            (frame.chin_v + hh * 0.26)
+                .min(ev.clothes_top_v + hh * 0.12)
+                .max(frame.chin_v + hh * 0.10)
+        } else {
+            (frame.chin_v + hh * 0.48).max(ev.clothes_top_v + hh * 0.12)
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if clothes_dil3[i] && ev.fg_alpha[i] > 0 {
+                    let (u, v) = frame.to_local(DVec2::new(x as f64, y as f64));
+                    if (u - ev.torso_cx_u * 0.35).abs() <= neck_rx * 1.35
+                        && v >= neck_top
+                        && v <= neck_bot
+                    {
+                        tpl_masks[L_NECK][i] = tpl_masks[L_NECK][i].max(ev.fg_alpha[i]);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ref hat_m) = hat_layer {
+        let hat_bool_final: Vec<bool> = hat_m.iter().map(|&v| v > 0).collect();
+        let hat_deep_final = erode_mask(&hat_bool_final, w, h, 5);
+        let hf_dil3 = dilate_mask(
+            &visible_masks[L_HAIR_FRONT].iter().map(|&v| v > 0).collect::<Vec<_>>(),
+            w,
+            h,
+            3,
+        );
+        let hb_dil3 = dilate_mask(
+            &visible_masks[L_HAIR_BACK].iter().map(|&v| v > 0).collect::<Vec<_>>(),
+            w,
+            h,
+            3,
+        );
+        for i in 0..n {
+            if !hat_bool_final[i] || ev.fg_alpha[i] == 0 {
+                continue;
+            }
+            if !hat_deep_final[i] && hf_dil3[i] {
+                tpl_masks[L_HAIR_FRONT][i] = tpl_masks[L_HAIR_FRONT][i].max(ev.fg_alpha[i]);
+            } else {
+                tpl_masks[L_HAIR_FRONT][i] = 0;
+            }
+            if !hat_deep_final[i] && hb_dil3[i] {
+                tpl_masks[L_HAIR_BACK][i] = tpl_masks[L_HAIR_BACK][i].max(ev.fg_alpha[i]);
+            } else {
+                tpl_masks[L_HAIR_BACK][i] = 0;
             }
         }
     }
@@ -4058,9 +5122,29 @@ pub fn synthesize_template_bank(
                 }
             }
             "clothes" => {
+                let bridge_max = (eye_dist * 0.72).round().max(12.0) as usize;
                 for y in 0..h {
+                    let row = y * w;
+                    let mut left_vis = vec![None::<usize>; w];
+                    let mut last_x: Option<usize> = None;
+                    for (x, slot) in left_vis.iter_mut().enumerate() {
+                        let i = row + x;
+                        if m_vis[i] > 128 {
+                            last_x = Some(x);
+                        }
+                        *slot = last_x;
+                    }
+                    let mut next_x: Option<usize> = None;
+                    let mut right_vis = vec![None::<usize>; w];
+                    for (x, slot) in right_vis.iter_mut().enumerate().rev() {
+                        let i = row + x;
+                        if m_vis[i] > 128 {
+                            next_x = Some(x);
+                        }
+                        *slot = next_x;
+                    }
                     for x in 0..w {
-                        let i = y * w + x;
+                        let i = row + x;
                         let ea = m_vis[i].max(m_fill[i]);
                         if ea == 0 {
                             continue;
@@ -4068,6 +5152,23 @@ pub fn synthesize_template_bank(
                         let rgb = if m_vis[i] > 0 {
                             let k = i * 4;
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
+                        } else if let (Some(lx), Some(rx)) = (left_vis[x], right_vis[x]) {
+                            let _ = bridge_max;
+                            if x > lx && rx > x && x - lx <= 16 && rx - x <= 16 {
+                                let lk = (row + lx) * 4;
+                                let rk = (row + rx) * 4;
+                                let lc = [rgba[lk], rgba[lk + 1], rgba[lk + 2]];
+                                let rc = [rgba[rk], rgba[rk + 1], rgba[rk + 2]];
+                                if rgb_dist(lc, rc) <= 28.0 {
+                                    let t = (x - lx) as f64 / (rx - lx).max(1) as f64;
+                                    let horiz = lerp_rgb(lc, rc, t);
+                                    lerp_rgb(horiz, clothes_field.sample(x, y), 0.25)
+                                } else {
+                                    clothes_field.sample(x, y)
+                                }
+                            } else {
+                                clothes_field.sample(x, y)
+                            }
                         } else {
                             clothes_field.sample(x, y)
                         };
@@ -4148,8 +5249,8 @@ pub fn synthesize_template_bank(
                 } else {
                     (el_v, el_ry, &ev.iris_l, &ev_iris_l, &ev_upper_l, &ev_lower_l, &ev_eye_l_all)
                 };
-                let max_rx_cap = er_rx.max(el_rx) * if ev.is_sd { 0.82 } else { 0.58 };
-                let clamped_ry = iris_fit.ry.min(ry * if ev.is_sd { 1.08 } else { 1.12 });
+                let max_rx_cap = er_rx.max(el_rx) * if ev.is_sd { 0.94 } else { 0.66 };
+                let clamped_ry = iris_fit.ry.min(ry * if ev.is_sd { 1.12 } else { 1.14 });
                 let clamped_rx = iris_fit.rx.min(max_rx_cap);
                 let clamped_cv = iris_fit.center_v.clamp(cv - ry * 0.16, cv + ry * 0.14);
                 let white_luma = luma(ev.palette.sclera_white);
@@ -4223,7 +5324,7 @@ pub fn synthesize_template_bank(
                     ev.palette.lash_color[2].min(58),
                 ];
                 let skin_luma = luma(ev.palette.skin_base);
-                let arch_mult = if ev.is_sd { 0.86 } else { 0.80 };
+                let arch_mult = if ev.is_sd { 0.90 } else { 0.84 };
                 let lash_half = if ev.is_sd {
                     (rx * 0.095).clamp(2.4, 12.0)
                 } else {

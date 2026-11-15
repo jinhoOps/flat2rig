@@ -591,11 +591,11 @@ export type UpdateDownloadEvent =
   | { event: "Finished" };
 
 export async function getAppVersion(): Promise<string> {
-  if (!desktop) return "0.2.0-1";
+  if (!desktop) return "0.2.0-2";
   try {
     return await invoke<string>("get_app_version");
   } catch {
-    return "0.2.0-1";
+    return "0.2.0-2";
   }
 }
 
@@ -605,7 +605,7 @@ export async function checkAppUpdate(
   if (!desktop) {
     return {
       status: "unavailable",
-      currentVersion: "0.2.0-1",
+      currentVersion: "0.2.0-2",
       latestVersion: null,
       signed: false,
       endpointUsed: customEndpoint || "",

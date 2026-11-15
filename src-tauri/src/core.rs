@@ -1223,7 +1223,51 @@ fn apply_body_sway(p: DVec2, body_pivot: DVec2, hh: f64, pose: &Pose, scale: f64
     body_pivot + rot * (shifted - body_pivot)
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionDeformParams {
+    pub width: f64,
+    pub roundness_delta: f64,
+    pub corner: f64,
+    pub upper_curve_delta: f64,
+    pub lower_curve_delta: f64,
+    pub offset_x: f64,
+    pub offset_y: f64,
+}
+
+impl RegionDeformParams {
+    pub fn neutral() -> Self {
+        Self {
+            width: 1.0,
+            roundness_delta: 0.0,
+            corner: 0.0,
+            upper_curve_delta: 0.0,
+            lower_curve_delta: 0.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeDeformInput {
+    pub eye_l: Option<RegionDeformParams>,
+    pub eye_r: Option<RegionDeformParams>,
+    pub mouth: Option<RegionDeformParams>,
+}
+
 pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
+    deform_with_shapes(point, id, lm, pose, None)
+}
+
+pub fn deform_with_shapes(
+    point: Point,
+    id: &str,
+    lm: &Landmarks,
+    pose: &Pose,
+    shape_deform: Option<&ShapeDeformInput>,
+) -> Point {
     let hh = (lm.chin.y - lm.crown.y).max(1.);
     let dist = lm.eye_l.v().distance(lm.eye_r.v()).max(1.);
     let cx = (lm.eye_l.x + lm.eye_r.x) / 2.;
@@ -1232,36 +1276,71 @@ pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
         return apply_body_sway(point.v(), body_pivot, hh, pose, 1.0).into();
     }
     let mut p = point.v();
+    let is_sub_layer = id.contains("_sub_");
     if id.starts_with("eye") {
-        let (eye, open, smile) = if id.starts_with("eyeL") {
+        let is_left = id.starts_with("eyeL");
+        let (eye, open, smile) = if is_left {
             (lm.eye_l, pose.eye_l, pose.eye_l_smile)
         } else {
             (lm.eye_r, pose.eye_r, pose.eye_r_smile)
         };
-        if id.ends_with("_iris") {
-            p.x += pose.eye_ball_x * dist * 0.045;
-            p.y -= pose.eye_ball_y * dist * 0.025;
-            p.y = eye.y + (p.y - eye.y) * open.clamp(0.04, 1.3);
-        } else if id.ends_with("_upper") {
-            // Stretch upper lid skin smoothly down from brow-ridge anchor while flattening
-            // the lash arch onto `close_y` so outer lash corners never droop onto the cheek.
-            let close = (1.0 - open).clamp(0.0, 1.0);
-            let widen = (open - 1.0).clamp(0.0, 0.3);
-            let lid_anchor_y = eye.y - dist * 0.34;
-            let close_y = eye.y + dist * 0.04;
-            let span_y = (close_y - lid_anchor_y).max(1.0);
-            let u = ((p.y - lid_anchor_y) / span_y).clamp(0.0, 1.0);
-            if close > 0.0 && u > 0.0 && u < 1.0 {
-                let target_u = 1.0 - (1.0 - u).powf(3.6);
-                let closed_y = lid_anchor_y + span_y * target_u;
-                p.y += (closed_y - p.y) * close;
-            } else if widen > 0.0 && u > 0.0 {
-                p.y -= span_y * 0.18 * u * widen;
+        if let Some(shape) = shape_deform.and_then(|s| if is_left { s.eye_l } else { s.eye_r }) {
+            let is_iris = id.ends_with("_iris");
+            p.x += shape.offset_x * dist * 0.14;
+            p.y += shape.offset_y * dist * 0.12;
+            let width_scale = if is_iris {
+                1.0 + (shape.width - 1.0) * 0.45
+            } else {
+                shape.width
+            };
+            p.x = eye.x + (p.x - eye.x) * width_scale;
+            let nx = (p.x - eye.x) / (dist * 0.24).max(1.0);
+            let center_arch = (1.0 - nx * nx).max(0.0);
+            let eye_sign = if is_left { 1.0 } else { -1.0 };
+            let outer_signed = (nx * eye_sign).clamp(-0.4, 1.2);
+            p.y -= shape.corner * dist * 0.045 * outer_signed;
+            let upper_mask = if id.ends_with("_upper") || id.ends_with("_sub_lid") {
+                1.0
+            } else {
+                ((eye.y + dist * 0.06 - p.y) / (dist * 0.14).max(1.0)).clamp(0.0, 1.0)
+            };
+            let lower_mask = if id.ends_with("_lower") {
+                1.0
+            } else {
+                ((p.y - (eye.y - dist * 0.02)) / (dist * 0.14).max(1.0)).clamp(0.0, 1.0)
+            };
+            p.y -= shape.upper_curve_delta * dist * 0.055 * center_arch * upper_mask;
+            p.y += shape.lower_curve_delta * dist * 0.045 * center_arch * lower_mask;
+            if !is_iris {
+                p.y = eye.y + (p.y - eye.y) * (1.0 + shape.roundness_delta * 0.32 * center_arch);
             }
-        } else {
-            p.y = eye.y + (p.y - eye.y) * open.max(0.04);
-            if id.ends_with("_lower") {
-                p.y -= smile * dist * 0.032;
+        }
+        if !is_sub_layer {
+            if id.ends_with("_iris") {
+                p.x += pose.eye_ball_x * dist * 0.045;
+                p.y -= pose.eye_ball_y * dist * 0.025;
+                p.y = eye.y + (p.y - eye.y) * open.clamp(0.04, 1.3);
+            } else if id.ends_with("_upper") {
+                // Stretch upper lid skin smoothly down from brow-ridge anchor while flattening
+                // the lash arch onto `close_y` so outer lash corners never droop onto the cheek.
+                let close = (1.0 - open).clamp(0.0, 1.0);
+                let widen = (open - 1.0).clamp(0.0, 0.3);
+                let lid_anchor_y = eye.y - dist * 0.34;
+                let close_y = eye.y + dist * 0.04;
+                let span_y = (close_y - lid_anchor_y).max(1.0);
+                let u = ((p.y - lid_anchor_y) / span_y).clamp(0.0, 1.0);
+                if close > 0.0 && u > 0.0 && u < 1.0 {
+                    let target_u = 1.0 - (1.0 - u).powf(3.6);
+                    let closed_y = lid_anchor_y + span_y * target_u;
+                    p.y += (closed_y - p.y) * close;
+                } else if widen > 0.0 && u > 0.0 {
+                    p.y -= span_y * 0.18 * u * widen;
+                }
+            } else {
+                p.y = eye.y + (p.y - eye.y) * open.max(0.04);
+                if id.ends_with("_lower") {
+                    p.y -= smile * dist * 0.032;
+                }
             }
         }
     }
@@ -1276,22 +1355,46 @@ pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
         p.y -= brow_form * hh * 0.028 * inner_factor;
     }
     if id.starts_with("mouth") {
-        let mdx = p.x - lm.mouth.x;
-        let corner_w = (mdx.abs() / (dist * 0.18).max(1.)).clamp(0., 1.2);
-        p.x += mdx * pose.mouth_form * 0.14;
-        p.y -= pose.mouth_form * hh * 0.016 * corner_w * corner_w;
-    }
-    if id == "mouth_upper" {
-        p.y -= pose.mouth * hh * 0.012;
-    }
-    if id == "mouth_lower" {
-        p.y += pose.mouth * hh * 0.045;
-    }
-    if id == "mouth_inner" {
-        p.y = lm.mouth.y + (p.y - lm.mouth.y) * (1. + pose.mouth * 2.);
+        if let Some(m_shape) = shape_deform.and_then(|s| s.mouth) {
+            p.x += m_shape.offset_x * dist * 0.12;
+            p.y += m_shape.offset_y * hh * 0.04;
+            p.x = lm.mouth.x + (p.x - lm.mouth.x) * m_shape.width;
+            let mnx = (p.x - lm.mouth.x) / (dist * 0.16).max(1.0);
+            let m_center = (1.0 - mnx * mnx).max(0.0);
+            let m_corner_w = mnx.abs().clamp(0.0, 1.2);
+            p.y -= m_shape.corner * hh * 0.028 * m_corner_w * m_corner_w;
+            p.y = lm.mouth.y + (p.y - lm.mouth.y) * (1.0 + m_shape.roundness_delta * 0.3 * m_center);
+            let upper_w = if id == "mouth_upper" || id == "mouth_sub_lip" {
+                1.0
+            } else {
+                ((lm.mouth.y + hh * 0.02 - p.y) / (hh * 0.04).max(1.0)).clamp(0.0, 1.0)
+            };
+            let lower_w = if id == "mouth_lower" || id == "mouth_sub_lip" {
+                1.0
+            } else {
+                ((p.y - (lm.mouth.y - hh * 0.02)) / (hh * 0.04).max(1.0)).clamp(0.0, 1.0)
+            };
+            p.y -= m_shape.upper_curve_delta * hh * 0.024 * m_center * upper_w;
+            p.y += m_shape.lower_curve_delta * hh * 0.026 * m_center * lower_w;
+        }
+        if !is_sub_layer {
+            let mdx = p.x - lm.mouth.x;
+            let corner_w = (mdx.abs() / (dist * 0.18).max(1.)).clamp(0., 1.2);
+            p.x += mdx * pose.mouth_form * 0.14;
+            p.y -= pose.mouth_form * hh * 0.016 * corner_w * corner_w;
+            if id == "mouth_upper" {
+                p.y -= pose.mouth * hh * 0.012;
+            }
+            if id == "mouth_lower" {
+                p.y += pose.mouth * hh * 0.045;
+            }
+            if id == "mouth_inner" {
+                p.y = lm.mouth.y + (p.y - lm.mouth.y) * (1. + pose.mouth * 2.);
+            }
+        }
     }
     let weight = if id == "neck" {
-        ((lm.chin.y + hh * 0.25 - p.y) / (hh * 0.25)).clamp(0., 1.)
+        ((lm.chin.y + hh * 0.42 - p.y) / (hh * 0.42)).clamp(0., 1.)
     } else {
         1.
     };
@@ -1319,7 +1422,8 @@ pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
         p.x += sway_param * hh * 0.04 * 0.45 * ((p.y - lm.crown.y) / hh).clamp(0., 1.8);
     }
     let pivot = DVec2::new(cx, lm.chin.y);
-    let rot = glam::DMat2::from_angle(pose.angle_z.to_radians() * weight);
+    let rot_weight = if id == "neck" { weight * 0.78 } else { weight };
+    let rot = glam::DMat2::from_angle(pose.angle_z.to_radians() * rot_weight);
     let head_posed = pivot + rot * (p - pivot);
     let body_follow = if id == "neck" {
         0.45 + 0.55 * weight
@@ -1940,5 +2044,45 @@ mod tests {
         assert!(lid_report.triangle_count >= 12);
         assert_eq!(lid_report.hole_crossings, 0);
         assert_eq!(lid_report.flipped_at_extremes, 0);
+    }
+
+    #[test]
+    fn deform_with_shapes_matches_rest_and_transforms_contours() {
+        let l = lm();
+        let eye_pt = Point { x: 40., y: 22. };
+        let neutral = RegionDeformParams::neutral();
+        let shape_neutral = ShapeDeformInput {
+            eye_l: Some(neutral),
+            eye_r: Some(neutral),
+            mouth: Some(neutral),
+        };
+        let rest_4 = deform(eye_pt, "eyeL_upper", &l, &Pose::default());
+        let rest_5 = deform_with_shapes(eye_pt, "eyeL_upper", &l, &Pose::default(), Some(&shape_neutral));
+        assert!((rest_4.x - rest_5.x).abs() < 1e-6);
+        assert!((rest_4.y - rest_5.y).abs() < 1e-6);
+
+        let widened = ShapeDeformInput {
+            eye_l: Some(RegionDeformParams {
+                width: 1.25,
+                upper_curve_delta: 0.4,
+                corner: 0.3,
+                ..neutral
+            }),
+            ..ShapeDeformInput::default()
+        };
+        let moved = deform_with_shapes(eye_pt, "eyeL_upper", &l, &Pose::default(), Some(&widened));
+        assert!(moved.x > eye_pt.x);
+        assert!(moved.y < eye_pt.y);
+
+        let mouth_corner = Point { x: 36., y: 36. };
+        let pursed = ShapeDeformInput {
+            mouth: Some(RegionDeformParams {
+                width: 0.6,
+                ..neutral
+            }),
+            ..ShapeDeformInput::default()
+        };
+        let pursed_pt = deform_with_shapes(mouth_corner, "mouth_upper", &l, &Pose::default(), Some(&pursed));
+        assert!(pursed_pt.x < mouth_corner.x);
     }
 }

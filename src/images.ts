@@ -1,4 +1,4 @@
-import type { Project } from "./types";
+import { createDefaultProjectRigState, type Project } from "./types";
 import { compositePartTexture, defaultLandmarks } from "./engine";
 export function canvas(w: number, h: number) {
   const c = document.createElement("canvas");
@@ -54,7 +54,7 @@ export async function readImage(file: File): Promise<Project> {
   const c = canvas(w, h);
   c.getContext("2d")!.drawImage(img, 0, 0, w, h);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     name: file.name.replace(/\.[^.]+$/, ""),
     width: w,
     height: h,
@@ -78,6 +78,7 @@ export async function readImage(file: File): Promise<Project> {
     revision: 0,
     provider: "manual",
     analysisStatus: "idle",
+    ...createDefaultProjectRigState("ld"),
     createdAt: new Date().toISOString(),
   };
 }

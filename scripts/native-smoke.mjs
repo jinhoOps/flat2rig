@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { createCanvas } from "@napi-rs/canvas";
 import WebSocket from "ws";
 
@@ -26,12 +27,14 @@ ctx.fillRect(38, 20, 52, 55);
 const fixture = resolve(dir, "native-input.png");
 writeFileSync(fixture, c.toBuffer("image/png"));
 const port = 19228;
+const userDataDir = mkdtempSync(join(tmpdir(), "flat2rig-smoke-"));
 const app = spawn(binary, [], {
   cwd: root,
   windowsHide: true,
   env: {
     ...process.env,
     FLAT2RIG_HEADLESS_SMOKE: "1",
+    WEBVIEW2_USER_DATA_FOLDER: userDataDir,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
   },
   stdio: "pipe",
@@ -189,8 +192,58 @@ try {
   )
     throw new Error(`Native command contract failed: ${JSON.stringify(native)}`);
   console.log("ort, delaunator, glam, occlusion and model registry commands passed");
+  const checkMinFont = () =>
+    evaluate(
+      "(()=>{let minFont=999,minEl='';for(const el of document.querySelectorAll('*')){if(el.closest('.sr-only')||el.classList.contains('sr-only'))continue;const st=getComputedStyle(el);if(st.display==='none'||st.visibility==='hidden'||parseFloat(st.opacity)===0)continue;const r=el.getBoundingClientRect();if(r.width<=2||r.height<=2)continue;const hasText=[...el.childNodes].some(n=>n.nodeType===3&&n.nodeValue.trim().length>0);if(!hasText)continue;const fs=parseFloat(st.fontSize);if(fs<minFont){minFont=fs;minEl=el.tagName+'.'+el.className+':'+el.textContent.trim().slice(0,20);}}return {minFont,minEl};})()",
+    );
+
+  // Step 2: 표정 (Expressions)
   await evaluate(
-    "[...document.querySelectorAll('[role=tab]')].find(b=>b.textContent.includes('리깅')).click()",
+    "[...document.querySelectorAll('[role=tab]')].find(b=>b.textContent.includes('표정')).click()",
+  );
+  await waitFor(
+    "document.querySelectorAll('.rig-card').length>=8 && document.querySelectorAll('.rig-card-thumb img').length>=4 && !document.body.innerText.includes('메쉬 계산 중')",
+  );
+  const exprFont = await checkMinFont();
+  if (exprFont.minFont < 12)
+    throw new Error(`Expression font < 12px: ${JSON.stringify(exprFont)}`);
+  await evaluate(
+    "[...document.querySelectorAll('.rig-card')].find(b=>b.textContent.includes('미소'))?.click()",
+  );
+  await delay(120);
+  const exprScreenshot = await rpc("Page.captureScreenshot", { format: "png" });
+  writeFileSync(
+    resolve(dir, "native-ui.png"),
+    Buffer.from(exprScreenshot.data, "base64"),
+  );
+
+  // Step 3: 조정 (Adjust)
+  await evaluate(
+    "[...document.querySelectorAll('[role=tab]')].find(b=>b.textContent.includes('조정')).click()",
+  );
+  await waitFor("document.querySelectorAll('.rig-card').length>=4");
+  const adjustFont = await checkMinFont();
+  if (adjustFont.minFont < 12)
+    throw new Error(`Adjust font < 12px: ${JSON.stringify(adjustFont)}`);
+
+  // Step 4: 재생 (Play)
+  await evaluate(
+    "[...document.querySelectorAll('[role=tab]')].find(b=>b.textContent.includes('재생')).click()",
+  );
+  await waitFor(
+    "!!document.querySelector('.canvas-frame.clean') && document.body.innerText.includes('라이브 재생 시작')",
+  );
+  const playFont = await checkMinFont();
+  if (playFont.minFont < 12)
+    throw new Error(`Play font < 12px: ${JSON.stringify(playFont)}`);
+
+  // Step 5: 고급 (Advanced Parts + Mesh + PSD)
+  await evaluate(
+    "[...document.querySelectorAll('[role=tab]')].find(b=>b.textContent.includes('고급')).click()",
+  );
+  await waitFor("!!document.querySelector('.handoff-card')");
+  await evaluate(
+    "[...document.querySelectorAll('button')].find(b=>b.textContent.includes('메쉬 · 파라미터 확인')).click()",
   );
   await waitFor(
     "document.querySelectorAll('input[type=range]').length>=22 && !document.body.innerText.includes('메쉬 계산 중')",
@@ -202,7 +255,7 @@ try {
     throw new Error(`Minimum UI font size below 12px: ${JSON.stringify(typography)}`);
   if (typography.paramTabs < 7)
     throw new Error(`Expected parameter group tabs, got ${JSON.stringify(typography)}`);
-  console.log("Daylight font-size floor (>=12px) and parameter tabs verified:", JSON.stringify(typography));
+  console.log("Daylight font-size floor (>=12px), 4+1 tabs, thumbnails, clean stage, and parameter tabs verified:", JSON.stringify(typography));
   await rpc("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-reduced-transparency", value: "reduce" }],
   });
@@ -212,16 +265,12 @@ try {
   if (reduced !== "none")
     throw new Error("Reduced transparency fallback failed");
   await rpc("Emulation.setEmulatedMedia", { features: [] });
-  const screenshot = await rpc("Page.captureScreenshot", { format: "png" });
-  writeFileSync(
-    resolve(dir, "native-ui.png"),
-    Buffer.from(screenshot.data, "base64"),
-  );
   if (exceptions.length) throw new Error(JSON.stringify(exceptions));
   const report = {
     passed: true,
     dragDrop: true,
     invalidDropRejected: true,
+    workflowTabs: ["prepare", "expressions", "adjust", "play", "advanced"],
     initialSurface: initial.surface,
     lightMode: { bodyBg: initial.bodyBg, panelBg: initial.panelBg },
     typography,
@@ -250,4 +299,7 @@ try {
 } finally {
   socket?.close();
   app.kill();
+  try {
+    rmSync(userDataDir, { recursive: true, force: true });
+  } catch {}
 }

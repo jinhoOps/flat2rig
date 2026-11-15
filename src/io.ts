@@ -2,19 +2,41 @@ import { zip, unzipSync, strToU8, strFromU8, type Zippable } from "fflate";
 import { writePsdUint8Array, readPsd } from "ag-psd";
 import {
   ALLOWED_BLEND_MODES,
+  createDefaultProjectRigState,
   describeDynamicPart,
   HAIR_ROLE_META,
   PART_DEFS,
   PARAM_DEFS,
   PARAM_GROUPS,
+  REST,
+  type ExpressionPreset,
   type HairRole,
+  type Parameters,
   type PartRole,
+  type PlaybackSettings,
   type Project,
   type Part,
+  type RigProfile,
+  type ShapePreset,
+  type ShapeRegion,
+  type ShapeSubstituteAsset,
+  type ShapeSubstituteLayer,
 } from "./types";
 import { bounds, effectiveMask } from "./engine";
 import { canvas, partCanvases, pngBytes } from "./images";
 import { buildRig } from "./native";
+
+const MAX_ZIP_FILE_BYTES = 160 * 1024 * 1024;
+const MAX_UNCOMPRESSED_ZIP_BYTES = 450 * 1024 * 1024;
+const MAX_SHAPE_PRESETS = 256;
+const MAX_EXPRESSION_PRESETS = 128;
+const MAX_SHAPE_ASSETS = 256;
+const MAX_ASSET_LAYERS = 16;
+const SAFE_ZIP_ID = /^[a-zA-Z0-9_-]{1,80}$/;
+const SHAPE_REGIONS: readonly ShapeRegion[] = ["eye_L", "eye_R", "mouth"];
+const PARAM_DEF_BOUNDS = new Map<keyof Parameters, { min: number; max: number }>(
+  PARAM_DEFS.map((d) => [d.key, { min: d.min, max: d.max }]),
+);
 
 export const safeName = (name: string) =>
   name.replace(/[^\p{L}\p{N}_.-]+/gu, "_").slice(0, 90) || "character";
@@ -27,13 +49,61 @@ export function pack(files: Zippable): Promise<Uint8Array> {
 }
 export async function saveProject(project: Project) {
   const files: Zippable = {};
-  const { parts, ...meta } = project;
+  const { parts, shapeAssets, ...meta } = project;
   const serializedParts = parts.map(({ mask: _, fillMask: __, ...p }) => p);
+  const serializedAssets: Record<string, ShapeSubstituteAsset> | undefined =
+    shapeAssets
+      ? Object.fromEntries(
+          Object.entries(shapeAssets).map(([assetId, asset]) => {
+            if (!SAFE_ZIP_ID.test(assetId) || asset.assetId !== assetId) {
+              throw new Error(`잘못된 쉐이프 에셋 ID입니다: ${assetId}`);
+            }
+            const cleanLayers: ShapeSubstituteLayer[] = asset.layers.map(
+              (layer) => {
+                if (!SAFE_ZIP_ID.test(layer.partId)) {
+                  throw new Error(`잘못된 쉐이프 파츠 ID입니다: ${layer.partId}`);
+                }
+                if (layer.mask) {
+                  files[`shapes/${assetId}/${layer.partId}.bin`] = layer.mask;
+                }
+                if (layer.fillMask) {
+                  files[`shapes/${assetId}/${layer.partId}.fill.bin`] =
+                    layer.fillMask;
+                }
+                if (layer.pngBytes) {
+                  files[`shapes/${assetId}/${layer.partId}.png`] =
+                    layer.pngBytes;
+                }
+                const {
+                  mask: _m,
+                  fillMask: _fm,
+                  pngBytes: _png,
+                  ...restLayer
+                } = layer;
+                return {
+                  ...restLayer,
+                  hasMask: Boolean(layer.mask),
+                  hasFillMask: Boolean(layer.fillMask),
+                  hasTexturePng: Boolean(layer.pngBytes),
+                };
+              },
+            );
+            return [
+              assetId,
+              {
+                ...asset,
+                layers: cleanLayers,
+              },
+            ];
+          }),
+        )
+      : undefined;
   files["project.json"] = strToU8(
     JSON.stringify({
       ...meta,
-      schemaVersion: 2,
+      schemaVersion: 3,
       parts: serializedParts,
+      ...(serializedAssets ? { shapeAssets: serializedAssets } : {}),
     }),
   );
   for (const p of parts) {
@@ -50,34 +120,63 @@ function validDataURL(v: unknown): v is string {
     /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(v)
   );
 }
-function migrateV1ToV2(p: Record<string, unknown>, parts: Part[]): Project {
+function inferLegacyProportionMode(p: Record<string, unknown>): "ld" | "sd" {
+  const sm = p.styleMatch as
+    | { resolved?: { proportionMode?: unknown } }
+    | undefined;
+  const sel = p.styleSelection as { proportionMode?: unknown } | undefined;
+  if (sm?.resolved?.proportionMode === "sd" || sel?.proportionMode === "sd") {
+    return "sd";
+  }
+  return "ld";
+}
+function migrateLegacyToV3(
+  p: Record<string, unknown>,
+  parts: Part[],
+  fromVersion: 1 | 2,
+): Project {
   const landmarks = p.landmarks as Project["landmarks"];
+  const width = p.width as number;
+  const height = p.height as number;
+  const origW = (p.originalWidth as number) || width;
+  const origH = (p.originalHeight as number) || height;
+  const defaults = createDefaultProjectRigState(inferLegacyProportionMode(p));
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     name: p.name as string,
-    width: p.width as number,
-    height: p.height as number,
-    originalWidth: (p.originalWidth as number) || (p.width as number),
-    originalHeight: (p.originalHeight as number) || (p.height as number),
+    width,
+    height,
+    originalWidth: origW,
+    originalHeight: origH,
     source: p.source as string,
     original: p.original as string,
-    workToOriginalTransform: {
-      matrix2: [
-        ((p.originalWidth as number) || (p.width as number)) / (p.width as number),
-        0,
-        0,
-        ((p.originalHeight as number) || (p.height as number)) / (p.height as number),
-        ],
-      translation: [0, 0],
-    },
+    imageHash: typeof p.imageHash === "string" ? p.imageHash : undefined,
+    workToOriginalTransform:
+      (p.workToOriginalTransform as Project["workToOriginalTransform"]) ?? {
+        matrix2: [origW / width, 0, 0, origH / height],
+        translation: [0, 0],
+      },
     landmarks,
-    landmarkProvenance: {
-      eyeL: "manual",
-      eyeR: "manual",
-      mouth: "manual",
-      chin: "manual",
-      crown: "manual",
-    },
+    landmarkProvenance:
+      fromVersion === 1
+        ? {
+            eyeL: "manual",
+            eyeR: "manual",
+            mouth: "manual",
+            chin: "manual",
+            crown: "manual",
+          }
+        : ((p.landmarkProvenance as Project["landmarkProvenance"]) ?? {
+            eyeL: "estimated",
+            eyeR: "estimated",
+            mouth: "estimated",
+            chin: "estimated",
+            crown: "estimated",
+          }),
+    landmarks28: p.landmarks28 as Project["landmarks28"],
+    faceCandidates: p.faceCandidates as Project["faceCandidates"],
+    selectedFaceId:
+      typeof p.selectedFaceId === "number" ? p.selectedFaceId : undefined,
     parts: parts.map((part, index) => ({
       ...part,
       blendMode: part.blendMode ?? "normal",
@@ -86,28 +185,529 @@ function migrateV1ToV2(p: Record<string, unknown>, parts: Part[]): Project {
       compositeOrder: part.compositeOrder ?? index,
     })),
     revision: 0,
-    provider: (p.provider as string) || "migrated-v1",
+    provider: (p.provider as string) || `migrated-v${fromVersion}`,
     modelHash: typeof p.modelHash === "string" ? p.modelHash : undefined,
-    analysisStatus: "idle",
+    modelHashes: p.modelHashes as Project["modelHashes"],
+    postprocessVersions:
+      p.postprocessVersions as Project["postprocessVersions"],
+    analysisStatus: (p.analysisStatus as Project["analysisStatus"]) ?? "idle",
+    analysisNote:
+      typeof p.analysisNote === "string" ? p.analysisNote : undefined,
+    detailMode: p.detailMode as Project["detailMode"],
+    styleMatch: p.styleMatch as Project["styleMatch"],
+    styleSelection: p.styleSelection as Project["styleSelection"],
+    ...defaults,
     createdAt: (p.createdAt as string) || new Date().toISOString(),
   };
 }
+
+function validPngBytesForBounds(
+  png: Uint8Array,
+  expectedWidth: number,
+  expectedHeight: number,
+): boolean {
+  if (png.length < 24) return false;
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (let i = 0; i < sig.length; i++) {
+    if (png[i] !== sig[i]) return false;
+  }
+  const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
+  return (
+    view.getUint32(16, false) === expectedWidth &&
+    view.getUint32(20, false) === expectedHeight
+  );
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function validateParamMap(
+  raw: unknown,
+  context: string,
+): Partial<Parameters> {
+  if (!isPlainObject(raw)) {
+    throw new Error(`잘못된 ${context} 파라미터 정보입니다.`);
+  }
+  const out: Partial<Parameters> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const key = k as keyof Parameters;
+    const range = PARAM_DEF_BOUNDS.get(key);
+    if (!range || typeof v !== "number" || !Number.isFinite(v)) {
+      throw new Error(`잘못된 ${context} 파라미터 키 또는 값(${k})입니다.`);
+    }
+    if (v < range.min - 1e-4 || v > range.max + 1e-4) {
+      throw new Error(
+        `${context} 파라미터(${k}=${v})가 허용 범위(${range.min}..${range.max})를 벗어났습니다.`,
+      );
+    }
+    out[key] = v;
+  }
+  return out;
+}
+
+function validateShapeHandles(raw: unknown): ShapePreset["handles"] {
+  if (!isPlainObject(raw)) {
+    throw new Error("잘못된 쉐이프 핸들 정보입니다.");
+  }
+  const check = (
+    name: keyof ShapePreset["handles"],
+    min: number,
+    max: number,
+  ): number => {
+    const v = raw[name];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
+      throw new Error(`잘못된 쉐이프 핸들 값(${String(name)})입니다.`);
+    }
+    return v;
+  };
+  return {
+    width: check("width", 0.25, 2.5),
+    open: check("open", 0, 2),
+    roundness: check("roundness", 0, 1),
+    corner: check("corner", -1.5, 1.5),
+    upperCurve: check("upperCurve", -1.5, 1.5),
+    lowerCurve: check("lowerCurve", -1.5, 1.5),
+    interiorVisibility: check("interiorVisibility", 0, 1),
+    offsetX: check("offsetX", -1, 1),
+    offsetY: check("offsetY", -1, 1),
+  };
+}
+
+function hydrateAndValidateV3Fields(
+  p: Record<string, unknown>,
+  files: Record<string, Uint8Array>,
+  width: number,
+  height: number,
+): Pick<
+  Project,
+  | "rigProfile"
+  | "shapePresets"
+  | "shapeAssets"
+  | "expressions"
+  | "activeExpressionId"
+  | "playback"
+> {
+  let shapeAssets: Record<string, ShapeSubstituteAsset> | undefined;
+  if (p.shapeAssets !== undefined) {
+    if (!isPlainObject(p.shapeAssets)) {
+      throw new Error("잘못된 쉐이프 대체 에셋 정보입니다.");
+    }
+    const entries = Object.entries(p.shapeAssets);
+    if (entries.length > MAX_SHAPE_ASSETS) {
+      throw new Error("쉐이프 대체 에셋 개수가 제한을 초과했습니다.");
+    }
+    shapeAssets = {};
+    for (const [assetId, rawAsset] of entries) {
+      if (
+        !SAFE_ZIP_ID.test(assetId) ||
+        !isPlainObject(rawAsset) ||
+        rawAsset.assetId !== assetId ||
+        !SHAPE_REGIONS.includes(rawAsset.region as ShapeRegion) ||
+        typeof rawAsset.recipeVersion !== "number" ||
+        !Number.isInteger(rawAsset.recipeVersion) ||
+        rawAsset.recipeVersion < 1 ||
+        !Array.isArray(rawAsset.hidesPartIds) ||
+        rawAsset.hidesPartIds.length > 64 ||
+        rawAsset.hidesPartIds.some(
+          (id) => typeof id !== "string" || !SAFE_ZIP_ID.test(id),
+        ) ||
+        !Array.isArray(rawAsset.layers) ||
+        rawAsset.layers.length < 1 ||
+        rawAsset.layers.length > MAX_ASSET_LAYERS
+      ) {
+        throw new Error(`잘못된 쉐이프 대체 에셋(${assetId})입니다.`);
+      }
+      const seenLayerIds = new Set<string>();
+      const hydratedLayers: ShapeSubstituteLayer[] = [];
+      for (const rawLayer of rawAsset.layers) {
+        if (
+          !isPlainObject(rawLayer) ||
+          typeof rawLayer.partId !== "string" ||
+          !SAFE_ZIP_ID.test(rawLayer.partId) ||
+          seenLayerIds.has(rawLayer.partId) ||
+          (rawLayer.blendMode !== undefined &&
+            !ALLOWED_BLEND_MODES.includes(
+              rawLayer.blendMode as (typeof ALLOWED_BLEND_MODES)[number],
+            ))
+        ) {
+          throw new Error(`잘못된 쉐이프 대체 레이어(${assetId})입니다.`);
+        }
+        seenLayerIds.add(rawLayer.partId);
+        const b = rawLayer.bounds;
+        if (
+          !isPlainObject(b) ||
+          !Number.isInteger(b.left) ||
+          !Number.isInteger(b.top) ||
+          !Number.isInteger(b.width) ||
+          !Number.isInteger(b.height) ||
+          (b.width as number) < 1 ||
+          (b.height as number) < 1 ||
+          (b.left as number) < 0 ||
+          (b.top as number) < 0 ||
+          (b.left as number) + (b.width as number) > width ||
+          (b.top as number) + (b.height as number) > height
+        ) {
+          throw new Error(
+            `쉐이프 대체 레이어 경계(bounds)가 캔버스 범위를 벗어났습니다: ${assetId}/${rawLayer.partId}`,
+          );
+        }
+        const bw = b.width as number;
+        const bh = b.height as number;
+        const hasMask = rawLayer.hasMask !== false;
+        const maskFile = files[`shapes/${assetId}/${rawLayer.partId}.bin`];
+        if (hasMask) {
+          if (!maskFile || maskFile.length !== bw * bh) {
+            throw new Error(
+              `쉐이프 대체 마스크 크기가 일치하지 않습니다: ${assetId}/${rawLayer.partId}`,
+            );
+          }
+        } else if (maskFile && maskFile.length !== bw * bh) {
+          throw new Error(
+            `쉐이프 대체 마스크 크기가 일치하지 않습니다: ${assetId}/${rawLayer.partId}`,
+          );
+        }
+        const fillFile =
+          files[`shapes/${assetId}/${rawLayer.partId}.fill.bin`];
+        if (
+          (rawLayer.hasFillMask === true && !fillFile) ||
+          (fillFile && fillFile.length !== bw * bh)
+        ) {
+          throw new Error(
+            `쉐이프 대체 가림 보완 마스크가 손상되었습니다: ${assetId}/${rawLayer.partId}`,
+          );
+        }
+        const pngFile = files[`shapes/${assetId}/${rawLayer.partId}.png`];
+        if (rawLayer.hasTexturePng === true) {
+          if (!pngFile || !validPngBytesForBounds(pngFile, bw, bh)) {
+            throw new Error(
+              `쉐이프 대체 PNG 이미지가 손상되었거나 크기가 일치하지 않습니다: ${assetId}/${rawLayer.partId}`,
+            );
+          }
+        } else if (pngFile && !validPngBytesForBounds(pngFile, bw, bh)) {
+          throw new Error(
+            `쉐이프 대체 PNG 이미지가 손상되었거나 크기가 일치하지 않습니다: ${assetId}/${rawLayer.partId}`,
+          );
+        }
+        if (!maskFile && !pngFile) {
+          throw new Error(
+            `쉐이프 대체 레이어에 마스크나 텍스처가 없습니다: ${assetId}/${rawLayer.partId}`,
+          );
+        }
+        hydratedLayers.push({
+          partId: rawLayer.partId,
+          ...(rawLayer.blendMode !== undefined
+            ? {
+                blendMode:
+                  rawLayer.blendMode as ShapeSubstituteLayer["blendMode"],
+              }
+            : {}),
+          bounds: {
+            left: b.left as number,
+            top: b.top as number,
+            width: bw,
+            height: bh,
+          },
+          ...(Array.isArray(rawLayer.hidesPartIds)
+            ? { hidesPartIds: rawLayer.hidesPartIds as string[] }
+            : {}),
+          ...(maskFile ? { mask: maskFile, hasMask: true } : { hasMask: false }),
+          ...(fillFile ? { fillMask: fillFile, hasFillMask: true } : {}),
+          ...(pngFile ? { pngBytes: pngFile, hasTexturePng: true } : {}),
+        });
+      }
+      shapeAssets[assetId] = {
+        assetId,
+        region: rawAsset.region as ShapeRegion,
+        recipeVersion: rawAsset.recipeVersion,
+        hidesPartIds: rawAsset.hidesPartIds as string[],
+        layers: hydratedLayers,
+      };
+    }
+  }
+
+  for (const zipPath of Object.keys(files)) {
+    if (!zipPath.startsWith("shapes/")) continue;
+    const parts = zipPath.split("/");
+    const assetId = parts[1];
+    if (!assetId || !shapeAssets || !shapeAssets[assetId]) {
+      throw new Error(
+        `참조되지 않은 쉐이프 에셋 파일이 포함되어 있습니다: ${zipPath}`,
+      );
+    }
+  }
+
+  if (
+    !Array.isArray(p.shapePresets) ||
+    p.shapePresets.length < 1 ||
+    p.shapePresets.length > MAX_SHAPE_PRESETS
+  ) {
+    throw new Error("잘못된 쉐이프 프리셋 목록입니다.");
+  }
+  const shapeById = new Map<string, ShapePreset>();
+  const shapePresets: ShapePreset[] = p.shapePresets.map((raw) => {
+    if (
+      !isPlainObject(raw) ||
+      typeof raw.id !== "string" ||
+      !SAFE_ZIP_ID.test(raw.id) ||
+      shapeById.has(raw.id) ||
+      !SHAPE_REGIONS.includes(raw.region as ShapeRegion) ||
+      typeof raw.label !== "string" ||
+      raw.label.trim().length < 1 ||
+      raw.label.length > 120 ||
+      typeof raw.kind !== "string" ||
+      typeof raw.recipeVersion !== "number" ||
+      !Number.isInteger(raw.recipeVersion) ||
+      raw.recipeVersion < 1
+    ) {
+      throw new Error("잘못된 쉐이프 프리셋 형식입니다.");
+    }
+    if (raw.assetId !== undefined) {
+      if (
+        typeof raw.assetId !== "string" ||
+        !shapeAssets ||
+        !shapeAssets[raw.assetId] ||
+        shapeAssets[raw.assetId].region !== raw.region
+      ) {
+        throw new Error(
+          `쉐이프 프리셋(${raw.id})이 유효하지 않은 대체 에셋(${String(raw.assetId)})을 참조합니다.`,
+        );
+      }
+    }
+    const preset: ShapePreset = {
+      id: raw.id,
+      region: raw.region as ShapeRegion,
+      label: raw.label,
+      kind: raw.kind as ShapePreset["kind"],
+      recipeVersion: raw.recipeVersion,
+      ...(typeof raw.builtIn === "boolean" ? { builtIn: raw.builtIn } : {}),
+      ...(typeof raw.mirrorLinked === "boolean"
+        ? { mirrorLinked: raw.mirrorLinked }
+        : {}),
+      handles: validateShapeHandles(raw.handles),
+      parameterOverrides: validateParamMap(
+        raw.parameterOverrides,
+        `쉐이프(${raw.id})`,
+      ),
+      ...(raw.assetId !== undefined ? { assetId: raw.assetId as string } : {}),
+    };
+    shapeById.set(preset.id, preset);
+    return preset;
+  });
+
+  if (
+    !Array.isArray(p.expressions) ||
+    p.expressions.length < 1 ||
+    p.expressions.length > MAX_EXPRESSION_PRESETS
+  ) {
+    throw new Error("잘못된 표정 프리셋 목록입니다.");
+  }
+  const expById = new Map<string, ExpressionPreset>();
+  const expressions: ExpressionPreset[] = p.expressions.map((raw) => {
+    if (
+      !isPlainObject(raw) ||
+      typeof raw.id !== "string" ||
+      !SAFE_ZIP_ID.test(raw.id) ||
+      expById.has(raw.id) ||
+      typeof raw.name !== "string" ||
+      raw.name.trim().length < 1 ||
+      raw.name.length > 120 ||
+      !isPlainObject(raw.shapeIds) ||
+      typeof raw.strength !== "number" ||
+      !Number.isFinite(raw.strength) ||
+      raw.strength < 0 ||
+      raw.strength > 1.5 ||
+      typeof raw.transitionMs !== "number" ||
+      !Number.isFinite(raw.transitionMs) ||
+      raw.transitionMs < 0 ||
+      raw.transitionMs > 3000
+    ) {
+      throw new Error("잘못된 표정 프리셋 형식입니다.");
+    }
+    const shapeIds: ExpressionPreset["shapeIds"] = {};
+    for (const region of SHAPE_REGIONS) {
+      const refId = raw.shapeIds[region];
+      if (refId !== undefined) {
+        if (
+          typeof refId !== "string" ||
+          shapeById.get(refId)?.region !== region
+        ) {
+          throw new Error(
+            `표정(${raw.id})이 존재하지 않거나 부위가 다른 쉐이프(${String(refId)})를 참조합니다.`,
+          );
+        }
+        shapeIds[region] = refId;
+      }
+    }
+    const exp: ExpressionPreset = {
+      id: raw.id,
+      name: raw.name,
+      ...(typeof raw.builtIn === "boolean" ? { builtIn: raw.builtIn } : {}),
+      shapeIds,
+      parameters: validateParamMap(raw.parameters, `표정(${raw.id})`),
+      ...(isPlainObject(raw.handleTweaks)
+        ? {
+            handleTweaks:
+              raw.handleTweaks as ExpressionPreset["handleTweaks"],
+          }
+        : {}),
+      strength: raw.strength,
+      transitionMs: raw.transitionMs,
+      ...(typeof raw.shortcutKey === "string"
+        ? { shortcutKey: raw.shortcutKey }
+        : {}),
+    };
+    expById.set(exp.id, exp);
+    return exp;
+  });
+
+  const rp = p.rigProfile;
+  if (
+    !isPlainObject(rp) ||
+    (rp.proportionMode !== "ld" && rp.proportionMode !== "sd") ||
+    !isPlainObject(rp.defaultShapeIds) ||
+    !isPlainObject(rp.neutralParameters) ||
+    !isPlainObject(rp.safeBounds) ||
+    !isPlainObject(rp.motionScale)
+  ) {
+    throw new Error("잘못된 리깅 프로필 정보입니다.");
+  }
+  for (const region of SHAPE_REGIONS) {
+    const defId = rp.defaultShapeIds[region];
+    if (typeof defId !== "string" || shapeById.get(defId)?.region !== region) {
+      throw new Error(
+        `리깅 프로필 기본 쉐이프(${region}=${String(defId)}) 참조가 유효하지 않습니다.`,
+      );
+    }
+  }
+  const neutralRaw = validateParamMap(rp.neutralParameters, "기본 포즈");
+  for (const k of Object.keys(REST) as (keyof Parameters)[]) {
+    if (typeof neutralRaw[k] !== "number") {
+      throw new Error(`리깅 기본 포즈에 필수 파라미터(${k})가 누락되었습니다.`);
+    }
+  }
+  const validatedBounds: RigProfile["safeBounds"] = {};
+  for (const [k, rawRange] of Object.entries(rp.safeBounds)) {
+    const key = k as keyof Parameters;
+    const defRange = PARAM_DEF_BOUNDS.get(key);
+    if (
+      !defRange ||
+      !isPlainObject(rawRange) ||
+      typeof rawRange.min !== "number" ||
+      typeof rawRange.max !== "number" ||
+      !Number.isFinite(rawRange.min) ||
+      !Number.isFinite(rawRange.max) ||
+      rawRange.min > rawRange.max ||
+      rawRange.min < defRange.min - 1e-4 ||
+      rawRange.max > defRange.max + 1e-4
+    ) {
+      throw new Error(`잘못된 리깅 안전 범위(${k})입니다.`);
+    }
+    validatedBounds[key] = { min: rawRange.min, max: rawRange.max };
+  }
+  const scaleKeys = ["head", "eyes", "mouth", "hair", "body"] as const;
+  const motionScale = {} as RigProfile["motionScale"];
+  for (const sk of scaleKeys) {
+    const sv = rp.motionScale[sk];
+    if (typeof sv !== "number" || !Number.isFinite(sv) || sv < 0 || sv > 3) {
+      throw new Error(`잘못된 모션 강도 배율(${sk})입니다.`);
+    }
+    motionScale[sk] = sv;
+  }
+  const rigProfile: RigProfile = {
+    proportionMode: rp.proportionMode,
+    defaultShapeIds: {
+      eye_L: rp.defaultShapeIds.eye_L as string,
+      eye_R: rp.defaultShapeIds.eye_R as string,
+      mouth: rp.defaultShapeIds.mouth as string,
+    },
+    neutralParameters: neutralRaw as Parameters,
+    safeBounds: validatedBounds,
+    motionScale,
+    ...(isPlainObject(rp.clippingTargets)
+      ? {
+          clippingTargets: rp.clippingTargets as Record<string, string>,
+        }
+      : {}),
+  };
+
+  if (
+    typeof p.activeExpressionId !== "string" ||
+    !expById.has(p.activeExpressionId)
+  ) {
+    throw new Error("활성 표정 ID가 표정 목록에 없습니다.");
+  }
+  const pb = p.playback;
+  if (
+    !isPlainObject(pb) ||
+    typeof pb.defaultExpressionId !== "string" ||
+    !expById.has(pb.defaultExpressionId) ||
+    typeof pb.autoBlink !== "boolean" ||
+    typeof pb.autoBreath !== "boolean" ||
+    typeof pb.autoIdle !== "boolean" ||
+    typeof pb.blinkIntervalSec !== "number" ||
+    !Number.isFinite(pb.blinkIntervalSec) ||
+    pb.blinkIntervalSec < 0.5 ||
+    pb.blinkIntervalSec > 30 ||
+    !isPlainObject(pb.shortcuts)
+  ) {
+    throw new Error("잘못된 재생 설정입니다.");
+  }
+  const shortcuts: Record<string, string> = {};
+  for (const [key, expId] of Object.entries(pb.shortcuts)) {
+    if (typeof expId !== "string" || !expById.has(expId)) {
+      throw new Error(`재생 단축키(${key})가 존재하지 않는 표정을 참조합니다.`);
+    }
+    shortcuts[key] = expId;
+  }
+  const playback: PlaybackSettings = {
+    defaultExpressionId: pb.defaultExpressionId,
+    autoBlink: pb.autoBlink,
+    blinkIntervalSec: pb.blinkIntervalSec,
+    autoBreath: pb.autoBreath,
+    autoIdle: pb.autoIdle,
+    ...(typeof pb.autoMouthDemo === "boolean"
+      ? { autoMouthDemo: pb.autoMouthDemo }
+      : {}),
+    shortcuts,
+  };
+
+  return {
+    rigProfile,
+    shapePresets,
+    ...(shapeAssets ? { shapeAssets } : {}),
+    expressions,
+    activeExpressionId: p.activeExpressionId,
+    playback,
+  };
+}
+
 export function loadProject(bytes: Uint8Array): Project {
-  if (bytes.length > 160 * 1024 * 1024)
+  if (bytes.length > MAX_ZIP_FILE_BYTES)
     throw new Error("프로젝트 파일이 너무 큽니다.");
   let total = 0;
   const files = unzipSync(bytes, {
     filter: (f) => {
       total += f.originalSize;
-      if (total > 450 * 1024 * 1024 || f.originalSize > 100 * 1024 * 1024)
+      if (
+        total > MAX_UNCOMPRESSED_ZIP_BYTES ||
+        f.originalSize > 100 * 1024 * 1024
+      )
         throw new Error("프로젝트 압축 해제 한도를 초과했습니다.");
       return true;
     },
   });
+  let actualTotal = 0;
+  for (const entry of Object.values(files)) {
+    actualTotal += entry.byteLength;
+    if (actualTotal > MAX_UNCOMPRESSED_ZIP_BYTES) {
+      throw new Error("프로젝트 압축 해제 한도를 초과했습니다.");
+    }
+  }
   if (!files["project.json"]) throw new Error("flat2rig 프로젝트가 아닙니다.");
   const p = JSON.parse(strFromU8(files["project.json"]));
   if (
-    (p.schemaVersion !== 1 && p.schemaVersion !== 2) ||
+    (p.schemaVersion !== 1 && p.schemaVersion !== 2 && p.schemaVersion !== 3) ||
     !Number.isInteger(p.width) ||
     !Number.isInteger(p.height) ||
     p.width < 1 ||
@@ -173,11 +773,16 @@ export function loadProject(bytes: Uint8Array): Project {
     )
       throw new Error("잘못된 랜드마크입니다.");
   }
-  if (p.schemaVersion === 1) {
-    return migrateV1ToV2(p, p.parts as Part[]);
+  if (p.schemaVersion === 1 || p.schemaVersion === 2) {
+    return migrateLegacyToV3(p, p.parts as Part[], p.schemaVersion);
   }
-  p.revision = 0;
-  return p as Project;
+  const v3Fields = hydrateAndValidateV3Fields(p, files, p.width, p.height);
+  return {
+    ...(p as Project),
+    ...v3Fields,
+    schemaVersion: 3,
+    revision: 0,
+  };
 }
 function quote(value: unknown) {
   return `"${String(value ?? "").replace(/"/g, '""')}"`;

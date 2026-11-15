@@ -28,7 +28,30 @@ import {
   readCsvTemplate,
   saveProject,
 } from "../src/io";
-import { PARAM_DEFS, REST, type Project } from "../src/types";
+import {
+  createDefaultProjectRigState,
+  DEFAULT_MOUTH_HANDLES,
+  PARAM_DEFS,
+  REST,
+  type Project,
+} from "../src/types";
+import {
+  createCustomExpression,
+  createUndoHistory,
+  deleteExpressionPreset,
+  saveNeutralParameters,
+  selectExpressionPreset,
+  updateShapePresetHandles,
+} from "../src/rig/state";
+import { createPhysicsState, evaluateRigFrame } from "../src/rig/evaluate";
+import {
+  buildAllPartMeshes,
+  buildAllPartTextures,
+  buildProjectSubstituteTextures,
+  renderCharacterFrame,
+  renderDeterministicSnapshot,
+} from "../src/rig/render";
+import { synthesizeShapeAssetsForProject } from "../src/rig/shapes";
 
 function flattenPsdLayers<T extends { children?: T[] }>(layers?: T[]): T[] {
   const out: T[] = [];
@@ -67,7 +90,7 @@ function fixture(): Project {
     ),
     landmarks = defaultLandmarks(width, height);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     name: "테스트 캐릭터",
     width,
     height,
@@ -91,6 +114,7 @@ function fixture(): Project {
     })),
     revision: 3,
     provider: "geometry-template-v1 (browser fallback)",
+    ...createDefaultProjectRigState("ld"),
     createdAt: "2026-11-15T00:00:00Z",
   };
 }
@@ -315,12 +339,17 @@ describe("persistent project and export contract", () => {
     p.parts[1].visible = false;
     p.parts[2].status = "missing";
     const restored = loadProject(await saveProject(p));
-    expect(restored.schemaVersion).toBe(2);
+    expect(restored.schemaVersion).toBe(3);
     expect(restored.name).toBe(p.name);
     expect(restored.source).toBe(p.source);
     expect(restored.landmarks).toEqual(p.landmarks);
     expect(restored.styleSelection).toEqual(p.styleSelection);
     expect(restored.styleMatch).toEqual(p.styleMatch);
+    expect(restored.rigProfile).toEqual(p.rigProfile);
+    expect(restored.shapePresets).toEqual(p.shapePresets);
+    expect(restored.expressions).toEqual(p.expressions);
+    expect(restored.activeExpressionId).toBe(p.activeExpressionId);
+    expect(restored.playback).toEqual(p.playback);
     expect(restored.parts[0].fillKind).toBe("template");
     expect(
       restored.parts.map((part) => ({
@@ -336,26 +365,126 @@ describe("persistent project and export contract", () => {
       })),
     );
   });
-  it("migrates legacy schemaVersion 1 projects to v2 preserving landmarks", async () => {
-    const v2 = fixture();
+  it("migrates legacy schemaVersion 1 and 2 projects to v3 with defaults and landmarks", async () => {
+    const v3 = fixture();
     const {
       landmarkProvenance: _lp,
       schemaVersion: _sv,
+      rigProfile: _rp,
+      shapePresets: _sp,
+      expressions: _ex,
+      activeExpressionId: _ae,
+      playback: _pb,
       ...legacyBase
-    } = v2;
-    const legacyFiles = unzipSync(await saveProject(v2));
-    const legacyMeta = {
+    } = v3;
+    const legacyFiles = unzipSync(await saveProject(v3));
+    const v1Meta = {
       ...legacyBase,
       schemaVersion: 1,
-      parts: v2.parts.map(({ mask: _, provenance: _p, fillKind: _f, compositeOrder: _c, ...rest }) => rest),
+      parts: v3.parts.map(({ mask: _, provenance: _p, fillKind: _f, compositeOrder: _c, ...rest }) => rest),
     };
-    legacyFiles["project.json"] = strToU8(JSON.stringify(legacyMeta));
-    const migrated = loadProject(zipSync(legacyFiles));
-    expect(migrated.schemaVersion).toBe(2);
-    expect(migrated.landmarks).toEqual(v2.landmarks);
-    expect(migrated.landmarkProvenance?.eyeL).toBe("manual");
-    expect(migrated.parts.length).toBe(18);
-    expect(migrated.parts[0].provenance).toBe("geometry");
+    legacyFiles["project.json"] = strToU8(JSON.stringify(v1Meta));
+    const migratedV1 = loadProject(zipSync(legacyFiles));
+    expect(migratedV1.schemaVersion).toBe(3);
+    expect(migratedV1.landmarks).toEqual(v3.landmarks);
+    expect(migratedV1.landmarkProvenance?.eyeL).toBe("manual");
+    expect(migratedV1.parts.length).toBe(18);
+    expect(migratedV1.parts[0].provenance).toBe("geometry");
+    expect(migratedV1.rigProfile.defaultShapeIds.eye_L).toBe("eye_L_original");
+    expect(migratedV1.expressions.length).toBeGreaterThanOrEqual(8);
+    expect(migratedV1.playback.defaultExpressionId).toBe("neutral");
+
+    const v2Meta = {
+      ...legacyBase,
+      landmarkProvenance: v3.landmarkProvenance,
+      styleSelection: { proportionMode: "sd" as const },
+      schemaVersion: 2,
+      parts: v3.parts.map(({ mask: _, ...rest }) => rest),
+    };
+    legacyFiles["project.json"] = strToU8(JSON.stringify(v2Meta));
+    const migratedV2 = loadProject(zipSync(legacyFiles));
+    expect(migratedV2.schemaVersion).toBe(3);
+    expect(migratedV2.rigProfile.proportionMode).toBe("sd");
+    expect(migratedV2.shapePresets.length).toBeGreaterThanOrEqual(15);
+  });
+  it("round-trips and strictly validates ZIP shape substitute assets and v3 guards", async () => {
+    const p = fixture();
+    const bw = 16;
+    const bh = 12;
+    const spriteCanvas = createCanvas(bw, bh);
+    const sg = spriteCanvas.getContext("2d");
+    sg.fillStyle = "#4b2c3b";
+    sg.fillRect(2, 2, 12, 8);
+    const pngBuf = new Uint8Array(spriteCanvas.toBuffer("image/png"));
+    const subMask = new Uint8Array(bw * bh).fill(255);
+    p.shapeAssets = {
+      asset_smile_l: {
+        assetId: "asset_smile_l",
+        region: "eye_L",
+        recipeVersion: 1,
+        hidesPartIds: ["eyeL_upper", "eyeL_white", "eyeL_iris"],
+        layers: [
+          {
+            partId: "eyeL_closed_arc",
+            blendMode: "normal",
+            bounds: { left: 32, top: 14, width: bw, height: bh },
+            mask: subMask,
+            pngBytes: pngBuf,
+          },
+        ],
+      },
+    };
+    const smilePreset = p.shapePresets.find((s) => s.id === "eye_L_smiling")!;
+    smilePreset.assetId = "asset_smile_l";
+
+    const packed = await saveProject(p);
+    const zipEntries = unzipSync(packed);
+    expect(zipEntries["shapes/asset_smile_l/eyeL_closed_arc.bin"]).toBeDefined();
+    expect(zipEntries["shapes/asset_smile_l/eyeL_closed_arc.png"]).toBeDefined();
+
+    const restored = loadProject(packed);
+    expect(restored.shapeAssets?.asset_smile_l.layers[0].mask?.length).toBe(bw * bh);
+    expect(restored.shapeAssets?.asset_smile_l.layers[0].pngBytes?.slice(0, 4)).toEqual(
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+    );
+
+    // Reject missing shape asset ref
+    const brokenRef = unzipSync(packed);
+    const metaBrokenRef = JSON.parse(strFromU8(brokenRef["project.json"]));
+    metaBrokenRef.shapePresets[0].assetId = "missing_asset_id";
+    brokenRef["project.json"] = strToU8(JSON.stringify(metaBrokenRef));
+    expect(() => loadProject(zipSync(brokenRef))).toThrow("대체 에셋");
+
+    // Reject out-of-bounds substitute bounds
+    const badBounds = unzipSync(packed);
+    const metaBadBounds = JSON.parse(strFromU8(badBounds["project.json"]));
+    metaBadBounds.shapeAssets.asset_smile_l.layers[0].bounds = {
+      left: 56,
+      top: 14,
+      width: 16,
+      height: 12,
+    };
+    badBounds["project.json"] = strToU8(JSON.stringify(metaBadBounds));
+    expect(() => loadProject(zipSync(badBounds))).toThrow("경계");
+
+    // Reject wrong substitute mask size
+    const badMask = unzipSync(packed);
+    badMask["shapes/asset_smile_l/eyeL_closed_arc.bin"] = new Uint8Array(10);
+    expect(() => loadProject(zipSync(badMask))).toThrow("마스크 크기");
+
+    // Reject future schemaVersion
+    const futureSchema = unzipSync(packed);
+    const metaFuture = JSON.parse(strFromU8(futureSchema["project.json"]));
+    metaFuture.schemaVersion = 99;
+    futureSchema["project.json"] = strToU8(JSON.stringify(metaFuture));
+    expect(() => loadProject(zipSync(futureSchema))).toThrow("형식");
+
+    // Reject expression referencing missing shape ID
+    const badExpRef = unzipSync(packed);
+    const metaBadExp = JSON.parse(strFromU8(badExpRef["project.json"]));
+    metaBadExp.expressions[0].shapeIds.mouth = "nonexistent_mouth";
+    badExpRef["project.json"] = strToU8(JSON.stringify(metaBadExp));
+    expect(() => loadProject(zipSync(badExpRef))).toThrow("쉐이프");
   });
   it("rejects corrupted dimensions and missing masks", async () => {
     const files = unzipSync(await saveProject(fixture()));
@@ -725,5 +854,438 @@ describe("preserved part merging on regeneration", () => {
     b.mask[overlapIdx] = 200;
 
     expect(() => mergePreservedParts(p.parts, p.parts)).toThrow(/겹쳐 있어/);
+  });
+
+  it("batches shape/expression drags into single undo/redo steps and protects built-in defaults", () => {
+    const p0 = fixture();
+    const history = createUndoHistory(p0);
+    history.beginDrag();
+    const pMid = updateShapePresetHandles(p0, "eye_L_half_closed", { open: 0.38 }, true);
+    history.previewDrag(pMid);
+    const pFinal = updateShapePresetHandles(pMid, "eye_L_half_closed", { open: 0.3 }, true);
+    history.previewDrag(pFinal);
+    const afterCommit = history.commitDrag();
+
+    expect(afterCommit.past.length).toBe(1);
+    expect(afterCommit.current.shapePresets.find((s) => s.id === "eye_L_half_closed")?.handles.open).toBeCloseTo(0.3, 6);
+    expect(afterCommit.current.shapePresets.find((s) => s.id === "eye_R_half_closed")?.handles.open).toBeCloseTo(0.3, 6);
+
+    const undone = history.undo();
+    expect(undone.current.shapePresets.find((s) => s.id === "eye_L_half_closed")?.handles.open).toBeCloseTo(0.45, 6);
+    expect(undone.future.length).toBe(1);
+    const redone = history.redo();
+    expect(redone.current.shapePresets.find((s) => s.id === "eye_L_half_closed")?.handles.open).toBeCloseTo(0.3, 6);
+
+    const { project: withCustom, expression: custom } = createCustomExpression(
+      redone.current,
+      "커스텀 윙크",
+      "wink",
+    );
+    expect(withCustom.activeExpressionId).toBe(custom.id);
+    // Neutral built-in cannot be deleted
+    expect(deleteExpressionPreset(withCustom, "neutral").expressions.length).toBe(
+      withCustom.expressions.length,
+    );
+    const afterDelete = deleteExpressionPreset(withCustom, custom.id);
+    expect(afterDelete.activeExpressionId).toBe("neutral");
+    expect(afterDelete.expressions.length).toBe(p0.expressions.length);
+
+    const savedDefaults = saveNeutralParameters(afterDelete, { ...REST, angleX: 6 });
+    expect(savedDefaults.rigProfile.neutralParameters.angleX).toBe(6);
+  });
+
+  it("rejects mismatched PNG dimensions and excessive preset counts in v3 ZIPs", async () => {
+    const p = fixture();
+    const bw = 12;
+    const bh = 10;
+    const wrongPng = new Uint8Array(createCanvas(8, 8).toBuffer("image/png"));
+    p.shapeAssets = {
+      sub_a: {
+        assetId: "sub_a",
+        region: "mouth",
+        recipeVersion: 1,
+        hidesPartIds: ["mouth_inner"],
+        layers: [
+          {
+            partId: "mouth_sub",
+            bounds: { left: 20, top: 20, width: bw, height: bh },
+            mask: new Uint8Array(bw * bh).fill(255),
+            pngBytes: wrongPng,
+          },
+        ],
+      },
+    };
+    const packed = await saveProject(p);
+    expect(() => loadProject(packed)).toThrow(/PNG/);
+
+    const clean = fixture();
+    const zipEntries = unzipSync(await saveProject(clean));
+    const json = JSON.parse(strFromU8(zipEntries["project.json"]));
+    json.expressions = Array.from({ length: 200 }, (_, i) => ({
+      ...json.expressions[0],
+      id: `exp_${i}`,
+      name: `표정 ${i}`,
+    }));
+    zipEntries["project.json"] = strToU8(JSON.stringify(json));
+    expect(() => loadProject(zipSync(zipEntries))).toThrow(/표정 프리셋/);
+  });
+
+  it("evaluates rig frames in fixed stage order without auto mouth opening or blink override on wink", () => {
+    const p = fixture();
+    const winkProj = selectExpressionPreset(p, "wink");
+
+    // 1. Default playback does NOT automatically open mouth unless autoMouthDemo === true
+    let phys = createPhysicsState();
+    for (let t = 0; t <= 4.5; t += 0.35) {
+      const frame = evaluateRigFrame({
+        project: p,
+        timeSec: t,
+        playing: true,
+        physicsState: phys,
+      });
+      phys = frame.nextPhysicsState;
+      expect(frame.parameters.mouth).toBe(0);
+    }
+
+    // 2. Auto-blink hits peak around phase = 0.09s (since phase = (t + period*0.5) % period):
+    // period = 3.6 -> blink center at t = 1.89s -> eyeR blinks, while winking eyeL stays closed!
+    const blinkFrame = evaluateRigFrame({
+      project: winkProj,
+      timeSec: 1.89,
+      playing: true,
+    });
+    expect(blinkFrame.eyeClosedOrSmiling.L).toBe(true);
+    expect(blinkFrame.eyeClosedOrSmiling.R).toBe(false);
+    expect(blinkFrame.parameters.eyeL).toBe(0);
+    expect(blinkFrame.parameters.eyeR).toBeLessThan(0.2);
+
+    // Character-relative Right Wink (`wink_r`) keeps right eye closed & left eye blinking naturally
+    const winkRProj = selectExpressionPreset(p, "wink_r");
+    const blinkRFrame = evaluateRigFrame({
+      project: winkRProj,
+      timeSec: 1.89,
+      playing: true,
+    });
+    expect(blinkRFrame.eyeClosedOrSmiling.R).toBe(true);
+    expect(blinkRFrame.eyeClosedOrSmiling.L).toBe(false);
+    expect(blinkRFrame.parameters.eyeR).toBe(0);
+    expect(blinkRFrame.parameters.eyeL).toBeLessThan(0.2);
+
+    // All 8 built-in expressions exist
+    expect(p.expressions.filter((e) => e.builtIn).map((e) => e.id)).toEqual([
+      "neutral",
+      "smile",
+      "happy",
+      "angry",
+      "sad",
+      "surprised",
+      "wink",
+      "wink_r",
+    ]);
+
+    // 3. Pause / deterministic / backward seek resets physics state to 0
+    const movingFrame = evaluateRigFrame({
+      project: p,
+      timeSec: 1.0,
+      playing: true,
+      physicsState: createPhysicsState(),
+    });
+    const pausedFrame = evaluateRigFrame({
+      project: p,
+      timeSec: 1.0,
+      playing: false,
+      physicsState: movingFrame.nextPhysicsState,
+    });
+    expect(pausedFrame.nextPhysicsState.position).toBe(0);
+    expect(pausedFrame.nextPhysicsState.velocity).toBe(0);
+
+    // 4. Priority order: expression -> user offset -> safety clamp
+    const clampedFrame = evaluateRigFrame({
+      project: selectExpressionPreset(p, "happy"),
+      userOffsets: { angleX: 90 },
+      deterministic: true,
+    });
+    expect(clampedFrame.parameters.angleX).toBe(
+      p.rigProfile.safeBounds.angleX!.max,
+    );
+    expect(clampedFrame.parameters.mouthForm).toBeGreaterThan(0.5);
+  });
+
+  it("renders deterministic snapshots with identical pixels across calls and non-empty transparent bounds", async () => {
+    const p = fixture();
+    const img = await new Promise<InstanceType<typeof Image>>((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = reject;
+      im.src = p.source;
+    });
+    const tmp = createCanvas(p.width, p.height);
+    tmp.getContext("2d").drawImage(img, 0, 0);
+    const px = new Uint8ClampedArray(tmp.getContext("2d").getImageData(0, 0, p.width, p.height).data);
+
+    const textures = buildAllPartTextures(p, px);
+    const meshes = buildAllPartMeshes(p);
+
+    const snapNeutral = renderDeterministicSnapshot(
+      { project: selectExpressionPreset(p, "neutral") },
+      textures,
+      meshes,
+    );
+    const dataNeutral = (snapNeutral.canvas as unknown as ReturnType<typeof createCanvas>)
+      .getContext("2d")
+      .getImageData(0, 0, p.width, p.height).data;
+    const snapA = renderDeterministicSnapshot(
+      { project: selectExpressionPreset(p, "smile") },
+      textures,
+      meshes,
+    );
+    const snapB = renderDeterministicSnapshot(
+      { project: selectExpressionPreset(p, "smile") },
+      textures,
+      meshes,
+    );
+    const dataA = (snapA.canvas as unknown as ReturnType<typeof createCanvas>)
+      .getContext("2d")
+      .getImageData(0, 0, p.width, p.height).data;
+    const dataB = (snapB.canvas as unknown as ReturnType<typeof createCanvas>)
+      .getContext("2d")
+      .getImageData(0, 0, p.width, p.height).data;
+    expect(dataA).toEqual(dataB);
+    // Corners must stay transparent (alpha === 0)
+    expect(dataA[3]).toBe(0);
+    // Center character face must be well populated and body interior fully opaque
+    expect(dataA[(22 * p.width + 32) * 4 + 3]).toBeGreaterThan(128);
+    expect(dataA[(48 * p.width + 32) * 4 + 3]).toBe(255);
+    // Smile expression produces measurable pixel difference from neutral
+    let changedPx = 0;
+    for (let i = 0; i < dataA.length; i += 4) {
+      if (
+        Math.abs(dataA[i] - dataNeutral[i]) +
+          Math.abs(dataA[i + 1] - dataNeutral[i + 1]) +
+          Math.abs(dataA[i + 2] - dataNeutral[i + 2]) +
+          Math.abs(dataA[i + 3] - dataNeutral[i + 3]) >
+        12
+      ) {
+        changedPx++;
+      }
+    }
+    expect(changedPx).toBeGreaterThan(15);
+  });
+
+  it("synthesizes distinct T3 eye and T4 mouth shape assets, preserves across ZIP round-trip, and handles blink/interior alpha", async () => {
+    const width = 128;
+    const height = 128;
+    const landmarks = defaultLandmarks(width, height);
+    const c = createCanvas(width, height);
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#b8a4e5";
+    ctx.fillRect(16, 6, 96, 118);
+    ctx.fillStyle = "#f9dcd0";
+    ctx.fillRect(32, 18, 64, 54);
+    // Draw distinct irises & mouth right at landmarks so T3/T4 covers and vowel shapes differ clearly
+    for (const pt of [landmarks.eyeR, landmarks.eyeL]) {
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.ellipse(pt.x, pt.y, 7, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#2b1d2e";
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = "#c95b6b";
+    ctx.fillRect(landmarks.mouth.x - 6, landmarks.mouth.y - 2, 12, 4);
+
+    const data = new Uint8ClampedArray(ctx.getImageData(0, 0, width, height).data);
+    const base: Project = {
+      schemaVersion: 3,
+      name: "모양 테스트",
+      width,
+      height,
+      originalWidth: width,
+      originalHeight: height,
+      source: c.toDataURL("image/png"),
+      original: c.toDataURL("image/png"),
+      landmarks,
+      landmarkProvenance: {
+        eyeL: "model",
+        eyeR: "model",
+        mouth: "model",
+        chin: "model",
+        crown: "estimated",
+      },
+      parts: separate(data, width, height, landmarks, 0).map((part, index) => ({
+        ...part,
+        provenance: "geometry",
+        fillKind: "none",
+        compositeOrder: index,
+      })),
+      revision: 1,
+      provider: "geometry-template-v1",
+      ...createDefaultProjectRigState("ld"),
+      createdAt: "2026-11-15T00:00:00Z",
+    };
+
+    const synth = synthesizeShapeAssetsForProject(base, data, true);
+    const expectedAssetIds = [
+      "eye_L_closed_v1",
+      "eye_L_smiling_v1",
+      "eye_R_closed_v1",
+      "eye_R_smiling_v1",
+      "mouth_closed_v1",
+      "mouth_a_v1",
+      "mouth_i_v1",
+      "mouth_u_v1",
+      "mouth_e_v1",
+      "mouth_o_v1",
+    ];
+    for (const id of expectedAssetIds) {
+      const asset = synth.shapeAssets?.[id];
+      expect(asset).toBeDefined();
+      expect(asset!.layers.length).toBeGreaterThanOrEqual(2);
+      for (const layer of asset!.layers) {
+        expect(layer.pngBytes?.length ?? 0).toBeGreaterThan(20);
+      }
+    }
+
+    // ZIP save/load round-trip preserves shapeAssets and preset assetId links
+    const reloaded = await loadProject(await saveProject(synth));
+    for (const id of expectedAssetIds) {
+      expect(reloaded.shapeAssets?.[id]?.layers.length).toBe(
+        synth.shapeAssets?.[id]?.layers.length,
+      );
+      expect(reloaded.shapeAssets?.[id]?.layers[0]?.pngBytes).toEqual(
+        synth.shapeAssets?.[id]?.layers[0]?.pngBytes,
+      );
+    }
+
+    const partTextures = buildAllPartTextures(reloaded, data);
+    const meshes = buildAllPartMeshes(reloaded);
+    const subTextures = await buildProjectSubstituteTextures(reloaded);
+
+    const diffCount = (a: Uint8ClampedArray, b: Uint8ClampedArray) => {
+      let changed = 0;
+      for (let i = 0; i < a.length; i += 4) {
+        if (
+          Math.abs(a[i] - b[i]) +
+            Math.abs(a[i + 1] - b[i + 1]) +
+            Math.abs(a[i + 2] - b[i + 2]) +
+            Math.abs(a[i + 3] - b[i + 3]) >
+          14
+        ) {
+          changed++;
+        }
+      }
+      return changed;
+    };
+
+    const renderEye = (eyeId: string) => {
+      const snap = renderDeterministicSnapshot(
+        {
+          project: selectExpressionPreset(reloaded, "neutral"),
+          overrideShapeIds: { eye_L: eyeId, eye_R: eyeId.replace("eye_L", "eye_R") },
+        },
+        partTextures,
+        meshes,
+        subTextures,
+      );
+      return (snap.canvas as unknown as ReturnType<typeof createCanvas>)
+        .getContext("2d")
+        .getImageData(0, 0, width, height).data;
+    };
+    const eyeImgs = ["eye_L_original", "eye_L_half_closed", "eye_L_closed", "eye_L_smiling"].map(
+      renderEye,
+    );
+    for (let i = 0; i < eyeImgs.length; i++) {
+      for (let j = i + 1; j < eyeImgs.length; j++) {
+        expect(diffCount(eyeImgs[i], eyeImgs[j])).toBeGreaterThan(20);
+      }
+    }
+
+    const renderMouth = (mouthId: string) => {
+      const snap = renderDeterministicSnapshot(
+        {
+          project: selectExpressionPreset(reloaded, "neutral"),
+          overrideShapeIds: { mouth: mouthId },
+        },
+        partTextures,
+        meshes,
+        subTextures,
+      );
+      return (snap.canvas as unknown as ReturnType<typeof createCanvas>)
+        .getContext("2d")
+        .getImageData(0, 0, width, height).data;
+    };
+    const mouthIds = [
+      "mouth_original",
+      "mouth_closed",
+      "mouth_a",
+      "mouth_i",
+      "mouth_u",
+      "mouth_e",
+      "mouth_o",
+    ];
+    const mouthImgs = mouthIds.map(renderMouth);
+    for (let i = 0; i < mouthImgs.length; i++) {
+      for (let j = i + 1; j < mouthImgs.length; j++) {
+        expect(diffCount(mouthImgs[i], mouthImgs[j])).toBeGreaterThan(15);
+      }
+    }
+
+    // Auto-blink swaps eye_L to closed asset when pulse drops eyeL <= 0.22
+    const autoBlinkProj: Project = {
+      ...reloaded,
+      playback: { ...reloaded.playback, autoBlink: true, blinkIntervalSec: 3.6, autoBreath: false, autoIdle: false },
+    };
+    const blinkEval = evaluateRigFrame({
+      project: autoBlinkProj,
+      timeSec: 1.89,
+      playing: true,
+    });
+    expect(blinkEval.parameters.eyeL).toBeLessThanOrEqual(0.22);
+    expect(blinkEval.activeShapes.eye_L?.assetId).toBe("eye_L_closed_v1");
+
+    // DEFAULT_MOUTH_HANDLES reveals mouthInteriorAlpha only when mouth opens (> 0.03), 0 at rest / mouth_closed
+    expect(DEFAULT_MOUTH_HANDLES.interiorVisibility).toBe(1);
+    const restMouthEval = evaluateRigFrame({ project: reloaded, deterministic: true });
+    expect(restMouthEval.mouthInteriorAlpha).toBe(0);
+    const openOriginalMouthEval = evaluateRigFrame({
+      project: reloaded,
+      userOffsets: { mouth: 1 },
+      deterministic: true,
+    });
+    expect(openOriginalMouthEval.mouthInteriorAlpha).toBeGreaterThan(0.5);
+    const closedPresetEval = evaluateRigFrame({
+      project: reloaded,
+      overrideShapeIds: { mouth: "mouth_closed" },
+      userOffsets: { mouth: 1 },
+      deterministic: true,
+    });
+    expect(closedPresetEval.mouthInteriorAlpha).toBe(0);
+
+    // enableGpu gracefully falls back to Canvas2D in headless/Node environments without WebGL
+    const fallbackCanvas = createCanvas(width, height);
+    const fallbackScratch = renderCharacterFrame({
+      ctx: fallbackCanvas.getContext("2d") as unknown as CanvasRenderingContext2D,
+      project: reloaded,
+      evaluated: evaluateRigFrame({ project: selectExpressionPreset(reloaded, "smile"), deterministic: true }),
+      partTextures,
+      meshes,
+      substituteTextures: subTextures,
+      previewDeform: true,
+      enableGpu: true,
+    });
+    expect(fallbackScratch.gl).toBeNull();
+    const cpuSmile = renderDeterministicSnapshot(
+      { project: selectExpressionPreset(reloaded, "smile") },
+      partTextures,
+      meshes,
+      subTextures,
+    );
+    const a = fallbackCanvas.getContext("2d").getImageData(0, 0, width, height).data;
+    const b = (cpuSmile.canvas as unknown as ReturnType<typeof createCanvas>)
+      .getContext("2d")
+      .getImageData(0, 0, width, height).data;
+    expect(diffCount(a, b)).toBe(0);
   });
 });

@@ -1269,11 +1269,28 @@ function applyBodySway(
   };
 }
 
+export interface RegionDeformParams {
+  width: number;
+  roundnessDelta: number;
+  corner: number;
+  upperCurveDelta: number;
+  lowerCurveDelta: number;
+  offsetX: number;
+  offsetY: number;
+}
+
+export interface ShapeDeformInput {
+  eyeL?: RegionDeformParams;
+  eyeR?: RegionDeformParams;
+  mouth?: RegionDeformParams;
+}
+
 export function deform(
   p: Point,
   part: Pick<Part, "id" | "role">,
   lm: Landmarks,
   params: Parameters,
+  shapeDeform?: ShapeDeformInput,
 ): Point {
   let { x, y } = p;
   const cx = (lm.eyeL.x + lm.eyeR.x) / 2,
@@ -1292,33 +1309,61 @@ export function deform(
   ) {
     return applyBodySway(x, y, bodyPivotX, bodyPivotY, headH, params, 1);
   }
+  const isSubLayer = part.id.includes("_sub_");
   if (part.id.startsWith("eye")) {
-    const side = part.id.startsWith("eyeL") ? "L" : "R",
+    const isLeft = part.id.startsWith("eyeL"),
+      side = isLeft ? "L" : "R",
       eye = lm[`eye${side}`],
       open = params[`eye${side}`],
       smile = params[`eye${side}Smile`];
-    if (part.id.endsWith("_iris")) {
-      x += params.eyeBallX * eyeDist * 0.045;
-      y -= params.eyeBallY * eyeDist * 0.025;
-      y = eye.y + (y - eye.y) * clamp(open, 0.04, 1.3);
-    } else if (part.id.endsWith("_upper")) {
-      const close = clamp(1 - open, 0, 1);
-      const widen = clamp(open - 1, 0, 0.3);
-      const lidAnchorY = eye.y - eyeDist * 0.34;
-      const closeY = eye.y + eyeDist * 0.04;
-      const spanY = Math.max(1, closeY - lidAnchorY);
-      const u = clamp((y - lidAnchorY) / spanY, 0, 1);
-      if (close > 0 && u > 0 && u < 1) {
-        const targetU = 1 - Math.pow(1 - u, 3.6);
-        const closedY = lidAnchorY + spanY * targetU;
-        y += (closedY - y) * close;
-      } else if (widen > 0 && u > 0) {
-        y -= spanY * 0.18 * u * widen;
+    const shape = isLeft ? shapeDeform?.eyeL : shapeDeform?.eyeR;
+    if (shape) {
+      const isIris = part.id.endsWith("_iris");
+      x += shape.offsetX * eyeDist * 0.14;
+      y += shape.offsetY * eyeDist * 0.12;
+      const widthScale = isIris ? 1 + (shape.width - 1) * 0.45 : shape.width;
+      x = eye.x + (x - eye.x) * widthScale;
+      const nx = (x - eye.x) / Math.max(1, eyeDist * 0.24);
+      const centerArch = Math.max(0, 1 - nx * nx);
+      const eyeSign = isLeft ? 1 : -1;
+      const outerSigned = clamp(nx * eyeSign, -0.4, 1.2);
+      y -= shape.corner * eyeDist * 0.045 * outerSigned;
+      const upperMask = part.id.endsWith("_upper") || part.id.endsWith("_sub_lid")
+        ? 1
+        : clamp((eye.y + eyeDist * 0.06 - y) / Math.max(1, eyeDist * 0.14), 0, 1);
+      const lowerMask = part.id.endsWith("_lower")
+        ? 1
+        : clamp((y - (eye.y - eyeDist * 0.02)) / Math.max(1, eyeDist * 0.14), 0, 1);
+      y -= shape.upperCurveDelta * eyeDist * 0.055 * centerArch * upperMask;
+      y += shape.lowerCurveDelta * eyeDist * 0.045 * centerArch * lowerMask;
+      if (!isIris) {
+        y = eye.y + (y - eye.y) * (1 + shape.roundnessDelta * 0.32 * centerArch);
       }
-    } else {
-      y = eye.y + (y - eye.y) * Math.max(0.04, open);
-      if (part.id.endsWith("_lower")) {
-        y -= smile * eyeDist * 0.032;
+    }
+    if (!isSubLayer) {
+      if (part.id.endsWith("_iris")) {
+        x += params.eyeBallX * eyeDist * 0.045;
+        y -= params.eyeBallY * eyeDist * 0.025;
+        y = eye.y + (y - eye.y) * clamp(open, 0.04, 1.3);
+      } else if (part.id.endsWith("_upper")) {
+        const close = clamp(1 - open, 0, 1);
+        const widen = clamp(open - 1, 0, 0.3);
+        const lidAnchorY = eye.y - eyeDist * 0.34;
+        const closeY = eye.y + eyeDist * 0.04;
+        const spanY = Math.max(1, closeY - lidAnchorY);
+        const u = clamp((y - lidAnchorY) / spanY, 0, 1);
+        if (close > 0 && u > 0 && u < 1) {
+          const targetU = 1 - Math.pow(1 - u, 3.6);
+          const closedY = lidAnchorY + spanY * targetU;
+          y += (closedY - y) * close;
+        } else if (widen > 0 && u > 0) {
+          y -= spanY * 0.18 * u * widen;
+        }
+      } else {
+        y = eye.y + (y - eye.y) * Math.max(0.04, open);
+        if (part.id.endsWith("_lower")) {
+          y -= smile * eyeDist * 0.032;
+        }
       }
     }
   }
@@ -1331,18 +1376,41 @@ export function deform(
     y -= browForm * headH * 0.028 * innerFactor;
   }
   if (part.id.startsWith("mouth")) {
-    const mdx = x - lm.mouth.x;
-    const cornerW = clamp(Math.abs(mdx) / Math.max(1, eyeDist * 0.18), 0, 1.2);
-    x += mdx * params.mouthForm * 0.14;
-    y -= params.mouthForm * headH * 0.016 * cornerW * cornerW;
-    if (part.id === "mouth_upper") y -= params.mouth * headH * 0.012;
-    if (part.id === "mouth_lower") y += params.mouth * headH * 0.045;
-    if (part.id === "mouth_inner")
-      y = lm.mouth.y + (y - lm.mouth.y) * (1 + params.mouth * 2);
+    const mShape = shapeDeform?.mouth;
+    if (mShape) {
+      x += mShape.offsetX * eyeDist * 0.12;
+      y += mShape.offsetY * headH * 0.04;
+      x = lm.mouth.x + (x - lm.mouth.x) * mShape.width;
+      const mnx = (x - lm.mouth.x) / Math.max(1, eyeDist * 0.16);
+      const mCenter = Math.max(0, 1 - mnx * mnx);
+      const mCornerW = clamp(Math.abs(mnx), 0, 1.2);
+      y -= mShape.corner * headH * 0.028 * mCornerW * mCornerW;
+      y = lm.mouth.y + (y - lm.mouth.y) * (1 + mShape.roundnessDelta * 0.3 * mCenter);
+      const upperW =
+        part.id === "mouth_upper" || part.id === "mouth_sub_lip"
+          ? 1
+          : clamp((lm.mouth.y + headH * 0.02 - y) / Math.max(1, headH * 0.04), 0, 1);
+      const lowerW =
+        part.id === "mouth_lower" || part.id === "mouth_sub_lip"
+          ? 1
+          : clamp((y - (lm.mouth.y - headH * 0.02)) / Math.max(1, headH * 0.04), 0, 1);
+      y -= mShape.upperCurveDelta * headH * 0.024 * mCenter * upperW;
+      y += mShape.lowerCurveDelta * headH * 0.026 * mCenter * lowerW;
+    }
+    if (!isSubLayer) {
+      const mdx = x - lm.mouth.x;
+      const cornerW = clamp(Math.abs(mdx) / Math.max(1, eyeDist * 0.18), 0, 1.2);
+      x += mdx * params.mouthForm * 0.14;
+      y -= params.mouthForm * headH * 0.016 * cornerW * cornerW;
+      if (part.id === "mouth_upper") y -= params.mouth * headH * 0.012;
+      if (part.id === "mouth_lower") y += params.mouth * headH * 0.045;
+      if (part.id === "mouth_inner")
+        y = lm.mouth.y + (y - lm.mouth.y) * (1 + params.mouth * 2);
+    }
   }
   const weight =
     part.id === "neck"
-      ? clamp((lm.chin.y + headH * 0.25 - y) / (headH * 0.25), 0, 1)
+      ? clamp((lm.chin.y + headH * 0.42 - y) / (headH * 0.42), 0, 1)
       : 1;
   x +=
     params.angleX *
@@ -1389,7 +1457,8 @@ export function deform(
       0.45 *
       clamp((y - lm.crown.y) / headH, 0, 1.8);
   }
-  const angle = ((params.angleZ * Math.PI) / 180) * weight,
+  const rotWeight = part.id === "neck" ? weight * 0.78 : weight;
+  const angle = ((params.angleZ * Math.PI) / 180) * rotWeight,
     dx = x - cx,
     dy = y - lm.chin.y;
   const headX = cx + dx * Math.cos(angle) - dy * Math.sin(angle);

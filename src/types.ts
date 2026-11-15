@@ -235,8 +235,140 @@ export interface Part {
   diagnostics?: string[];
 }
 
+export type RigProportionMode = "ld" | "sd";
+
+export interface RegionHandleRange {
+  min: number;
+  max: number;
+}
+
+export type ShapeRegion = "eye_L" | "eye_R" | "mouth";
+
+export type EyeShapeKind = "original" | "half_closed" | "closed" | "smiling" | "custom";
+export type MouthShapeKind = "original" | "closed" | "a" | "i" | "u" | "e" | "o" | "custom";
+
+export interface ShapeHandleValues {
+  /** Normalized horizontal width multiplier relative to base region width (0.5..1.5, default 1). */
+  width: number;
+  /** Vertical openness / height ratio (0..1.4). */
+  open: number;
+  /** Roundness vs sharpness of lid/lip contour (0..1). */
+  roundness: number;
+  /** Corner lift or droop (-1..1). */
+  corner: number;
+  /** Upper lid / lip arc bend (-1..1). */
+  upperCurve: number;
+  /** Lower lid / lip arc bend (-1..1). */
+  lowerCurve: number;
+  /** Mouth interior (teeth/tongue) visibility or eye iris/highlight visibility weight (0..1). */
+  interiorVisibility: number;
+  /** Horizontal offset normalized to region size (-0.5..0.5). */
+  offsetX: number;
+  /** Vertical offset normalized to region size (-0.5..0.5). */
+  offsetY: number;
+}
+
+export interface ShapeSubstituteLayer {
+  /** Target part ID being substituted or added for this shape (e.g. eyeL_upper, mouth_inner). */
+  partId: string;
+  /** Layer blend mode strictly restricted to normal, multiply, or additive. */
+  blendMode?: BlendMode;
+  /** Bounding box in working canvas pixels. */
+  bounds: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
+  /** Base part IDs whose rest pixels are hidden when this substitute asset is active. */
+  hidesPartIds?: string[];
+  /** Cropped mask aligned with `bounds` (`bounds.width * bounds.height`), persisted as shapes/<assetId>/<partId>.bin. */
+  mask?: Uint8Array;
+  /** Optional fill mask aligned with `bounds`, persisted as shapes/<assetId>/<partId>.fill.bin. */
+  fillMask?: Uint8Array;
+  /** Optional RGBA PNG bytes persisted as shapes/<assetId>/<partId>.png. */
+  pngBytes?: Uint8Array;
+  /** Serialization hint set in project.json when binary mask exists in ZIP. */
+  hasMask?: boolean;
+  /** Serialization hint set in project.json when fill mask exists in ZIP. */
+  hasFillMask?: boolean;
+  /** Serialization hint set in project.json when PNG sprite exists in ZIP. */
+  hasTexturePng?: boolean;
+}
+
+export interface ShapeSubstituteAsset {
+  assetId: string;
+  region: ShapeRegion;
+  recipeVersion: number;
+  hidesPartIds: string[];
+  layers: ShapeSubstituteLayer[];
+}
+
+export interface ShapePreset {
+  /** Stable preset identifier distinct from display `label`. */
+  id: string;
+  region: ShapeRegion;
+  label: string;
+  kind: EyeShapeKind | MouthShapeKind;
+  recipeVersion: number;
+  builtIn?: boolean;
+  mirrorLinked?: boolean;
+  handles: ShapeHandleValues;
+  parameterOverrides: Partial<Parameters>;
+  /** Optional reference into `Project.shapeAssets`. */
+  assetId?: string;
+}
+
+export interface ExpressionPreset {
+  /** Stable unique identifier distinct from display `name`. */
+  id: string;
+  name: string;
+  builtIn?: boolean;
+  shapeIds: {
+    eye_L?: string;
+    eye_R?: string;
+    mouth?: string;
+  };
+  parameters: Partial<Parameters>;
+  handleTweaks?: Partial<Record<ShapeRegion, Partial<ShapeHandleValues>>>;
+  /** Blending multiplier (0..1.5, default 1). */
+  strength: number;
+  /** Interpolation duration in milliseconds (0..3000, default 180). */
+  transitionMs: number;
+  shortcutKey?: string;
+}
+
+export interface RigProfile {
+  proportionMode: RigProportionMode;
+  defaultShapeIds: {
+    eye_L: string;
+    eye_R: string;
+    mouth: string;
+  };
+  neutralParameters: Parameters;
+  safeBounds: Partial<Record<keyof Parameters, RegionHandleRange>>;
+  motionScale: {
+    head: number;
+    eyes: number;
+    mouth: number;
+    hair: number;
+    body: number;
+  };
+  clippingTargets?: Record<string, string>;
+}
+
+export interface PlaybackSettings {
+  defaultExpressionId: string;
+  autoBlink: boolean;
+  blinkIntervalSec: number;
+  autoBreath: boolean;
+  autoIdle: boolean;
+  autoMouthDemo?: boolean;
+  shortcuts: Record<string, string>;
+}
+
 export interface Project {
-  schemaVersion: 2;
+  schemaVersion: 3;
   name: string;
   width: number;
   height: number;
@@ -262,6 +394,12 @@ export interface Project {
   detailMode?: "detail" | "parent";
   styleMatch?: StyleMatchReport;
   styleSelection?: TemplateStyleSelection;
+  rigProfile: RigProfile;
+  shapePresets: ShapePreset[];
+  shapeAssets?: Record<string, ShapeSubstituteAsset>;
+  expressions: ExpressionPreset[];
+  activeExpressionId: string;
+  playback: PlaybackSettings;
   createdAt: string;
 }
 export interface Mesh {
@@ -791,4 +929,518 @@ export function describeDynamicPart(id: string): {
     color: "#64748b",
     role,
   };
+}
+
+export const DEFAULT_EYE_HANDLES: ShapeHandleValues = {
+  width: 1,
+  open: 1,
+  roundness: 0.55,
+  corner: 0,
+  upperCurve: 0.35,
+  lowerCurve: 0.15,
+  interiorVisibility: 1,
+  offsetX: 0,
+  offsetY: 0,
+};
+
+export const DEFAULT_MOUTH_HANDLES: ShapeHandleValues = {
+  width: 1,
+  open: 0,
+  roundness: 0.25,
+  corner: 0,
+  upperCurve: 0.05,
+  lowerCurve: 0,
+  interiorVisibility: 1,
+  offsetX: 0,
+  offsetY: 0,
+};
+
+export const DEFAULT_RIG_SAFE_BOUNDS: Record<keyof Parameters, RegionHandleRange> = {
+  angleX: { min: -25, max: 25 },
+  angleY: { min: -25, max: 25 },
+  angleZ: { min: -25, max: 25 },
+  eyeL: { min: 0, max: 1 },
+  eyeLSmile: { min: 0, max: 1 },
+  eyeR: { min: 0, max: 1 },
+  eyeRSmile: { min: 0, max: 1 },
+  eyeBallX: { min: -1, max: 1 },
+  eyeBallY: { min: -1, max: 1 },
+  browLY: { min: -1, max: 1 },
+  browLForm: { min: -1, max: 1 },
+  browRY: { min: -1, max: 1 },
+  browRForm: { min: -1, max: 1 },
+  mouthForm: { min: -1, max: 1 },
+  mouth: { min: 0, max: 1 },
+  bodyAngleX: { min: -10, max: 10 },
+  bodyAngleY: { min: -10, max: 10 },
+  bodyAngleZ: { min: -10, max: 10 },
+  breath: { min: 0, max: 1 },
+  hair: { min: -1, max: 1 },
+  hairSide: { min: -1, max: 1 },
+  hairBack: { min: -1, max: 1 },
+};
+
+function makeEyeShapePresets(
+  region: "eye_L" | "eye_R",
+  proportionMode: RigProportionMode,
+): ShapePreset[] {
+  const isLeft = region === "eye_L";
+  const openKey = isLeft ? "eyeL" : "eyeR";
+  const smileKey = isLeft ? "eyeLSmile" : "eyeRSmile";
+  const baseRound = proportionMode === "sd" ? 0.72 : 0.55;
+  return [
+    {
+      id: `${region}_original`,
+      region,
+      label: "원본",
+      kind: "original",
+      recipeVersion: 1,
+      builtIn: true,
+      mirrorLinked: true,
+      handles: { ...DEFAULT_EYE_HANDLES, roundness: baseRound },
+      parameterOverrides: {},
+    },
+    {
+      id: `${region}_half_closed`,
+      region,
+      label: "반감김",
+      kind: "half_closed",
+      recipeVersion: 1,
+      builtIn: true,
+      mirrorLinked: true,
+      handles: {
+        ...DEFAULT_EYE_HANDLES,
+        open: 0.45,
+        roundness: baseRound * 0.85,
+        upperCurve: 0.1,
+        lowerCurve: 0.1,
+        interiorVisibility: 0.85,
+      },
+      parameterOverrides: { [openKey]: 0.45, [smileKey]: 0 },
+    },
+    {
+      id: `${region}_closed`,
+      region,
+      label: "감김",
+      kind: "closed",
+      recipeVersion: 1,
+      builtIn: true,
+      mirrorLinked: true,
+      handles: {
+        ...DEFAULT_EYE_HANDLES,
+        open: 0,
+        roundness: 0.2,
+        upperCurve: -0.2,
+        lowerCurve: 0,
+        interiorVisibility: 0,
+      },
+      parameterOverrides: { [openKey]: 0, [smileKey]: 0 },
+    },
+    {
+      id: `${region}_smiling`,
+      region,
+      label: "웃는 눈",
+      kind: "smiling",
+      recipeVersion: 1,
+      builtIn: true,
+      mirrorLinked: true,
+      handles: {
+        ...DEFAULT_EYE_HANDLES,
+        open: 0,
+        roundness: 0.65,
+        corner: 0.35,
+        upperCurve: 0.85,
+        lowerCurve: 0.4,
+        interiorVisibility: 0,
+      },
+      parameterOverrides: { [openKey]: 0, [smileKey]: 1 },
+    },
+  ];
+}
+
+export function createDefaultShapePresets(
+  proportionMode: RigProportionMode = "ld",
+): ShapePreset[] {
+  const narrowScale = proportionMode === "sd" ? 0.92 : 1;
+  return [
+    ...makeEyeShapePresets("eye_L", proportionMode),
+    ...makeEyeShapePresets("eye_R", proportionMode),
+    {
+      id: "mouth_original",
+      region: "mouth",
+      label: "원본",
+      kind: "original",
+      recipeVersion: 1,
+      builtIn: true,
+      handles: { ...DEFAULT_MOUTH_HANDLES },
+      parameterOverrides: {},
+    },
+    {
+      id: "mouth_closed",
+      region: "mouth",
+      label: "다문 입",
+      kind: "closed",
+      recipeVersion: 1,
+      builtIn: true,
+      handles: {
+        ...DEFAULT_MOUTH_HANDLES,
+        open: 0,
+        roundness: 0.15,
+        upperCurve: 0.08,
+        interiorVisibility: 0,
+      },
+      parameterOverrides: { mouth: 0, mouthForm: 0.1 },
+    },
+    {
+      id: "mouth_a",
+      region: "mouth",
+      label: "아",
+      kind: "a",
+      recipeVersion: 1,
+      builtIn: true,
+      handles: {
+        ...DEFAULT_MOUTH_HANDLES,
+        width: 0.92 * narrowScale,
+        open: 0.78,
+        roundness: 0.72,
+        upperCurve: 0.15,
+        lowerCurve: -0.55,
+        interiorVisibility: 0.9,
+      },
+      parameterOverrides: { mouth: 0.78, mouthForm: 0.25 },
+    },
+    {
+      id: "mouth_i",
+      region: "mouth",
+      label: "이",
+      kind: "i",
+      recipeVersion: 1,
+      builtIn: true,
+      handles: {
+        ...DEFAULT_MOUTH_HANDLES,
+        width: 1.22,
+        open: 0.34,
+        roundness: 0.28,
+        corner: 0.45,
+        upperCurve: 0.2,
+        lowerCurve: -0.15,
+        interiorVisibility: 0.95,
+      },
+      parameterOverrides: { mouth: 0.34, mouthForm: 0.68 },
+    },
+    {
+      id: "mouth_u",
+      region: "mouth",
+      label: "우",
+      kind: "u",
+      recipeVersion: 1,
+      builtIn: true,
+      handles: {
+        ...DEFAULT_MOUTH_HANDLES,
+        width: proportionMode === "sd" ? 0.56 : 0.62,
+        open: 0.46,
+        roundness: 0.95,
+        corner: -0.15,
+        upperCurve: 0.35,
+        lowerCurve: -0.35,
+        interiorVisibility: 0.55,
+      },
+      parameterOverrides: { mouth: 0.46, mouthForm: -0.25 },
+    },
+    {
+      id: "mouth_e",
+      region: "mouth",
+      label: "에",
+      kind: "e",
+      recipeVersion: 1,
+      builtIn: true,
+      handles: {
+        ...DEFAULT_MOUTH_HANDLES,
+        width: 1.12,
+        open: 0.52,
+        roundness: 0.42,
+        corner: 0.2,
+        upperCurve: 0.15,
+        lowerCurve: -0.3,
+        interiorVisibility: 0.85,
+      },
+      parameterOverrides: { mouth: 0.52, mouthForm: 0.32 },
+    },
+    {
+      id: "mouth_o",
+      region: "mouth",
+      label: "오",
+      kind: "o",
+      recipeVersion: 1,
+      builtIn: true,
+      handles: {
+        ...DEFAULT_MOUTH_HANDLES,
+        width: proportionMode === "sd" ? 0.68 : 0.74,
+        open: 0.86,
+        roundness: 0.96,
+        upperCurve: 0.4,
+        lowerCurve: -0.65,
+        interiorVisibility: 0.88,
+      },
+      parameterOverrides: { mouth: 0.86, mouthForm: -0.1 },
+    },
+  ];
+}
+
+export function createDefaultExpressionPresets(): ExpressionPreset[] {
+  return [
+    {
+      id: "neutral",
+      name: "기본",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_original",
+        eye_R: "eye_R_original",
+        mouth: "mouth_original",
+      },
+      parameters: {},
+      strength: 1,
+      transitionMs: 160,
+      shortcutKey: "1",
+    },
+    {
+      id: "smile",
+      name: "미소",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_smiling",
+        eye_R: "eye_R_smiling",
+        mouth: "mouth_i",
+      },
+      parameters: {
+        eyeLSmile: 0.85,
+        eyeRSmile: 0.85,
+        browLY: 0.15,
+        browRY: 0.15,
+        mouthForm: 0.55,
+        mouth: 0.12,
+      },
+      strength: 1,
+      transitionMs: 180,
+      shortcutKey: "2",
+    },
+    {
+      id: "happy",
+      name: "기쁨",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_smiling",
+        eye_R: "eye_R_smiling",
+        mouth: "mouth_a",
+      },
+      parameters: {
+        eyeLSmile: 1,
+        eyeRSmile: 1,
+        browLY: 0.3,
+        browRY: 0.3,
+        mouthForm: 0.75,
+        mouth: 0.45,
+      },
+      strength: 1,
+      transitionMs: 180,
+      shortcutKey: "3",
+    },
+    {
+      id: "angry",
+      name: "화남",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_half_closed",
+        eye_R: "eye_R_half_closed",
+        mouth: "mouth_e",
+      },
+      parameters: {
+        eyeL: 0.85,
+        eyeR: 0.85,
+        browLY: -0.45,
+        browRY: -0.45,
+        browLForm: -0.85,
+        browRForm: -0.85,
+        mouthForm: -0.65,
+        mouth: 0.28,
+      },
+      strength: 1,
+      transitionMs: 160,
+      shortcutKey: "4",
+    },
+    {
+      id: "sad",
+      name: "슬픔",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_half_closed",
+        eye_R: "eye_R_half_closed",
+        mouth: "mouth_closed",
+      },
+      parameters: {
+        eyeL: 0.65,
+        eyeR: 0.65,
+        browLY: 0.35,
+        browRY: 0.35,
+        browLForm: -0.45,
+        browRForm: -0.45,
+        mouthForm: -0.55,
+        mouth: 0.05,
+        angleY: -5,
+      },
+      strength: 1,
+      transitionMs: 220,
+      shortcutKey: "5",
+    },
+    {
+      id: "surprised",
+      name: "놀람",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_original",
+        eye_R: "eye_R_original",
+        mouth: "mouth_o",
+      },
+      parameters: {
+        eyeL: 1,
+        eyeR: 1,
+        browLY: 0.65,
+        browRY: 0.65,
+        browLForm: 0.25,
+        browRForm: 0.25,
+        mouth: 0.75,
+        mouthForm: -0.05,
+      },
+      strength: 1,
+      transitionMs: 140,
+      shortcutKey: "6",
+    },
+    {
+      id: "wink",
+      name: "왼윙크 (L)",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_smiling",
+        eye_R: "eye_R_original",
+        mouth: "mouth_i",
+      },
+      parameters: {
+        eyeL: 0,
+        eyeLSmile: 1,
+        eyeR: 1,
+        eyeRSmile: 0.15,
+        mouthForm: 0.4,
+        mouth: 0.15,
+        angleZ: 4,
+      },
+      strength: 1,
+      transitionMs: 150,
+      shortcutKey: "7",
+    },
+    {
+      id: "wink_r",
+      name: "오른윙크 (R)",
+      builtIn: true,
+      shapeIds: {
+        eye_L: "eye_L_original",
+        eye_R: "eye_R_smiling",
+        mouth: "mouth_i",
+      },
+      parameters: {
+        eyeL: 1,
+        eyeLSmile: 0.15,
+        eyeR: 0,
+        eyeRSmile: 1,
+        mouthForm: 0.4,
+        mouth: 0.15,
+        angleZ: -4,
+      },
+      strength: 1,
+      transitionMs: 150,
+      shortcutKey: "8",
+    },
+  ];
+}
+
+export function createDefaultRigProfile(
+  proportionMode: RigProportionMode = "ld",
+): RigProfile {
+  return {
+    proportionMode,
+    defaultShapeIds: {
+      eye_L: "eye_L_original",
+      eye_R: "eye_R_original",
+      mouth: "mouth_original",
+    },
+    neutralParameters: { ...REST },
+    safeBounds: Object.fromEntries(
+      Object.entries(DEFAULT_RIG_SAFE_BOUNDS).map(([k, r]) => [k, { ...r }]),
+    ) as Record<keyof Parameters, RegionHandleRange>,
+    motionScale: {
+      head: 1,
+      eyes: 1,
+      mouth: 1,
+      hair: 1,
+      body: 1,
+    },
+    clippingTargets: {
+      eyeL_iris: "eyeL_white",
+      eyeR_iris: "eyeR_white",
+    },
+  };
+}
+
+export function createDefaultPlaybackSettings(
+  expressions: ExpressionPreset[] = createDefaultExpressionPresets(),
+): PlaybackSettings {
+  const shortcuts: Record<string, string> = {};
+  for (const exp of expressions) {
+    if (exp.shortcutKey) shortcuts[exp.shortcutKey] = exp.id;
+  }
+  return {
+    defaultExpressionId: expressions[0]?.id ?? "neutral",
+    autoBlink: true,
+    blinkIntervalSec: 3.6,
+    autoBreath: true,
+    autoIdle: true,
+    autoMouthDemo: false,
+    shortcuts,
+  };
+}
+
+export function createDefaultProjectRigState(
+  proportionMode: RigProportionMode = "ld",
+) {
+  const expressions = createDefaultExpressionPresets();
+  return {
+    rigProfile: createDefaultRigProfile(proportionMode),
+    shapePresets: createDefaultShapePresets(proportionMode),
+    expressions,
+    activeExpressionId: expressions[0].id,
+    playback: createDefaultPlaybackSettings(expressions),
+  };
+}
+
+export function clampParameterValue(
+  key: keyof Parameters,
+  value: number,
+  bounds?: Partial<Record<keyof Parameters, RegionHandleRange>>,
+): number {
+  const fallback = DEFAULT_RIG_SAFE_BOUNDS[key];
+  const custom = bounds?.[key];
+  const lo = Math.max(fallback.min, custom?.min ?? fallback.min);
+  const hi = Math.min(fallback.max, custom?.max ?? fallback.max);
+  if (!Number.isFinite(value)) return REST[key];
+  return Math.max(Math.min(lo, hi), Math.min(Math.max(lo, hi), value));
+}
+
+export function clampParameters(
+  params: Parameters,
+  bounds?: Partial<Record<keyof Parameters, RegionHandleRange>>,
+): Parameters {
+  const next = { ...params };
+  for (const key of Object.keys(REST) as (keyof Parameters)[]) {
+    next[key] = clampParameterValue(key, params[key], bounds);
+  }
+  return next;
 }

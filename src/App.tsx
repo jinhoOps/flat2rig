@@ -31,6 +31,7 @@ import {
   ScanFace,
   Settings,
   SlidersHorizontal,
+  Smile,
   Sparkles,
   Undo2,
   Upload,
@@ -104,6 +105,18 @@ import {
   type CsvTemplate,
 } from "./io";
 import Viewport from "./Viewport";
+import { synthesizeShapeAssetsForProject } from "./rig/shapes";
+import {
+  buildAllPartMeshes,
+  buildAllPartTextures,
+  buildProjectSubstituteTextures,
+  renderDeterministicSnapshot,
+} from "./rig/render";
+import { selectExpressionPreset } from "./rig/state";
+import { useProjectTextures } from "./rig/useProjectTextures";
+import ExpressionPanel from "./components/ExpressionPanel";
+import AdjustPanel from "./components/AdjustPanel";
+import PlaybackPanel from "./components/PlaybackPanel";
 import {
   demoFile,
   downloadSpriteGuide,
@@ -151,12 +164,16 @@ function countStyleOverrides(sel?: TemplateStyleSelection): number {
   return TEMPLATE_FEATURE_KEYS.filter((k) => sel[k] && sel[k] !== "auto").length;
 }
 
+type AppTab = "prepare" | "expressions" | "adjust" | "play" | "advanced";
+
 export default function App() {
   const [project, setProject] = useState<Project | null>(null),
     projectRef = useRef<Project | null>(null);
   const [selected, setSelected] = useState("face"),
     [tool, setTool] = useState<Tool>("landmark");
-  const [tab, setTab] = useState<"prepare" | "preview">("prepare");
+  const [tab, setTab] = useState<AppTab>("prepare");
+  const [advancedPreview, setAdvancedPreview] = useState(false);
+  const projectTextures = useProjectTextures(project);
   const [zoom, setZoom] = useState(1),
     [radius, setRadius] = useState(18),
     [tolerance, setTolerance] = useState(32);
@@ -217,7 +234,7 @@ export default function App() {
     "export" | "regenerate" | "reanalysis" | "models" | "help" | "spriteGuide" | "updates" | null
   >(null),
     [dirty, setDirty] = useState(false);
-  const [appVersion, setAppVersion] = useState("0.2.0-1");
+  const [appVersion, setAppVersion] = useState("0.2.0-2");
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [updateCustomUrl, setUpdateCustomUrl] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -289,6 +306,7 @@ export default function App() {
     projectInput = useRef<HTMLInputElement>(null),
     partInput = useRef<HTMLInputElement>(null),
     csvInput = useRef<HTMLInputElement>(null);
+  const dragSnapshot = useRef<Project | null>(null);
   const gesture = useRef<{
     before: Project;
     part?: string;
@@ -302,6 +320,7 @@ export default function App() {
   }, []);
   const commit = useCallback(
     (p: Project, before = projectRef.current) => {
+      dragSnapshot.current = null;
       if (before) history.current.push(before);
       if (history.current.length > 24) history.current.shift();
       future.current = [];
@@ -311,9 +330,90 @@ export default function App() {
     },
     [update],
   );
+  const beginDrag = useCallback(() => {
+    if (!dragSnapshot.current && projectRef.current) {
+      dragSnapshot.current = projectRef.current;
+    }
+  }, []);
+  const previewDrag = useCallback(
+    (next: Project) => {
+      if (!dragSnapshot.current && projectRef.current) {
+        dragSnapshot.current = projectRef.current;
+      }
+      update(next);
+    },
+    [update],
+  );
+  const commitDrag = useCallback(() => {
+    const snap = dragSnapshot.current;
+    const cur = projectRef.current;
+    dragSnapshot.current = null;
+    if (snap && cur && snap !== cur) {
+      commit(cur, snap);
+    }
+  }, [commit]);
   const notify = (text: string) => {
     setMessage(text);
     setError("");
+  };
+  const commitRig = useCallback(
+    (next: Project, note?: string) => {
+      commit(next);
+      if (note) notify(note);
+    },
+    [commit],
+  );
+  const regenerateShapeAssets = () => {
+    const cur = projectRef.current;
+    if (!cur || !cur.parts.length) return;
+    void task("눈 · 입 대체 모양 파츠 생성 중", async (signal) => {
+      const img = projectTextures.sourceImage ?? (await loadImage(cur.source));
+      signal.throwIfAborted();
+      const data = pixels(img, cur.width, cur.height);
+      const next = synthesizeShapeAssetsForProject(cur, data, true);
+      commit(next);
+      notify("눈 · 입 대체 모양 파츠를 다시 생성했습니다.");
+    });
+  };
+  const exportCurrentFramePng = () => {
+    const p = projectRef.current;
+    if (!p || !p.parts.length) return;
+    setModal(null);
+    void task("투명 배경 PNG 내보내는 중", async (signal) => {
+      const meshesMap = meshes.size > 0 ? meshes : buildAllPartMeshes(p);
+      let partTexMap = projectTextures.partTextures;
+      if (partTexMap.size === 0) {
+        const img = projectTextures.sourceImage ?? (await loadImage(p.source));
+        signal.throwIfAborted();
+        partTexMap = buildAllPartTextures(p, pixels(img, p.width, p.height));
+      }
+      const subTexMap =
+        projectTextures.substituteTextures.size > 0 || !p.shapeAssets
+          ? projectTextures.substituteTextures
+          : await buildProjectSubstituteTextures(p);
+      signal.throwIfAborted();
+      const snap = renderDeterministicSnapshot(
+        {
+          project: p,
+          userParameters: parameters,
+        },
+        partTexMap,
+        meshesMap,
+        subTexMap,
+      );
+      const blob = await new Promise<Blob | null>((resolve) =>
+        snap.canvas.toBlob(resolve, "image/png"),
+      );
+      if (!blob) throw new Error("PNG 생성에 실패했습니다.");
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const expTag = safeName(p.activeExpressionId || "neutral");
+      const saved = await saveFile(
+        `${safeName(p.name)}_${expTag}.png`,
+        bytes,
+        "image/png",
+      );
+      if (saved) notify("투명 배경 현재 표정 PNG를 저장했습니다.");
+    });
   };
   const task = async (
     label: string,
@@ -338,6 +438,7 @@ export default function App() {
     }
   };
   const reset = (p: Project) => {
+    dragSnapshot.current = null;
     history.current = [];
     future.current = [];
     setHistoryCount([0, 0]);
@@ -345,7 +446,7 @@ export default function App() {
     setMeshWarnings([]);
     setPromptResult(null);
     setPromptCandidateIdx(0);
-    setParameters({ ...REST });
+    setParameters({ ...(p.rigProfile?.neutralParameters ?? REST) });
     setPlaying(false);
     setZoom(1);
     setSolo(false);
@@ -356,6 +457,7 @@ export default function App() {
     setStyleSelection(loadedSel);
     setStyleMode(countStyleOverrides(loadedSel) > 0 ? "override" : "preserve");
     setTab("prepare");
+    setAdvancedPreview(false);
     setTool(p.parts.length ? "select" : "face");
     setSelected(
       p.parts.find((t) => t.id === "face")?.id ?? p.parts[0]?.id ?? "face",
@@ -567,28 +669,44 @@ export default function App() {
       const { parts: mergedParts, preservedCount } = preserveApproved
         ? mergePreservedParts(p.parts, result.parts)
         : { parts: result.parts, preservedCount: 0 };
-      commit({
-        ...p,
-        parts: mergedParts,
-        provider: result.provider,
-        detailMode: mode,
-        styleMatch: result.styleMatch,
-        styleSelection: styles,
-        modelHash:
-          result.modelHashes.part_decoder ??
-          result.modelHashes.background ??
-          p.modelHash,
-        modelHashes: { ...p.modelHashes, ...result.modelHashes },
-        postprocessVersions: {
-          ...p.postprocessVersions,
-          parts: result.postprocessVersion,
+      const nextProportion =
+        result.styleMatch?.resolved.proportionMode === "sd"
+          ? "sd"
+          : result.styleMatch?.resolved.proportionMode === "ld"
+            ? "ld"
+            : p.rigProfile.proportionMode;
+      const nextProject = synthesizeShapeAssetsForProject(
+        {
+          ...p,
+          parts: mergedParts,
+          provider: result.provider,
+          detailMode: mode,
+          styleMatch: result.styleMatch,
+          styleSelection: styles,
+          rigProfile: {
+            ...p.rigProfile,
+            proportionMode: nextProportion,
+          },
+          modelHash:
+            result.modelHashes.part_decoder ??
+            result.modelHashes.background ??
+            p.modelHash,
+          modelHashes: { ...p.modelHashes, ...result.modelHashes },
+          postprocessVersions: {
+            ...p.postprocessVersions,
+            parts: result.postprocessVersion,
+          },
         },
-      });
+        data,
+        !preserveApproved,
+      );
+      commit(nextProject);
       if (!mergedParts.some((t) => t.id === selected)) {
         setSelected(mergedParts[0]?.id ?? "face");
       }
       setTool("select");
       setTab("prepare");
+    setAdvancedPreview(false);
       const overrideCount = countStyleOverrides(styles);
       const propLabel =
         result.styleMatch?.resolved.proportionMode === "sd" ? "SD형" : "일반 LD";
@@ -600,6 +718,7 @@ export default function App() {
   const undo = useCallback(() => {
     if (controller.current || !history.current.length || !projectRef.current)
       return;
+    dragSnapshot.current = null;
     future.current.push(projectRef.current);
     const p = history.current.pop()!;
     update({ ...p, revision: projectRef.current.revision + 1 });
@@ -609,6 +728,7 @@ export default function App() {
   const redo = useCallback(() => {
     if (controller.current || !future.current.length || !projectRef.current)
       return;
+    dragSnapshot.current = null;
     history.current.push(projectRef.current);
     const p = future.current.pop()!;
     update({ ...p, revision: projectRef.current.revision + 1 });
@@ -631,21 +751,20 @@ export default function App() {
   };
   useEffect(() => {
     const keyboard = (e: KeyboardEvent) => {
-      if (
-        (e.target as HTMLElement).matches("input,textarea,select") ||
-        controller.current
-      )
+      const targetEl = e.target instanceof Element ? e.target : null;
+      if (targetEl?.matches("input,textarea,select") || controller.current)
         return;
       if (e.ctrlKey || e.metaKey) {
-        if (e.key === "z") {
+        const key = e.key.toLowerCase();
+        if (key === "z") {
           e.preventDefault();
           e.shiftKey ? redo() : undo();
         }
-        if (e.key === "y") {
+        if (key === "y") {
           e.preventDefault();
           redo();
         }
-        if (e.key === "s") {
+        if (key === "s") {
           e.preventDefault();
           document
             .querySelector<HTMLButtonElement>('[data-action="save"]')
@@ -653,15 +772,46 @@ export default function App() {
         }
         return;
       }
-      const keys: Record<string, Tool> = {
-        v: "select",
-        b: "add",
-        e: "erase",
-        p: "prompt",
-        l: "landmark",
-        f: "face",
-      };
-      if (keys[e.key]) setTool(keys[e.key]);
+      if (
+        (tab === "expressions" || tab === "adjust" || tab === "play") &&
+        projectRef.current?.parts.length &&
+        !modal
+      ) {
+        if (e.code === "Space" && !targetEl?.matches("button,a")) {
+          e.preventDefault();
+          setPlaying((v) => !v);
+          return;
+        }
+        if (/^[1-9]$/.test(e.key)) {
+          const cur = projectRef.current;
+          const idx = Number(e.key) - 1;
+          const exp =
+            cur.expressions.find((item) => item.shortcutKey === e.key) ??
+            cur.expressions[idx];
+          if (exp) {
+            e.preventDefault();
+            commitRig(
+              selectExpressionPreset(cur, exp.id),
+              `표정 '${exp.name}' 전환`,
+            );
+            if (e.key === "1" || exp.id === "neutral") {
+              setParameters({ ...(cur.rigProfile?.neutralParameters ?? REST) });
+            }
+          }
+          return;
+        }
+      }
+      if (tab === "prepare" || (tab === "advanced" && !advancedPreview)) {
+        const keys: Record<string, Tool> = {
+          v: "select",
+          b: "add",
+          e: "erase",
+          p: "prompt",
+          l: "landmark",
+          f: "face",
+        };
+        if (keys[e.key]) setTool(keys[e.key]);
+      }
       if (e.key === "Escape") {
         setModal(null);
         setPlaying(false);
@@ -679,10 +829,9 @@ export default function App() {
       window.removeEventListener("keydown", keyboard);
       window.removeEventListener("beforeunload", unload);
     };
-  }, [undo, redo, dirty]);
+  }, [undo, redo, dirty, tab, advancedPreview, modal, commitRig]);
   useEffect(() => {
-    if (!project || !project.parts.length || (!wire && tab !== "preview"))
-      return;
+    if (!project || !project.parts.length) return;
     let active = true;
     setMeshing(true);
     const timer = setTimeout(() => {
@@ -713,7 +862,7 @@ export default function App() {
       active = false;
       clearTimeout(timer);
     };
-  }, [project?.revision, project?.source, wire, tab]);
+  }, [project?.parts, project?.landmarks, project?.width, project?.height, project?.source]);
   const patchPart = (patch: Partial<Part>) => {
     const p = projectRef.current;
     if (!p) return;
@@ -1220,15 +1369,25 @@ export default function App() {
   const part = project?.parts.find((p) => p.id === selected),
     approved =
       project?.parts.filter((p) => p.status === "approved").length ?? 0;
-  const total = project?.parts.length ?? 0,
-    preview = tab === "preview";
-  const changeTab = (t: "prepare" | "preview") => {
+  const total = project?.parts.length ?? 0;
+  const showLayers = tab === "prepare" || tab === "advanced";
+  const isRigStage = tab === "expressions" || tab === "adjust" || tab === "play";
+  const preview = isRigStage || (tab === "advanced" && advancedPreview);
+  const changeTab = (t: AppTab) => {
     setTab(t);
-    if (t === "preview") {
+    if (t === "expressions" || t === "adjust" || t === "play") {
       setOriginal(false);
       setOverlay(false);
+      setFillOverlay(false);
+      setCompareDiff(false);
       setSolo(false);
-    } else setPlaying(false);
+      if (t !== "play") setPlaying(false);
+    } else if (t === "prepare") {
+      setPlaying(false);
+      setAdvancedPreview(false);
+    } else if (t === "advanced" && !advancedPreview) {
+      setPlaying(false);
+    }
   };
   return (
     <div
@@ -1306,10 +1465,18 @@ export default function App() {
           )
             return;
           void task("프로젝트 불러오는 중", async (signal) => {
-            const p = loadProject(new Uint8Array(await file.arrayBuffer()));
-            await loadImage(p.source);
+            const loaded = loadProject(new Uint8Array(await file.arrayBuffer()));
+            const img = await loadImage(loaded.source);
             signal.throwIfAborted();
-            reset(p);
+            const prepared =
+              loaded.parts.length > 0
+                ? synthesizeShapeAssetsForProject(
+                    loaded,
+                    pixels(img, loaded.width, loaded.height),
+                    false,
+                  )
+                : loaded;
+            reset(prepared);
             notify("프로젝트를 불러왔습니다.");
           });
         }}
@@ -1415,7 +1582,8 @@ export default function App() {
           </button>
         </div>
       </header>
-      <div className="workspace">
+      <div className={showLayers ? "workspace" : "workspace no-layers"}>
+        {showLayers && (
         <aside className="layers-panel">
           <div className="panel-header">
             <span>
@@ -1592,33 +1760,75 @@ export default function App() {
             <p>좌우는 캐릭터 기준입니다.</p>
           </div>
         </aside>
+        )}
         <main className="editor">
           <div className="editor-tabs">
-            <div role="tablist">
+            <div role="tablist" aria-label="작업 단계">
               <button
                 role="tab"
-                aria-selected={!preview}
-                className={!preview ? "active" : ""}
+                aria-selected={tab === "prepare"}
+                className={tab === "prepare" ? "active" : ""}
                 onClick={() => changeTab("prepare")}
               >
                 <ScanFace size={15} />
-                파츠 준비
+                1. 준비
               </button>
               <button
                 role="tab"
-                aria-selected={preview}
+                aria-selected={tab === "expressions"}
                 disabled={!total || !!busy}
-                className={preview ? "active" : ""}
-                onClick={() => changeTab("preview")}
+                className={tab === "expressions" ? "active" : ""}
+                onClick={() => changeTab("expressions")}
+              >
+                <Smile size={15} />
+                2. 표정
+              </button>
+              <button
+                role="tab"
+                aria-selected={tab === "adjust"}
+                disabled={!total || !!busy}
+                className={tab === "adjust" ? "active" : ""}
+                onClick={() => changeTab("adjust")}
               >
                 <SlidersHorizontal size={15} />
-                리깅 미리보기
+                3. 조정
+              </button>
+              <button
+                role="tab"
+                aria-selected={tab === "play"}
+                disabled={!total || !!busy}
+                className={tab === "play" ? "active" : ""}
+                onClick={() => changeTab("play")}
+              >
+                <Play size={15} />
+                4. 재생
+              </button>
+              <button
+                role="tab"
+                aria-selected={tab === "advanced"}
+                disabled={!!busy}
+                className={`tab-advanced${tab === "advanced" ? " active" : ""}`}
+                onClick={() => changeTab("advanced")}
+              >
+                <Layers size={14} />
+                고급 (파츠·메쉬·PSD)
               </button>
             </div>
             <span className="stage-tag">
-              {preview ? "RIG DRAFT" : "MATERIAL SEPARATION"}
+              {tab === "prepare"
+                ? "01 PREPARE"
+                : tab === "expressions"
+                  ? "02 EXPRESSIONS"
+                  : tab === "adjust"
+                    ? "03 ADJUST"
+                    : tab === "play"
+                      ? playing
+                        ? "04 LIVE PLAYING"
+                        : "04 STAGE"
+                      : "ADVANCED"}
             </span>
           </div>
+          {!isRigStage && (
           <div className="toolbar">
             <div className="tool-group">
               {(
@@ -1722,6 +1932,7 @@ export default function App() {
               </button>
             </div>
           </div>
+          )}
           <div className={`stage ${busy ? "working" : ""}`}>
             {project ? (
               <>
@@ -1730,9 +1941,15 @@ export default function App() {
                     <i />
                     {original
                       ? "ORIGINAL"
-                      : preview
-                        ? "MOTION STUDY"
-                        : "WORKING CANVAS"}
+                      : tab === "play"
+                        ? playing
+                          ? "LIVE PLAYBACK"
+                          : "CLEAN STAGE"
+                        : tab === "expressions"
+                          ? `EXPRESSION · ${project.expressions.find((e) => e.id === project.activeExpressionId)?.name ?? "기본"}`
+                          : preview
+                            ? "MOTION PREVIEW"
+                            : "WORKING CANVAS"}
                   </span>
                   <span>
                     {project.width} × {project.height}
@@ -1752,27 +1969,55 @@ export default function App() {
                   solo={solo}
                   preview={preview}
                   playing={playing}
+                  cleanStage={tab === "play"}
                   parameters={parameters}
                   meshes={meshes}
+                  sharedTextures={projectTextures}
                   onStart={start}
                   onMove={move}
                   onEnd={end}
                 />
                 <div className="stage-bottom">
                   <span>
-                    {preview
-                      ? "작은 변형으로 파츠와 보완 영역을 확인하세요"
-                      : tool === "face"
-                        ? "얼굴 피부 영역의 좌상단에서 우하단까지 드래그하세요"
-                        : tool === "landmark"
-                          ? "눈 · 입 · 턱 · 얼굴 상단의 점을 드래그하세요"
-                          : tool === "prompt"
-                            ? "좌클릭: 포함(+) · 우클릭/Alt/Shift+클릭: 제외(-) 영역 지정"
-                            : tool === "add" || tool === "erase"
-                              ? "드래그하여 선택 파츠의 마스크를 수정하세요"
-                              : "파츠를 선택하여 경계를 확인하세요"}
+                    {tab === "play"
+                      ? "Space: 재생/일시정지 · 1~9 키: 표정 빠른 전환"
+                      : tab === "expressions"
+                        ? "우측 표정 카드를 클릭하거나 1~9 키로 즉시 전환할 수 있습니다"
+                        : tab === "adjust"
+                          ? "왼쪽/오른쪽 눈·입 모양을 고르고 슬라이더로 각도를 다듬으세요"
+                          : preview
+                            ? "고급 메쉬/변형 확인 모드입니다"
+                            : tool === "face"
+                              ? "얼굴 피부 영역의 좌상단에서 우하단까지 드래그하세요"
+                              : tool === "landmark"
+                                ? "눈 · 입 · 턱 · 얼굴 상단의 점을 드래그하세요"
+                                : tool === "prompt"
+                                  ? "좌클릭: 포함(+) · 우클릭/Alt/Shift+클릭: 제외(-) 영역 지정"
+                                  : tool === "add" || tool === "erase"
+                                    ? "드래그하여 선택 파츠의 마스크를 수정하세요"
+                                    : "파츠를 선택하여 경계를 확인하세요"}
                   </span>
                   <div>
+                    {isRigStage && (
+                      <>
+                        <button
+                          aria-label="실행 취소"
+                          title="실행 취소 (Ctrl+Z)"
+                          disabled={!historyCount[0] || !!busy}
+                          onClick={undo}
+                        >
+                          <Undo2 size={14} />
+                        </button>
+                        <button
+                          aria-label="다시 실행"
+                          title="다시 실행 (Ctrl+Shift+Z)"
+                          disabled={!historyCount[1] || !!busy}
+                          onClick={redo}
+                        >
+                          <Redo2 size={14} />
+                        </button>
+                      </>
+                    )}
                     <button
                       aria-label="축소"
                       onClick={() => setZoom((z) => clamp(z - 0.25, 0.25, 4))}
@@ -1898,15 +2143,128 @@ export default function App() {
           <div className="panel-header">
             <span>
               <SlidersHorizontal size={15} />
-              {preview ? "파라미터" : "작업 설정"}
+              {tab === "prepare"
+                ? "준비 · 파츠 생성"
+                : tab === "expressions"
+                  ? "표정 선택 · 저장"
+                  : tab === "adjust"
+                    ? "부위 · 움직임 조정"
+                    : tab === "play"
+                      ? "재생 · PNG 저장"
+                      : "고급 · 파츠·Cubism"}
             </span>
             <span className="tiny-label">
-              {preview ? "PREVIEW" : "INSPECTOR"}
+              {tab === "prepare"
+                ? "STEP 1"
+                : tab === "expressions"
+                  ? "STEP 2"
+                  : tab === "adjust"
+                    ? "STEP 3"
+                    : tab === "play"
+                      ? "STEP 4"
+                      : "ADVANCED"}
             </span>
           </div>
           <div className="inspector-scroll">
-            {!preview ? (
+            {tab === "expressions" && project ? (
+              <ExpressionPanel
+                project={project}
+                parameters={parameters}
+                partTextures={projectTextures.partTextures}
+                meshes={meshes}
+                substituteTextures={projectTextures.substituteTextures}
+                busy={!!busy}
+                onCommit={commitRig}
+                onBeginDrag={beginDrag}
+                onPreviewDrag={previewDrag}
+                onCommitDrag={commitDrag}
+                onResetPoseToNeutral={() =>
+                  setParameters({
+                    ...(project.rigProfile?.neutralParameters ?? REST),
+                  })
+                }
+                onOpenAdvancedParts={(partId) => {
+                  if (partId) setSelected(partId);
+                  setAdvancedPreview(false);
+                  changeTab("advanced");
+                }}
+              />
+            ) : tab === "adjust" && project ? (
+              <AdjustPanel
+                project={project}
+                parameters={parameters}
+                onChangeParameters={setParameters}
+                partTextures={projectTextures.partTextures}
+                meshes={meshes}
+                substituteTextures={projectTextures.substituteTextures}
+                busy={!!busy}
+                onCommit={commitRig}
+                onBeginDrag={beginDrag}
+                onPreviewDrag={previewDrag}
+                onCommitDrag={commitDrag}
+                onRegenerateShapeAssets={regenerateShapeAssets}
+                onOpenAdvancedParts={(partId) => {
+                  if (partId) setSelected(partId);
+                  setAdvancedPreview(false);
+                  changeTab("advanced");
+                }}
+              />
+            ) : tab === "play" && project ? (
+              <PlaybackPanel
+                project={project}
+                playing={playing}
+                busy={!!busy}
+                onTogglePlay={() => setPlaying((v) => !v)}
+                onResetToNeutral={() => {
+                  setPlaying(false);
+                  setParameters({
+                    ...(project.rigProfile?.neutralParameters ?? REST),
+                  });
+                  commitRig(
+                    selectExpressionPreset(
+                      project,
+                      project.expressions[0]?.id ?? "neutral",
+                    ),
+                    "기본 상태로 복귀했습니다.",
+                  );
+                }}
+                onCommit={commitRig}
+                onBeginDrag={beginDrag}
+                onPreviewDrag={previewDrag}
+                onCommitDrag={commitDrag}
+                onExportPng={exportCurrentFramePng}
+                onOpenAdvancedExport={() => setModal("export")}
+              />
+            ) : (
               <>
+                {tab === "advanced" && (
+                  <section>
+                    <div className="section-title">
+                      <span>00</span>
+                      <h2>고급 작업 보기</h2>
+                    </div>
+                    <div className="two-buttons compact">
+                      <button
+                        className={!advancedPreview ? "active" : ""}
+                        disabled={!!busy}
+                        onClick={() => {
+                          setAdvancedPreview(false);
+                          setPlaying(false);
+                        }}
+                      >
+                        파츠 · 마스크 보정
+                      </button>
+                      <button
+                        className={advancedPreview ? "active" : ""}
+                        disabled={!total || !!busy}
+                        onClick={() => setAdvancedPreview(true)}
+                      >
+                        메쉬 · 파라미터 확인
+                      </button>
+                    </div>
+                  </section>
+                )}
+                {tab === "prepare" && (
                 <section>
                   <div className="section-title">
                     <span>01</span>
@@ -2179,6 +2537,17 @@ export default function App() {
                     <WandSparkles size={16} />
                     {total ? "파츠 초안 다시 생성" : "파츠 초안 생성"}
                   </button>
+                  {total > 0 && (
+                    <button
+                      className="full"
+                      style={{ marginTop: 8 }}
+                      disabled={!!busy}
+                      onClick={() => changeTab("expressions")}
+                    >
+                      <Smile size={15} />
+                      다음: 2. 표정 고르기 →
+                    </button>
+                  )}
                   <div className="note">
                     <Sparkles size={13} />
                     <span>
@@ -2187,6 +2556,8 @@ export default function App() {
                     </span>
                   </div>
                 </section>
+                )}
+                {(tab === "prepare" || (tab === "advanced" && !advancedPreview)) && (
                 <section>
                   <div className="section-title">
                     <span>02</span>
@@ -2483,10 +2854,10 @@ export default function App() {
                     </div>
                   )}
                 </section>
-              </>
-            ) : (
-              <>
-                <section>
+                )}
+                {tab === "advanced" && advancedPreview && (
+                  <>
+                    <section>
                   <div className="section-title">
                     <span>01</span>
                     <h2>기본 모션 테스트</h2>
@@ -2599,22 +2970,29 @@ export default function App() {
                       </div>
                     )
                   )}
-                  <button className="full" onClick={() => changeTab("prepare")}>
+                  <button
+                    className="full"
+                    onClick={() => {
+                      setAdvancedPreview(false);
+                      setPlaying(false);
+                    }}
+                  >
                     파츠 보정으로 돌아가기
                     <ChevronRight size={14} />
                   </button>
                 </section>
               </>
             )}
+            {tab === "advanced" && (
             <section className="handoff-card">
               <div className="section-title">
-                <span>{preview ? "02" : "03"}</span>
-                <h2>Cubism 내보내기</h2>
+                <span>{advancedPreview ? "02" : "03"}</span>
+                <h2>Cubism 내보내기 (고급)</h2>
               </div>
               <div className="export-item">
                 <FileImage size={17} />
                 <span>
-                  레이어드 PSD<small>파츠 이미지 · 원본 위치</small>
+                  레이어드 PSD<small>기준(Rest) 파츠 이미지 · 원본 위치</small>
                 </span>
                 <Check size={13} />
               </div>
@@ -2635,10 +3013,13 @@ export default function App() {
                 {csv ? "Cubism CSV 샘플 연결됨" : "Cubism CSV 샘플 연결"}
               </button>
               <p className="muted tiny">
-                샘플 연결 전에는 참고용 파라미터 목록을 내보냅니다. 메쉬·키폼은
-                Cubism에서 적용합니다.
+                활성 대체 눈·입 모양 및 표정·물리 설정은 .flat2rig에 저장됩니다.
+                기본 PSD에는 기준 파츠만 포함되며 메쉬·키폼은 Cubism에서 적용합니다.
               </p>
             </section>
+            )}
+            </>
+            )}
           </div>
           <div className="inspector-footer">
             <span className="local-status">
@@ -2686,8 +3067,8 @@ export default function App() {
             {modal === "export" ? (
               <>
                 <span className="eyebrow">EXPORT</span>
-                <h2>Cubism용 파일 내보내기</h2>
-                <p>파츠와 기초 리깅 자료를 함께 내보냅니다.</p>
+                <h2>내보내기</h2>
+                <p>현재 표정 이미지(PNG) 또는 후반 작업용 Cubism 자료를 내보냅니다.</p>
                 <div className="export-summary">
                   <span>
                     {project?.width} × {project?.height}px
@@ -2703,13 +3084,26 @@ export default function App() {
                 )}
                 <button
                   className="export-choice"
+                  onClick={exportCurrentFramePng}
+                >
+                  <span className="choice-icon">
+                    <FileImage size={22} />
+                  </span>
+                  <span>
+                    <strong>현재 표정 PNG</strong>
+                    <small>오버레이 제외 · 투명 배경 · 현재 자세/모양 반영</small>
+                  </span>
+                  <Download size={18} />
+                </button>
+                <button
+                  className="export-choice"
                   onClick={() => output("bundle")}
                 >
                   <span className="choice-icon">
                     <Box size={22} />
                   </span>
                   <span>
-                    <strong>Cubism 인계 패키지</strong>
+                    <strong>Cubism 인계 패키지 (고급)</strong>
                     <small>
                       PSD · 파츠 PNG · 프로젝트 · JSON · CSV · 가이드
                     </small>
@@ -2721,15 +3115,16 @@ export default function App() {
                     <FileImage size={22} />
                   </span>
                   <span>
-                    <strong>레이어드 PSD만</strong>
-                    <small>이미지 레이어와 투명도 · RGB 8bit</small>
+                    <strong>레이어드 PSD만 (고급)</strong>
+                    <small>기준(Rest) 파츠 이미지 레이어 · normal 모드 · RGB 8bit</small>
                   </span>
                   <Download size={18} />
                 </button>
                 <p className="muted tiny">
-                  자체 메쉬·변형 키는 PSD에 저장되지 않습니다. Cubism Editor에서
-                  후반 작업을 진행하세요. 실제 Editor 가져오기 호환성은 별도
-                  확인이 필요합니다.
+                  활성 대체 눈·입 모양 및 저장한 표정·물리 설정은 .flat2rig 프로젝트에만
+                  저장됩니다. 기본 PSD에는 기준 원본 파츠만 포함되며, 자체 메쉬·변형 키는
+                  저장되지 않습니다. 실제 Cubism Editor 가져오기 호환성은 별도 확인이
+                  필요합니다.
                 </p>
               </>
             ) : modal === "reanalysis" && pendingReanalysis && project ? (

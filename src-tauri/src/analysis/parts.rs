@@ -432,6 +432,387 @@ fn separable_box_bool(src: &[bool], w: usize, h: usize, radius: usize, dilate: b
 
 /// Seals MobileSAM deconvolution checkerboard pinholes inside `fg` using O(N) morphological closing
 /// while avoiding harsh blocky square artifacts.
+struct OpaqueFgRecovery {
+    fg: Vec<u8>,
+    rec_hair: Vec<u8>,
+    rec_torso: Vec<u8>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_opaque_fg_with_sam(
+    reg: &mut crate::analysis::models::ModelRegistry,
+    full_cache: &SamEmbeddingCache,
+    rgba: &[u8],
+    fg: &[u8],
+    w: usize,
+    h: usize,
+    landmarks: &Landmarks,
+    skin_rgb: [f64; 3],
+    eye_dist: f64,
+) -> Option<OpaqueFgRecovery> {
+    let n = w * h;
+    if n == 0 || fg.len() != n {
+        return None;
+    }
+
+    // 1. Only recover when input lacks an actual transparent border cutout.
+    let mut border_total = 0usize;
+    let mut border_trans = 0usize;
+    let x_step = (w / 48).max(1);
+    let y_step = (h / 48).max(1);
+    for x in (0..w).step_by(x_step) {
+        for y in [0usize, h - 1] {
+            border_total += 1;
+            if rgba[(y * w + x) * 4 + 3] < 245 {
+                border_trans += 1;
+            }
+        }
+    }
+    for y in (0..h).step_by(y_step) {
+        for x in [0usize, w - 1] {
+            border_total += 1;
+            if rgba[(y * w + x) * 4 + 3] < 245 {
+                border_trans += 1;
+            }
+        }
+    }
+    if border_total > 0 && border_trans * 100 >= border_total * 8 {
+        return None;
+    }
+
+    let frame = HeadFrame::from_landmarks(landmarks, w, h);
+    let head_cx = 0.5 * (landmarks.eye_l.x + landmarks.eye_r.x);
+    let eye_mid_y = 0.5 * (landmarks.eye_l.y + landmarks.eye_r.y);
+    let hh = frame.hh;
+
+    // 2. Sample upper-corner background swatches where `fg == 0`.
+    let mut bg_swatches: Vec<[f64; 3]> = Vec::new();
+    let mut bg_neg_pts: Vec<PromptInput> = Vec::new();
+    let corner_coords = [
+        (w as f64 * 0.03, h as f64 * 0.04),
+        (w as f64 * 0.97, h as f64 * 0.04),
+        (w as f64 * 0.03, h as f64 * 0.18),
+        (w as f64 * 0.97, h as f64 * 0.18),
+        (w as f64 * 0.03, h as f64 * 0.34),
+        (w as f64 * 0.97, h as f64 * 0.34),
+    ];
+    for (bx, by) in corner_coords {
+        let px = (bx.round() as usize).min(w - 1);
+        let py = (by.round() as usize).min(h - 1);
+        if fg[py * w + px] > 32 {
+            continue;
+        }
+        let rgb = sample_patch_rgb(rgba, w, h, bx, by);
+        if rgb[2] - rgb[0] <= 6.0 {
+            bg_swatches.push(rgb);
+            bg_neg_pts.push(PromptInput {
+                x: bx,
+                y: by,
+                label: 0,
+            });
+        }
+    }
+    if bg_swatches.is_empty() {
+        return None;
+    }
+
+    let min_bg_dist = |i: usize| -> f64 {
+        let p = i * 4;
+        let r = rgba[p] as f64;
+        let g = rgba[p + 1] as f64;
+        let b = rgba[p + 2] as f64;
+        bg_swatches
+            .iter()
+            .map(|sw| ((r - sw[0]).powi(2) + (g - sw[1]).powi(2) + (b - sw[2]).powi(2)).sqrt())
+            .fold(f64::INFINITY, f64::min)
+    };
+    let is_cool_fg = |i: usize| -> bool {
+        let p = i * 4;
+        (rgba[p + 2] as f64 - rgba[p] as f64) >= 6.0
+    };
+
+    // 3. Measure U2NetP foreground deficit in upper head hair & torso.
+    let stride = (w.max(h) / 160).max(2);
+    let hx0 = ((head_cx - eye_dist * 1.35).floor() as isize).clamp(0, w as isize - 1) as usize;
+    let hx1 = ((head_cx + eye_dist * 1.35).ceil() as isize).clamp(0, w as isize - 1) as usize;
+    let hy0 = ((landmarks.crown.y - hh * 0.26).floor() as isize).clamp(0, h as isize - 1) as usize;
+    let hy1 = (eye_mid_y.ceil() as isize).clamp(0, h as isize - 1) as usize;
+    let mut hair_halo_total = 0usize;
+    let mut hair_halo_fg = 0usize;
+    for y in (hy0..=hy1).step_by(stride) {
+        for x in (hx0..=hx1).step_by(stride) {
+            let i = y * w + x;
+            let distinct = min_bg_dist(i) >= 22.0 || is_cool_fg(i);
+            let skin_like = is_warm_skin_candidate(rgba, i, skin_rgb)
+                && color_dist_sq(rgba, i, skin_rgb) < 30.0;
+            if distinct && !skin_like {
+                hair_halo_total += 1;
+                if fg[i] > 64 {
+                    hair_halo_fg += 1;
+                }
+            }
+        }
+    }
+
+    let tx0 = ((landmarks.chin.x - eye_dist * 1.35).floor() as isize).clamp(0, w as isize - 1) as usize;
+    let tx1 = ((landmarks.chin.x + eye_dist * 1.35).ceil() as isize).clamp(0, w as isize - 1) as usize;
+    let ty0 = ((landmarks.chin.y + hh * 0.25).floor() as isize).clamp(0, h as isize - 1) as usize;
+    let ty1 = ((landmarks.chin.y + hh * 1.25).ceil() as isize).clamp(0, h as isize - 1) as usize;
+    let mut torso_total = 0usize;
+    let mut torso_fg = 0usize;
+    for y in (ty0..=ty1).step_by(stride) {
+        for x in (tx0..=tx1).step_by(stride) {
+            let i = y * w + x;
+            if min_bg_dist(i) >= 22.0 || is_cool_fg(i) {
+                torso_total += 1;
+                if fg[i] > 64 {
+                    torso_fg += 1;
+                }
+            }
+        }
+    }
+
+    let needs_hair = hair_halo_total >= 90 && hair_halo_fg * 100 < hair_halo_total * 55;
+    let needs_torso = torso_total >= 150 && torso_fg * 100 < torso_total * 55;
+    if !needs_hair && !needs_torso {
+        return None;
+    }
+
+    let pick_sam_slot = |masks: &[Vec<u8>], ious: &[f32], pos_pts: &[PromptInput]| -> Vec<u8> {
+        let mut best_idx = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for (slot, m) in masks.iter().enumerate() {
+            let area = m.iter().filter(|&&v| v > 128).count();
+            if area < 64 || area * 100 > n * 92 {
+                continue;
+            }
+            let bg_hits = bg_neg_pts
+                .iter()
+                .filter(|bp| {
+                    let bx = (bp.x.round() as usize).min(w - 1);
+                    let by = (bp.y.round() as usize).min(h - 1);
+                    m[by * w + bx] > 128
+                })
+                .count();
+            if bg_hits > 1 {
+                continue;
+            }
+            let pos_hits = pos_pts
+                .iter()
+                .filter(|pp| pp.label == 1)
+                .filter(|pp| {
+                    let px = (pp.x.round() as usize).min(w - 1);
+                    let py = (pp.y.round() as usize).min(h - 1);
+                    m[py * w + px] > 128
+                })
+                .count();
+            let score = pos_hits as f64 * 10.0 + ious.get(slot).copied().unwrap_or(0.0) as f64 - bg_hits as f64 * 25.0;
+            if score > best_score {
+                best_score = score;
+                best_idx = Some(slot);
+            }
+        }
+        best_idx
+            .map(|s| masks[s].clone())
+            .unwrap_or_else(|| vec![0u8; n])
+    };
+
+    // 4. Decode character hair & torso via MobileSAM unclipped image embeddings.
+    let hair_local_pts = [
+        (0.0, frame.crown_v - hh * 0.10),
+        (-eye_dist * 0.55, frame.crown_v + hh * 0.02),
+        (eye_dist * 0.55, frame.crown_v + hh * 0.02),
+        (-eye_dist * 1.05, -eye_dist * 0.10),
+        (eye_dist * 1.05, -eye_dist * 0.10),
+        (-eye_dist * 1.25, frame.chin_v * 0.5),
+        (eye_dist * 1.25, frame.chin_v * 0.5),
+    ];
+    let mut rec_hair_pos = Vec::new();
+    for (du, dv) in hair_local_pts {
+        let p = frame.origin + frame.ex * du + frame.ey * dv;
+        let px = (p.x.round() as isize).clamp(2, w as isize - 3) as usize;
+        let py = (p.y.round() as isize).clamp(2, h as isize - 3) as usize;
+        let idx = py * w + px;
+        if (min_bg_dist(idx) >= 20.0 || is_cool_fg(idx))
+            && color_dist_sq(rgba, idx, skin_rgb) >= 24.0
+        {
+            rec_hair_pos.push(PromptInput {
+                x: px as f64,
+                y: py as f64,
+                label: 1,
+            });
+        }
+    }
+
+    let nose_x = 0.5 * (0.5 * (landmarks.eye_l.x + landmarks.eye_r.x) + landmarks.mouth.x);
+    let nose_y = 0.5 * (0.5 * (landmarks.eye_l.y + landmarks.eye_r.y) + landmarks.mouth.y);
+    let mut rec_hair = vec![0u8; n];
+    if !rec_hair_pos.is_empty() {
+        let mut h_prompts = rec_hair_pos.clone();
+        h_prompts.extend(bg_neg_pts.iter().copied());
+        h_prompts.extend([
+            PromptInput { x: nose_x, y: nose_y, label: 0 },
+            PromptInput { x: landmarks.eye_r.x, y: landmarks.eye_r.y, label: 0 },
+            PromptInput { x: landmarks.eye_l.x, y: landmarks.eye_l.y, label: 0 },
+            PromptInput { x: landmarks.mouth.x, y: landmarks.mouth.y, label: 0 },
+            PromptInput { x: landmarks.chin.x, y: landmarks.chin.y, label: 0 },
+            PromptInput {
+                x: landmarks.chin.x,
+                y: (landmarks.chin.y + eye_dist * 0.25).clamp(0.0, h as f64 - 1.0),
+                label: 0,
+            },
+        ]);
+        if let Ok(dec) = decode_sam_prompts(reg, full_cache, &h_prompts, None) {
+            rec_hair = pick_sam_slot(&dec.masks, &dec.iou_scores, &rec_hair_pos);
+        }
+    }
+
+    let torso_targets = [
+        (landmarks.chin.x, (landmarks.chin.y + hh * 0.35).min(h as f64 - 4.0)),
+        (landmarks.chin.x, (landmarks.chin.y + hh * 0.72).min(h as f64 - 4.0)),
+        (landmarks.chin.x - eye_dist * 0.85, (landmarks.chin.y + hh * 0.78).min(h as f64 - 4.0)),
+        (landmarks.chin.x + eye_dist * 0.85, (landmarks.chin.y + hh * 0.78).min(h as f64 - 4.0)),
+        (landmarks.chin.x - eye_dist * 0.45, (landmarks.chin.y + hh * 1.05).min(h as f64 - 4.0)),
+        (landmarks.chin.x + eye_dist * 0.45, (landmarks.chin.y + hh * 1.05).min(h as f64 - 4.0)),
+    ];
+    let mut rec_torso_pos = Vec::new();
+    for (tx, ty) in torso_targets {
+        let px = (tx.round() as isize).clamp(2, w as isize - 3) as usize;
+        let py = (ty.round() as isize).clamp(2, h as isize - 3) as usize;
+        let idx = py * w + px;
+        if min_bg_dist(idx) >= 20.0 || is_cool_fg(idx) || fg[idx] > 128 {
+            rec_torso_pos.push(PromptInput {
+                x: px as f64,
+                y: py as f64,
+                label: 1,
+            });
+        }
+    }
+    let mut rec_torso = vec![0u8; n];
+    if !rec_torso_pos.is_empty() {
+        let mut t_prompts = rec_torso_pos.clone();
+        t_prompts.extend(bg_neg_pts.iter().copied());
+        t_prompts.extend([
+            PromptInput { x: nose_x, y: nose_y, label: 0 },
+            PromptInput { x: landmarks.eye_r.x, y: landmarks.eye_r.y, label: 0 },
+            PromptInput { x: landmarks.eye_l.x, y: landmarks.eye_l.y, label: 0 },
+        ]);
+        if let Ok(dec) = decode_sam_prompts(reg, full_cache, &t_prompts, None) {
+            rec_torso = pick_sam_slot(&dec.masks, &dec.iou_scores, &rec_torso_pos);
+        }
+    }
+
+    // 5. Combine with original U2NetP core + conservative connected cool/lineart strand completion.
+    let mut fg_mask = vec![false; n];
+    for i in 0..n {
+        if fg[i] > 64 {
+            fg_mask[i] = true;
+        } else if rec_hair[i] > 128 || rec_torso[i] > 128 {
+            let warm_bg = min_bg_dist(i) < 22.0 && !is_cool_fg(i);
+            if !warm_bg {
+                fg_mask[i] = true;
+            }
+        }
+    }
+
+    let bg_all_warm = bg_swatches.iter().all(|sw| sw[2] - sw[0] <= 4.0);
+    if bg_all_warm {
+        let mut grow_q = VecDeque::new();
+        for (i, &keep) in fg_mask.iter().enumerate() {
+            if keep {
+                grow_q.push_back(i);
+            }
+        }
+        while let Some(cur) = grow_q.pop_front() {
+            let x = cur % w;
+            let y = cur / w;
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                let ni = ny * w + nx;
+                if fg_mask[ni] {
+                    continue;
+                }
+                let p = ni * 4;
+                let luma = 0.299 * rgba[p] as f64 + 0.587 * rgba[p + 1] as f64 + 0.114 * rgba[p + 2] as f64;
+                let cool_fg = (rgba[p + 2] as f64 - rgba[p] as f64) >= 6.0;
+                let dark_lineart_fg = luma < 165.0 && min_bg_dist(ni) >= 34.0;
+                if cool_fg || dark_lineart_fg {
+                    fg_mask[ni] = true;
+                    grow_q.push_back(ni);
+                }
+            }
+        }
+    }
+
+    // Keep strictly connected to head/original fg core so no corner specks survive.
+    let mut keep_cc = vec![false; n];
+    let mut cc_q = VecDeque::new();
+    let nx0 = (nose_x.round() as isize).clamp(0, w as isize - 1) as usize;
+    let ny0 = (nose_y.round() as isize).clamp(0, h as isize - 1) as usize;
+    let nose_i = ny0 * w + nx0;
+    if fg_mask[nose_i] {
+        keep_cc[nose_i] = true;
+        cc_q.push_back(nose_i);
+    }
+    for i in 0..n {
+        if fg[i] > 160 && fg_mask[i] && !keep_cc[i] {
+            keep_cc[i] = true;
+            cc_q.push_back(i);
+        }
+    }
+    while let Some(cur) = cc_q.pop_front() {
+        let x = cur % w;
+        let y = cur / w;
+        for (nx, ny) in [
+            (x.wrapping_sub(1), y),
+            (x + 1, y),
+            (x, y.wrapping_sub(1)),
+            (x, y + 1),
+        ] {
+            if nx < w && ny < h {
+                let ni = ny * w + nx;
+                if fg_mask[ni] && !keep_cc[ni] {
+                    keep_cc[ni] = true;
+                    cc_q.push_back(ni);
+                }
+            }
+        }
+    }
+
+    let mut recovered_fg = fg.to_vec();
+    let mut added = 0usize;
+    for i in 0..n {
+        if keep_cc[i] && recovered_fg[i] < 255 {
+            if recovered_fg[i] <= 32 {
+                added += 1;
+            }
+            recovered_fg[i] = 255;
+        }
+    }
+    if added < 200 {
+        return None;
+    }
+
+    for i in 0..n {
+        if !keep_cc[i] {
+            rec_hair[i] = 0;
+            rec_torso[i] = 0;
+        }
+    }
+    Some(OpaqueFgRecovery {
+        fg: recovered_fg,
+        rec_hair,
+        rec_torso,
+    })
+}
+
 fn clean_sam_mask_in_fg(mask: &[u8], fg: &[u8], w: usize, h: usize) -> Vec<u8> {
     let n = w * h;
     let bin: Vec<bool> = (0..n).map(|i| mask[i] > 128 && fg[i] > 8).collect();
@@ -1738,8 +2119,8 @@ fn propagate_chest_hair(
 
                 let is_hair = skin_d > 26.0
                     && skin_d > hair_p + 10.0
-                    && hair_p < 36.0
-                    && hair_opp < 30.0
+                    && hair_p < 46.0
+                    && hair_opp < 36.0
                     && clothes_ok;
 
                 let p = ni * 4;
@@ -1750,12 +2131,12 @@ fn propagate_chest_hair(
                         hair_geo[ni] = true;
                         q.push_back((ni, 0));
                     }
-                } else if steps < 1
-                    && luma < 85.0
+                } else if steps < 2
+                    && luma < 140.0
                     && skin_d > 28.0
-                    && hair_opp < 30.0
+                    && hair_opp < 36.0
                     && clothes_ok
-                    && (ny as f64) <= landmarks.chin.y + eye_dist * 0.90
+                    && (ny as f64) <= landmarks.chin.y + eye_dist * 0.95
                     && visited_steps[ni] > steps + 1
                 {
                     visited_steps[ni] = steps + 1;
@@ -2024,7 +2405,7 @@ pub fn propose_parts_with_sam_with_template(
 
     // 1. Background removal: explicit u2net_path -> registered Background role -> border flood / alpha.
     let mut model_hashes = HashMap::new();
-    let (fg, u2_alpha, bg_hash) =
+    let (mut fg, u2_alpha, bg_hash) =
         resolve_foreground_alpha(state, rgba, w, h, tolerance, u2net_path)?;
     if let Some(h_u2) = bg_hash {
         model_hashes.insert("background".into(), h_u2);
@@ -2074,12 +2455,12 @@ pub fn propose_parts_with_sam_with_template(
     let skin_rgb = sample_patch_rgb(rgba, w, h, nose_pt.x, nose_pt.y);
     let hair_seed_y = (landmarks.crown.y + eye_dist * 0.12).clamp(0.0, (h - 1) as f64);
     let hair_rgb = sample_patch_rgb(rgba, w, h, landmarks.crown.x, hair_seed_y);
-    let hair_palette = build_hair_palette(rgba, &fg, w, h, landmarks, skin_rgb, eye_dist);
+    let mut hair_palette = build_hair_palette(rgba, &fg, w, h, landmarks, skin_rgb, eye_dist);
 
     let mut sam_masks: HashMap<&'static str, (Vec<u8>, f32)> = HashMap::new();
     let decoder_sha: String;
-    let body_macro_mask: Vec<u8>;
-    let torso_seeds: TorsoSeeds;
+    let mut body_macro_mask: Vec<u8>;
+    let mut torso_seeds: TorsoSeeds;
     let hair_geo: Vec<bool>;
     let mut has_exposed_torso_skin = false;
 
@@ -2185,6 +2566,63 @@ pub fn propose_parts_with_sam_with_template(
                         y: hy,
                         label: 1,
                     });
+                }
+            }
+        }
+        let recovered_fg = recover_opaque_fg_with_sam(
+            &mut reg,
+            &full_cache,
+            rgba,
+            &fg,
+            w,
+            h,
+            landmarks,
+            skin_rgb,
+            eye_dist,
+        );
+        if let Some(rec) = recovered_fg {
+            fg = rec.fg;
+            hair_palette = build_hair_palette(rgba, &fg, w, h, landmarks, skin_rgb, eye_dist);
+            for (dst, &v) in body_macro_mask.iter_mut().zip(&rec.rec_torso) {
+                if v > 128 && *dst == 0 {
+                    *dst = 255;
+                }
+            }
+            torso_seeds = find_torso_seeds(
+                rgba,
+                &fg,
+                &face_clean,
+                &rec.rec_hair,
+                &vec![0u8; w * h],
+                &body_macro_mask,
+                w,
+                h,
+                landmarks,
+                skin_rgb,
+                &hair_palette,
+                eye_dist,
+            );
+            let hair_rgb_rec = hair_palette.first().copied().unwrap_or(skin_rgb);
+            let hf = HeadFrame::from_landmarks(landmarks, w, h);
+            for (du, dv) in [
+                (0.0, hf.crown_v - hf.hh * 0.10),
+                (-eye_dist * 0.55, hf.crown_v + hf.hh * 0.02),
+                (eye_dist * 0.55, hf.crown_v + hf.hh * 0.02),
+                (-eye_dist * 1.02, -eye_dist * 0.12),
+                (eye_dist * 1.02, -eye_dist * 0.12),
+            ] {
+                let p = hf.origin + hf.ex * du + hf.ey * dv;
+                if p.x >= 0.0 && p.y >= 0.0 && p.x < w as f64 && p.y < h as f64 {
+                    let idx = (p.y as usize) * w + (p.x as usize);
+                    if fg[idx] > 128
+                        && color_dist_sq(rgba, idx, hair_rgb_rec) < color_dist_sq(rgba, idx, skin_rgb) + 12.0
+                    {
+                        base_hair_positives.push(PromptInput {
+                            x: p.x,
+                            y: p.y,
+                            label: 1,
+                        });
+                    }
                 }
             }
         }
@@ -2610,61 +3048,64 @@ pub fn propose_parts_with_sam_with_template(
                 && clothes_candidate_active
                 && fy > landmarks.chin.y + hh * 0.26
                 && ((in_clothes
-                    && (clothes_opp_d <= hair_opp_d + 8.0
+                    && ((clothes_opp_d <= hair_opp_d + 6.0 && clothes_p_d <= hair_p_d + 12.0)
                         || clothes_p_d + 6.0 < hair_p_d
-                        || hair_p_d >= 42.0
-                        || clothes_opp_d < 36.0))
+                        || hair_p_d >= 46.0
+                        || (clothes_opp_d + 8.0 < hair_opp_d && clothes_p_d < hair_p_d + 8.0)))
                     || (body_macro_mask[i] > 128
                         && clothes_p_d < 34.0
                         && clothes_p_d + 14.0 < hair_p_d
-                        && hair_p_d >= 42.0));
+                        && hair_p_d >= 44.0));
 
             let pr = rgba[i * 4] as f64;
             let pg = rgba[i * 4 + 1] as f64;
             let pb = rgba[i * 4 + 2] as f64;
             let px_luma = 0.299 * pr + 0.587 * pg + 0.114 * pb;
             let px_chroma = pr.max(pg).max(pb) - pr.min(pg).min(pb);
-            let bang_over_eye = in_hair
-                && fy <= landmarks.eye_r.y.max(landmarks.eye_l.y) + eye_ry * 0.25
-                && px_luma > 105.0
-                && hair_p_d < 34.0
-                && hair_p_d + 6.0 < skin_d;
+            let bang_match = in_hair
+                && px_luma > 76.0
+                && hair_p_d < 28.0
+                && hair_p_d + 8.0 < skin_d;
+            let bang_over_eye_r = bang_match && fy <= landmarks.eye_r.y - eye_ry * 0.82;
+            let bang_over_eye_l = bang_match && fy <= landmarks.eye_l.y - eye_ry * 0.82;
+            let bang_over_brow = bang_match && fy <= landmarks.eye_r.y.max(landmarks.eye_l.y);
 
-            if !bang_over_eye && sam_masks.get("eyeR_all").is_some_and(|(m, _)| m[i] > 128) {
+            let classify_eye_sam_part =
+                |dx: f64, dy: f64, is_left: bool| -> &'static str {
+                    let iris_rn = (dx / (eye_rx * 0.72).max(2.0))
+                        .hypot(dy / (eye_ry * 0.92).max(2.0));
+                    let is_upper_iris = iris_rn <= 0.98
+                        && dy >= -eye_ry * 0.72
+                        && (px_luma >= 205.0
+                            || (px_chroma >= 14.0 && px_luma >= 66.0));
+                    let is_lower_iris = iris_rn <= 0.88
+                        && dy <= eye_ry * 0.72
+                        && px_chroma >= 16.0
+                        && px_luma >= 66.0;
+                    if dy < -eye_ry * 0.48 && !is_upper_iris {
+                        if is_left { "eyeL_upper" } else { "eyeR_upper" }
+                    } else if dy > eye_ry * 0.60 && !is_lower_iris {
+                        if is_left { "eyeL_lower" } else { "eyeR_lower" }
+                    } else if iris_rn <= 1.0
+                        && !(px_luma >= 220.0 && px_chroma < 16.0 && dx.abs() >= eye_rx * 0.48)
+                    {
+                        if is_left { "eyeL_iris" } else { "eyeR_iris" }
+                    } else {
+                        if is_left { "eyeL_white" } else { "eyeR_white" }
+                    }
+                };
+
+            if !bang_over_eye_r && sam_masks.get("eyeR_all").is_some_and(|(m, _)| m[i] > 128) {
                 let dx = fx - landmarks.eye_r.x;
                 let dy = fy - landmarks.eye_r.y;
-                if dy < -eye_ry * 0.48
-                    && !(dx.abs() < eye_rx * 0.56
-                        && ((px_chroma >= 24.0 && px_luma >= 95.0)
-                            || (px_luma >= 218.0 && px_chroma < 18.0)))
-                {
-                    chosen = Some("eyeR_upper");
-                } else if dy > eye_ry * 0.60 {
-                    chosen = Some("eyeR_lower");
-                } else if dx.abs() < eye_rx * 0.48 {
-                    chosen = Some("eyeR_iris");
-                } else {
-                    chosen = Some("eyeR_white");
-                }
-            } else if !bang_over_eye && sam_masks.get("eyeL_all").is_some_and(|(m, _)| m[i] > 128) {
+                chosen = Some(classify_eye_sam_part(dx, dy, false));
+            } else if !bang_over_eye_l && sam_masks.get("eyeL_all").is_some_and(|(m, _)| m[i] > 128) {
                 let dx = fx - landmarks.eye_l.x;
                 let dy = fy - landmarks.eye_l.y;
-                if dy < -eye_ry * 0.48
-                    && !(dx.abs() < eye_rx * 0.56
-                        && ((px_chroma >= 24.0 && px_luma >= 95.0)
-                            || (px_luma >= 218.0 && px_chroma < 18.0)))
-                {
-                    chosen = Some("eyeL_upper");
-                } else if dy > eye_ry * 0.60 {
-                    chosen = Some("eyeL_lower");
-                } else if dx.abs() < eye_rx * 0.48 {
-                    chosen = Some("eyeL_iris");
-                } else {
-                    chosen = Some("eyeL_white");
-                }
-            } else if !bang_over_eye && sam_masks.get("browR").is_some_and(|(m, _)| m[i] > 128) {
+                chosen = Some(classify_eye_sam_part(dx, dy, true));
+            } else if !bang_over_brow && sam_masks.get("browR").is_some_and(|(m, _)| m[i] > 128) {
                 chosen = Some("browR");
-            } else if !bang_over_eye && sam_masks.get("browL").is_some_and(|(m, _)| m[i] > 128) {
+            } else if !bang_over_brow && sam_masks.get("browL").is_some_and(|(m, _)| m[i] > 128) {
                 chosen = Some("browL");
             } else if sam_masks.get("mouth_all").is_some_and(|(m, _)| m[i] > 128) {
                 let dy = fy - landmarks.mouth.y;
