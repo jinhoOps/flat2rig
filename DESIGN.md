@@ -1,6 +1,6 @@
 # flat2rig Design System — Daylight Acrylic Glass (`DESIGN.md`)
 
-> **적용 대상**: `flat2rig` (Live2D Cubism 준비 스튜디오 · Tauri v2 + React + TypeScript)  
+> **적용 대상**: `flat2rig` (캐릭터 표정·움직임 편집 및 재생 · Tauri v2 + React + TypeScript)
 > **디자인 콘셉트**: **Daylight Drafting Acrylic** — 기존 다크·민트 네온 계열을 완전히 배제하고, 밝은 제도실 데스크 위의 반투명 아크릴 판과 제도용 코발트·그라파이트 잉크를 기준으로 설계한 라이트 글래스모피즘 디자인 시스템.
 
 ---

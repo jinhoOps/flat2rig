@@ -1,6 +1,6 @@
 # flat2rig Project Rules & Invariants
 
-flat2rig는 일러스트 1장을 Live2D Cubism Editor 후반 작업용 파츠 PSD와 리깅 초안으로 준비하는 로컬 데스크톱 앱(Tauri v2 + Rust + React/TypeScript)이다. 아래 불변 규칙은 코드·계획·내보내기 수정 시 항상 지킨다.
+flat2rig는 일러스트 1장에서 눈·입 모양과 표정을 선택하고 기본 움직임을 세부 조정하여 앱 안에서 저장·재생하는 로컬 데스크톱 앱(Tauri v2 + Rust + React/TypeScript)이다. Cubism Editor 후반 작업용 PSD와 리깅 초안은 선택적인 고급 출력으로 유지한다. 제품 목표는 `docs/product-plan.md`, 구현 지시는 `docs/development-tasks.md`를 따른다. 아래 불변 규칙은 코드·계획·내보내기 수정 시 항상 지킨다.
 
 ## 1. 좌표계와 좌우(L/R) 기준
 - 작업 캔버스 좌표는 **좌상단 `(0, 0)`**, X 오른쪽 증가, Y 아래쪽 증가, 픽셀 단위다.
@@ -34,3 +34,8 @@ flat2rig는 일러스트 1장을 Live2D Cubism Editor 후반 작업용 파츠 PS
 - PSD(`src/io.ts`)는 이미지 레이어·오프셋·블렌드 모드(`normal`)만 전달한다. Cubism이 특정 영문 레이어 이름(`PartFace` 등)을 마법처럼 자동 리깅 규격으로 인식한다고 가정하지 않는다.
 - 자체 `rig-draft.json`이나 참고용 `parameters-reference.csv`를 Cubism 공식 직접 가져오기 포맷으로 표기하지 않는다.
 - 검증하지 않은 항목(예: 실제 Cubism Editor 가져오기)은 `validation.json`이나 문서에서 통과한 것처럼 표시하지 않는다.
+
+## 6. 파츠 분리의 원칙
+- **한 레이어당 한 파츠**: 독립적으로 움직이거나 변형해야 하는 요소는 각각 별도 이미지 레이어로 분리한다. 폴더로 묶더라도 여러 파츠를 하나의 이미지 레이어로 합치지 않는다.
+- **움직이는 모습을 기준으로 분리**: 정지 화면의 영역 구분만으로 끝내지 않고 눈 깜빡임·시선 이동·입 개폐·고개 회전·머리카락 흔들림에서 필요한 분리 단위와 겹침 순서를 고려한다. 예를 들어 흰자와 홍채, 위·아래 눈꺼풀은 독립적인 움직임이 필요하면 별도 파츠로 둔다. 움직일 때 드러나는 가림 영역은 기존 `fillMask` 규칙에 따라 별도로 보완한다.
+- **레이어 합성 모드는 일반(`normal`)·곱하기(`multiply`)·가산(`additive`) 세 가지로 제한**한다. 현재 PSD 내보내기는 5절에 따라 `normal`만 지원한다. `multiply`·`additive`는 해당 모드의 저장과 실제 Cubism Editor 가져오기를 검증한 뒤 지원하며, 그 전에는 지원한다고 표시하거나 원본 합성 모드를 조용히 `normal`로 바꾸지 않는다.
