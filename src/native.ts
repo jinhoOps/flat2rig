@@ -1,4 +1,4 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   describeDynamicPart,
@@ -18,6 +18,8 @@ import {
   type PartProvenance,
   type Point,
   type PromptPoint,
+  type StyleMatchReport,
+  type TemplateStyleSelection,
 } from "./types";
 import {
   checkMeshQuality,
@@ -134,6 +136,7 @@ export interface PartProposalResult {
   modelHashes: Record<string, string>;
   postprocessVersion: string;
   imageHash: string;
+  styleMatch?: StyleMatchReport;
 }
 export interface PromptCandidate {
   index: number;
@@ -209,17 +212,23 @@ export async function proposeParts(
     modelPath?: string | null;
     detailMode?: "detail" | "parent";
     hairSplit?: boolean;
+    templateMode?: boolean;
+    styleOverrides?: TemplateStyleSelection | null;
     jobId?: number | null;
   },
   signal: AbortSignal,
 ): Promise<PartProposalResult> {
   const detailMode = options.detailMode ?? "detail";
   const hairSplit = options.hairSplit ?? true;
+  const templateMode = options.templateMode ?? detailMode === "detail";
   if (desktop) {
     const res = await invoke<{
       jobId: number;
       partIds: string[];
       masks: string[];
+      fillMasks?: (string | null)[];
+      fillKinds?: string[];
+      textures?: (string | null)[];
       metas: {
         id: string;
         provenance: PartProvenance;
@@ -231,6 +240,7 @@ export async function proposeParts(
       modelHashes: Record<string, string>;
       postprocessVersion: string;
       imageHash: string;
+      styleMatch?: StyleMatchReport | null;
     }>("propose_parts", {
       rgba: base64(pixels),
       width,
@@ -242,10 +252,13 @@ export async function proposeParts(
       modelPath: options.modelPath ?? null,
       detailMode,
       hairSplit,
+      templateMode,
+      styleOverrides: options.styleOverrides ?? null,
       jobId: options.jobId ?? null,
     });
     signal.throwIfAborted();
     const hasClothes = res.partIds.includes("clothes");
+    const validFillKinds = new Set(["none", "neighbor", "external", "template"]);
     return {
       parts: res.partIds.map((id, i) => {
         const known = PART_META_MAP.get(id);
@@ -259,6 +272,11 @@ export async function proposeParts(
         const group = known ? known[2] : dynamic!.group;
         const color = known ? known[3] : dynamic!.color;
         const meta = res.metas[i];
+        const rawFill = res.fillMasks?.[i];
+        const rawKind = res.fillKinds?.[i];
+        const fillKind: FillKind =
+          rawKind && validFillKinds.has(rawKind) ? (rawKind as FillKind) : "none";
+        const tex = res.textures?.[i];
         return {
           id,
           name,
@@ -268,6 +286,9 @@ export async function proposeParts(
           visible: true,
           status: "draft",
           mask: unbase64(res.masks[i]),
+          ...(rawFill ? { fillMask: unbase64(rawFill) } : {}),
+          fillKind,
+          ...(tex ? { texture: tex } : {}),
           provenance: meta?.provenance ?? "geometry",
           confidence: meta?.confidence,
           diagnostics: meta?.diagnostics,
@@ -278,6 +299,7 @@ export async function proposeParts(
       modelHashes: res.modelHashes ?? {},
       postprocessVersion: res.postprocessVersion,
       imageHash: res.imageHash,
+      styleMatch: res.styleMatch ?? undefined,
     };
   }
   const fallback = await separateNative(
@@ -376,7 +398,7 @@ export async function buildRig(
   await new Promise((resolve) => setTimeout(resolve, 20));
   return parts.map((part) => {
     const eff = effectiveMask(part);
-    const mesh = meshForPart(eff, width, height, 14, landmarks);
+    const mesh = meshForPart(eff, width, height, 14, landmarks, part);
     return {
       id: part.id,
       mesh,
@@ -549,6 +571,67 @@ export async function analyzeFace(
   });
   signal.throwIfAborted();
   return result;
+}
+
+export interface UpdateCheckResult {
+  status: "up-to-date" | "available" | "unsigned-release" | "unavailable";
+  currentVersion: string;
+  latestVersion?: string | null;
+  date?: string | null;
+  notes?: string | null;
+  signed: boolean;
+  endpointUsed: string;
+  releaseUrl: string;
+  message: string;
+}
+
+export type UpdateDownloadEvent =
+  | { event: "Started"; data: { contentLength?: number | null } }
+  | { event: "Progress"; data: { downloaded: number; contentLength?: number | null } }
+  | { event: "Finished" };
+
+export async function getAppVersion(): Promise<string> {
+  if (!desktop) return "0.2.0-1";
+  try {
+    return await invoke<string>("get_app_version");
+  } catch {
+    return "0.2.0-1";
+  }
+}
+
+export async function checkAppUpdate(
+  customEndpoint?: string,
+): Promise<UpdateCheckResult> {
+  if (!desktop) {
+    return {
+      status: "unavailable",
+      currentVersion: "0.2.0-1",
+      latestVersion: null,
+      signed: false,
+      endpointUsed: customEndpoint || "",
+      releaseUrl: "https://github.com/jinhoOps/flat2rig/releases",
+      message: "자동 업데이트 확인은 데스크톱 앱(.msi) 환경에서 실행됩니다.",
+    };
+  }
+  return invoke<UpdateCheckResult>("check_app_update", {
+    customEndpoint: customEndpoint?.trim() || null,
+  });
+}
+
+export async function installAppUpdate(
+  onProgress: (ev: UpdateDownloadEvent) => void,
+): Promise<void> {
+  if (!desktop) {
+    throw new Error("자동 업데이트 설치는 데스크톱 앱에서 실행됩니다.");
+  }
+  const channel = new Channel<UpdateDownloadEvent>();
+  channel.onmessage = onProgress;
+  await invoke("install_app_update", { onEvent: channel });
+}
+
+export async function relaunchApp(): Promise<void> {
+  if (!desktop) return;
+  await invoke("relaunch_app");
 }
 
 export async function detectLandmarksForFace(

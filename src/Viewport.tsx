@@ -13,7 +13,7 @@ import type {
   Tool,
 } from "./types";
 import { canvas, loadImage, pixels, pixelsCanvas } from "./images";
-import { clamp, deform, effectiveMask, maskedPixels, meshForPart } from "./engine";
+import { clamp, compositePartTexture, deform, effectiveMask, meshForPart } from "./engine";
 
 interface Props {
   project: Project;
@@ -97,13 +97,17 @@ export default function Viewport(props: Props) {
   const [cursor, setCursor] = useState<Point | null>(null),
     [frame, setFrame] = useState(0);
   const physics = useRef({ position: 0, velocity: 0, previous: 0 });
+  const clipWorkCanvas = useRef<{
+    white: HTMLCanvasElement;
+    iris: HTMLCanvasElement;
+  } | null>(null);
   const fallbackMeshes = useMemo(
     () =>
       new Map(
         p.parts.map((part) => [
           part.id,
           meshes.get(part.id) ??
-            meshForPart(effectiveMask(part), p.width, p.height, 14, p.landmarks),
+            meshForPart(effectiveMask(part), p.width, p.height, 14, p.landmarks, part),
         ]),
       ),
     [p.parts, p.width, p.height, p.landmarks, meshes],
@@ -140,11 +144,11 @@ export default function Viewport(props: Props) {
       p.parts.map(async (part) => {
         const cached = textureCache.current.get(part.id);
         if (cached?.part === part) return cached.canvas;
-        const sourcePixels = part.texture
+        const texPixels = part.texture
           ? pixels(await loadImage(part.texture), p.width, p.height)
-          : data;
+          : undefined;
         const result = pixelsCanvas(
-          maskedPixels(sourcePixels, effectiveMask(part)),
+          compositePartTexture(part, data, texPixels),
           p.width,
           p.height,
         );
@@ -225,10 +229,19 @@ export default function Viewport(props: Props) {
     if (playing && preview) {
       pose.angleX += Math.sin(frame * 0.9) * 7;
       pose.angleY += Math.sin(frame * 0.65) * 4;
+      pose.angleZ += Math.sin(frame * 0.45) * 2.5;
       const blink = Math.pow(Math.max(0, Math.cos(frame * 1.5)), 24);
       pose.eyeL *= 1 - blink;
       pose.eyeR *= 1 - blink;
+      pose.eyeBallX = clamp(pose.eyeBallX + Math.sin(frame * 0.55) * 0.35, -1, 1);
+      pose.eyeBallY = clamp(pose.eyeBallY + Math.sin(frame * 0.8 + 1.0) * 0.18, -1, 1);
+      pose.browLY = clamp(pose.browLY + Math.sin(frame * 0.9) * 0.18, -1, 1);
+      pose.browRY = clamp(pose.browRY + Math.sin(frame * 0.9) * 0.18, -1, 1);
       pose.mouth = Math.max(pose.mouth, Math.max(0, Math.sin(frame * 2)) * 0.5);
+      pose.mouthForm = clamp(pose.mouthForm + Math.sin(frame * 0.7) * 0.25, -1, 1);
+      pose.breath = Math.max(pose.breath, 0.5 + 0.5 * Math.sin(frame * 1.4));
+      pose.bodyAngleX = clamp(pose.bodyAngleX + Math.sin(frame * 0.45) * 3.5, -10, 10);
+      pose.bodyAngleZ = clamp(pose.bodyAngleZ + Math.sin(frame * 0.45 + 0.4) * 2.0, -10, 10);
       const ph = physics.current;
       const dt = clamp(frame - ph.previous, 0, 0.05);
       ph.previous = frame;
@@ -237,12 +250,28 @@ export default function Viewport(props: Props) {
         dt;
       ph.position += ph.velocity * dt;
       pose.hair += ph.position;
+      pose.hairSide = clamp(pose.hairSide + ph.position * 0.85, -1, 1);
+      pose.hairBack = clamp(pose.hairBack + ph.position * 0.65, -1, 1);
     }
     const moving =
       preview &&
       Object.entries(pose).some(([k, v]) =>
         k === "eyeL" || k === "eyeR" ? v !== 1 : v !== 0,
       );
+    const ensureClipCanvases = () => {
+      if (
+        !clipWorkCanvas.current ||
+        clipWorkCanvas.current.white.width !== p.width ||
+        clipWorkCanvas.current.white.height !== p.height
+      ) {
+        clipWorkCanvas.current = {
+          white: canvas(p.width, p.height),
+          iris: canvas(p.width, p.height),
+        };
+      }
+      return clipWorkCanvas.current;
+    };
+    const renderedSclera = new Map<string, HTMLCanvasElement>();
     if (props.original || !p.parts.length) {
       if (source) ctx.drawImage(source, 0, 0);
     } else
@@ -261,36 +290,110 @@ export default function Viewport(props: Props) {
           )
             return;
           const mesh = meshes.get(part.id) ?? fallbackMeshes.get(part.id);
-          if (moving && mesh && mesh.triangles.length) {
-            for (let t = 0; t < mesh.triangles.length; t += 3) {
-              const ids = mesh.triangles.slice(t, t + 3);
-              const src = ids.map((j) => mesh.vertices[j]);
-              triangle(
-                ctx,
-                textures[i],
-                src,
-                src.map((pt) => deform(pt, part, p.landmarks, pose)),
-              );
-            }
-          } else ctx.drawImage(textures[i], 0, 0);
-          if (props.wire && mesh) {
-            ctx.beginPath();
-            ctx.strokeStyle = part.id === selected ? "#49efcc" : "#9faecb88";
-            ctx.lineWidth = Math.max(0.6, 1 / scale);
-            for (let t = 0; t < mesh.triangles.length; t += 3) {
-              const pts = mesh.triangles
-                .slice(t, t + 3)
-                .map((j) =>
-                  preview
-                    ? deform(mesh.vertices[j], part, p.landmarks, pose)
-                    : mesh.vertices[j],
+          const drawDeformed = (targetCtx: CanvasRenderingContext2D) => {
+            if (moving && mesh && mesh.triangles.length) {
+              for (let t = 0; t < mesh.triangles.length; t += 3) {
+                const ids = mesh.triangles.slice(t, t + 3);
+                const src = ids.map((j) => mesh.vertices[j]);
+                triangle(
+                  targetCtx,
+                  textures[i],
+                  src,
+                  src.map((pt) => deform(pt, part, p.landmarks, pose)),
                 );
-              ctx.moveTo(pts[0].x, pts[0].y);
-              ctx.lineTo(pts[1].x, pts[1].y);
-              ctx.lineTo(pts[2].x, pts[2].y);
-              ctx.closePath();
+              }
+            } else {
+              targetCtx.drawImage(textures[i], 0, 0);
+            }
+          };
+
+          const compositeOp: GlobalCompositeOperation =
+            part.blendMode === "multiply"
+              ? "multiply"
+              : part.blendMode === "additive"
+                ? "lighter"
+                : "source-over";
+          ctx.globalCompositeOperation = compositeOp;
+          if (part.id === "eyeR_white" || part.id === "eyeL_white") {
+            drawDeformed(ctx);
+            if (moving && !props.solo) {
+              const pair = ensureClipCanvases();
+              const wCtx = pair.white.getContext("2d")!;
+              wCtx.clearRect(0, 0, p.width, p.height);
+              wCtx.globalCompositeOperation = "source-over";
+              drawDeformed(wCtx);
+              renderedSclera.set(part.id, pair.white);
+            }
+          } else if (
+            (part.id === "eyeR_iris" || part.id === "eyeL_iris") &&
+            moving &&
+            !props.solo
+          ) {
+            const sclera =
+              renderedSclera.get(
+                part.id === "eyeR_iris" ? "eyeR_white" : "eyeL_white",
+              ) ?? null;
+            if (sclera) {
+              const pair = ensureClipCanvases();
+              const iCtx = pair.iris.getContext("2d")!;
+              iCtx.clearRect(0, 0, p.width, p.height);
+              iCtx.globalCompositeOperation = "source-over";
+              drawDeformed(iCtx);
+              iCtx.globalCompositeOperation = "destination-in";
+              iCtx.drawImage(sclera, 0, 0);
+              iCtx.globalCompositeOperation = "source-over";
+              ctx.drawImage(pair.iris, 0, 0);
+            } else {
+              drawDeformed(ctx);
+            }
+          } else {
+            drawDeformed(ctx);
+          }
+          ctx.globalCompositeOperation = "source-over";
+          if (props.wire && mesh && mesh.triangles.length) {
+            const posed = preview
+              ? mesh.vertices.map((pt) => deform(pt, part, p.landmarks, pose))
+              : mesh.vertices;
+            const edgeCounts = new Map<string, [number, number, number]>();
+            const addEdge = (u: number, v: number) => {
+              const lo = Math.min(u, v);
+              const hi = Math.max(u, v);
+              const key = `${lo}:${hi}`;
+              const prev = edgeCounts.get(key);
+              if (prev) prev[2]++;
+              else edgeCounts.set(key, [lo, hi, 1]);
+            };
+            for (let t = 0; t < mesh.triangles.length; t += 3) {
+              const a = mesh.triangles[t];
+              const b = mesh.triangles[t + 1];
+              const c = mesh.triangles[t + 2];
+              addEdge(a, b);
+              addEdge(b, c);
+              addEdge(c, a);
+            }
+            ctx.save();
+            ctx.beginPath();
+            ctx.strokeStyle = part.id === selected ? "#49efcc" : "#9faecb";
+            ctx.globalAlpha = part.id === selected ? 0.42 : 0.28;
+            ctx.lineWidth = Math.max(0.5, 0.8 / scale);
+            for (const [u, v, cnt] of edgeCounts.values()) {
+              if (cnt <= 1) continue;
+              ctx.moveTo(posed[u].x, posed[u].y);
+              ctx.lineTo(posed[v].x, posed[v].y);
             }
             ctx.stroke();
+
+            ctx.beginPath();
+            ctx.strokeStyle = part.id === selected ? "#49efcc" : "#8fb0e0";
+            ctx.globalAlpha = part.id === selected ? 0.95 : 0.72;
+            ctx.lineWidth = Math.max(0.85, 1.35 / scale);
+            for (const [u, v, cnt] of edgeCounts.values()) {
+              if (cnt !== 1) continue;
+              ctx.moveTo(posed[u].x, posed[u].y);
+              ctx.lineTo(posed[v].x, posed[v].y);
+            }
+            ctx.stroke();
+            ctx.restore();
           }
         });
     if (!preview && !props.original && props.compareDiff && source && p.parts.length)
@@ -438,7 +541,7 @@ function drawAnalysisOverlay(
       ctx.lineWidth = (active ? 2.0 : 1.2) / scale;
       if (!active) ctx.setLineDash([5 / scale, 4 / scale]);
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-      ctx.font = `${10.5 / scale}px sans-serif`;
+      ctx.font = `600 ${13 / scale}px sans-serif`;
       const tag = `얼굴 #${cand.id + 1} (${Math.round(cand.score * 100)}%)`;
       ctx.fillStyle = active ? "#2456D6" : "#6E7485";
       ctx.fillText(tag, x1 + 4 / scale, Math.max(12 / scale, y1 - 4 / scale));
@@ -474,7 +577,7 @@ function drawAnalysisOverlay(
     ctx.strokeStyle = ringColor;
     ctx.lineWidth = 2 / scale;
     ctx.stroke();
-    ctx.font = `${11 / scale}px sans-serif`;
+    ctx.font = `600 ${13 / scale}px sans-serif`;
     ctx.lineWidth = 3 / scale;
     ctx.strokeStyle = "#ffffff";
     const label = `${landmarkLabels[id]}${suffix}`;

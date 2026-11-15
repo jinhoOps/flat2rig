@@ -4,6 +4,7 @@ pub mod models;
 pub mod parts;
 pub mod segmentation;
 pub mod state;
+pub mod templates;
 pub mod transforms;
 
 #[cfg(test)]

@@ -111,10 +111,12 @@ try {
   await rpc("Page.enable");
   await waitFor("Boolean(document.body?.innerText?.includes('일러스트 가져오기'))");
   const initial = await evaluate(
-    "({text:document.body.innerText,tauri:!!window.__TAURI_INTERNALS__,surface:getComputedStyle(document.querySelector('.topbar')).backdropFilter})",
+    "(()=>{const rgb=s=>{const m=s.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);return m?[+m[1],+m[2],+m[3]]:[0,0,0];};const luma=([r,g,b])=>0.2126*r+0.7152*g+0.0722*b;const panelEl=document.querySelector('.layers-panel')||document.querySelector('.inspector');return {text:document.body.innerText,tauri:!!window.__TAURI_INTERNALS__,surface:getComputedStyle(document.querySelector('.topbar')).backdropFilter,bodyBg:getComputedStyle(document.body).backgroundColor,bodyLuma:luma(rgb(getComputedStyle(document.body).backgroundColor)),panelBg:getComputedStyle(panelEl).backgroundColor,panelLuma:luma(rgb(getComputedStyle(panelEl).backgroundColor))};})()",
   );
   if (!initial.tauri) throw new Error("Native bridge not active");
-  console.log("Native WebView and Rust bridge loaded");
+  if (initial.bodyLuma < 200 || initial.panelLuma < 200)
+    throw new Error(`Expected Daylight Light Mode default, got ${JSON.stringify({ bodyBg: initial.bodyBg, panelBg: initial.panelBg })}`);
+  console.log("Native WebView, Daylight Light Mode, and Rust bridge loaded");
   const { root: documentRoot } = await rpc("DOM.getDocument");
   const { nodeId } = await rpc("DOM.querySelector", {
     nodeId: documentRoot.nodeId,
@@ -191,8 +193,16 @@ try {
     "[...document.querySelectorAll('[role=tab]')].find(b=>b.textContent.includes('리깅')).click()",
   );
   await waitFor(
-    "document.querySelectorAll('input[type=range]').length===7 && !document.body.innerText.includes('메쉬 계산 중')",
+    "document.querySelectorAll('input[type=range]').length>=22 && !document.body.innerText.includes('메쉬 계산 중')",
   );
+  const typography = await evaluate(
+    "(()=>{let minFont=999,minEl='';for(const el of document.querySelectorAll('*')){if(el.closest('.sr-only')||el.classList.contains('sr-only'))continue;const st=getComputedStyle(el);if(st.display==='none'||st.visibility==='hidden'||parseFloat(st.opacity)===0)continue;const r=el.getBoundingClientRect();if(r.width<=2||r.height<=2)continue;const hasText=[...el.childNodes].some(n=>n.nodeType===3&&n.nodeValue.trim().length>0);if(!hasText)continue;const fs=parseFloat(st.fontSize);if(fs<minFont){minFont=fs;minEl=el.tagName+'.'+el.className+':'+el.textContent.trim().slice(0,20);}}return {minFont,minEl,groupHeaders:document.querySelectorAll('.layer-group-header').length,paramTabs:document.querySelectorAll('.param-group-tab').length};})()",
+  );
+  if (typography.minFont < 12)
+    throw new Error(`Minimum UI font size below 12px: ${JSON.stringify(typography)}`);
+  if (typography.paramTabs < 7)
+    throw new Error(`Expected parameter group tabs, got ${JSON.stringify(typography)}`);
+  console.log("Daylight font-size floor (>=12px) and parameter tabs verified:", JSON.stringify(typography));
   await rpc("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-reduced-transparency", value: "reduce" }],
   });
@@ -213,6 +223,8 @@ try {
     dragDrop: true,
     invalidDropRejected: true,
     initialSurface: initial.surface,
+    lightMode: { bodyBg: initial.bodyBg, panelBg: initial.panelBg },
+    typography,
     reducedTransparency: reduced,
     native,
     exceptions,

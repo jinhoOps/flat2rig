@@ -28,7 +28,7 @@ body {
 }
 .brand-preview header > span {
   color: #747e8f;
-  font-size: 11px;
+  font-size: 12px;
 }
 .brand-preview-feature {
   padding-top: 40px;
@@ -49,7 +49,7 @@ body {
 .brand-assets a {
   color: #1d47b8;
   text-underline-offset: 4px;
-  font-size: 11px;
+  font-size: 12px;
 }
 .gold-preview {
   width: min(100% - 32px, 480px);

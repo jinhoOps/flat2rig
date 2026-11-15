@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "flat2rig",
-  "version": "0.1.0",
+  "version": "0.2.0-1",
   "identifier": "studio.flat2rig.desktop",
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://127.0.0.1:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": { "windows": [{ "label": "main", "title": "flat2rig — Cubism preparation studio", "width": 1440, "height": 960, "minWidth": 1100, "minHeight": 720, "dragDropEnabled": false }], "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost; worker-src 'self' blob:; font-src 'self' data:" } },
@@ -15,5 +15,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBDNjkzMDJDMzUxNzA1OUMKUldTY0JSYzFMREJwREFHK3FKMkFWdU1aS0I3VU9LKzVjQkZvUy9ETUE5eTg2L1RpTDZvRGhLMGoK",
+      "endpoints": [
+        "https://github.com/jinhoOps/flat2rig/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

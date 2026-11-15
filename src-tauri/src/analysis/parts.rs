@@ -5,8 +5,10 @@ use super::segmentation::{
     SAM_PREPROCESS_VERSION,
 };
 use super::state::{hash_rgba_bytes, AnalysisState, SamEmbeddingCache};
-use crate::core::{self, Landmarks, IDS};
+use super::templates::{synthesize_template_bank, StyleMatchReport, TemplateStyleSelection};
+use crate::core::{self, HeadFrame, Landmarks, IDS};
 use crate::inference;
+use glam::DVec2;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -26,11 +28,15 @@ pub struct PartProposalMeta {
 pub struct PartsProposalOutput {
     pub part_ids: Vec<String>,
     pub masks: Vec<Vec<u8>>,
+    pub fill_masks: Vec<Option<Vec<u8>>>,
+    pub fill_kinds: Vec<String>,
+    pub textures: Vec<Option<String>>,
     pub metas: Vec<PartProposalMeta>,
     pub provider: String,
     pub model_hashes: HashMap<String, String>,
     pub postprocess_version: String,
     pub image_hash: String,
+    pub style_match: Option<StyleMatchReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +462,20 @@ fn clean_sam_mask_in_fg(mask: &[u8], fg: &[u8], w: usize, h: usize) -> Vec<u8> {
     cur
 }
 
+#[inline]
+fn is_warm_skin_candidate(rgba: &[u8], idx: usize, skin_rgb: [f64; 3]) -> bool {
+    let p = idx * 4;
+    let r = rgba[p] as f64;
+    let g = rgba[p + 1] as f64;
+    let b = rgba[p + 2] as f64;
+    let skin_warmth = skin_rgb[0] - skin_rgb[2];
+    if skin_warmth > 10.0 {
+        (r - b) >= (skin_warmth * 0.28).max(4.0) && r + 3.0 >= g
+    } else {
+        true
+    }
+}
+
 fn build_hair_palette(
     rgba: &[u8],
     fg: &[u8],
@@ -465,25 +485,29 @@ fn build_hair_palette(
     skin_rgb: [f64; 3],
     eye_dist: f64,
 ) -> Vec<[f64; 3]> {
-    let face_cx = 0.5 * (landmarks.eye_l.x + landmarks.eye_r.x);
-    let crown_y = (landmarks.crown.y + eye_dist * 0.12).clamp(0.0, (h - 1) as f64);
-    let candidates = [
-        (landmarks.crown.x, crown_y),
-        (face_cx - eye_dist * 0.55, landmarks.crown.y + eye_dist * 0.25),
-        (face_cx + eye_dist * 0.55, landmarks.crown.y + eye_dist * 0.25),
-        (landmarks.eye_r.x - eye_dist * 0.45, landmarks.eye_r.y - eye_dist * 0.12),
-        (landmarks.eye_l.x + eye_dist * 0.45, landmarks.eye_l.y - eye_dist * 0.12),
-        (face_cx - eye_dist * 0.90, 0.5 * (landmarks.eye_r.y + landmarks.chin.y)),
-        (face_cx + eye_dist * 0.90, 0.5 * (landmarks.eye_l.y + landmarks.chin.y)),
-        (face_cx - eye_dist * 0.45, landmarks.eye_r.y - eye_dist * 0.45),
-        (face_cx + eye_dist * 0.45, landmarks.eye_l.y - eye_dist * 0.45),
+    let frame = HeadFrame::from_landmarks(landmarks, w, h);
+    let ed = eye_dist.max(frame.eye_dist);
+    let hh = frame.hh;
+    let local_candidates = [
+        (0.0, frame.crown_v + ed * 0.12),
+        (-ed * 0.55, frame.crown_v + ed * 0.25),
+        (ed * 0.55, frame.crown_v + ed * 0.25),
+        (-ed * 0.92, -ed * 0.15),
+        (ed * 0.92, -ed * 0.15),
+        (-ed * 1.12, hh * 0.30),
+        (ed * 1.12, hh * 0.30),
+        (-ed * 0.45, -ed * 0.45),
+        (ed * 0.45, -ed * 0.45),
+        (-ed * 1.18, frame.chin_v + hh * 0.15),
+        (ed * 1.18, frame.chin_v + hh * 0.15),
     ];
-    let mut all_samples = Vec::with_capacity(candidates.len());
-    for (cx, cy) in candidates {
-        if cx >= 0.0 && cy >= 0.0 && cx < w as f64 && cy < h as f64 {
-            let idx = (cy as usize) * w + (cx as usize);
+    let mut all_samples = Vec::with_capacity(local_candidates.len());
+    for (du, dv) in local_candidates {
+        let p = frame.origin + frame.ex * du + frame.ey * dv;
+        if p.x >= 0.0 && p.y >= 0.0 && p.x < w as f64 && p.y < h as f64 {
+            let idx = (p.y as usize) * w + (p.x as usize);
             if fg[idx] > 128 {
-                let rgb = sample_patch_rgb(rgba, w, h, cx, cy);
+                let rgb = sample_patch_rgb(rgba, w, h, p.x, p.y);
                 let d_skin = ((rgb[0] - skin_rgb[0]).powi(2)
                     + (rgb[1] - skin_rgb[1]).powi(2)
                     + (rgb[2] - skin_rgb[2]).powi(2))
@@ -494,9 +518,6 @@ fn build_hair_palette(
             }
         }
     }
-    // Filter out near-white glare highlights unless the character truly has white/silver hair,
-    // and avoid washed-out crown rim highlights when saturated/deeper hair samples exist so
-    // pale pastel garments don't match highlight colors as hair.
     let non_glare: Vec<[f64; 3]> = all_samples
         .iter()
         .copied()
@@ -524,7 +545,14 @@ fn build_hair_palette(
     if !all_samples.is_empty() {
         return all_samples;
     }
-    vec![sample_patch_rgb(rgba, w, h, landmarks.crown.x, crown_y)]
+    let crown_seed = frame.origin + frame.ey * (frame.crown_v + ed * 0.12);
+    vec![sample_patch_rgb(
+        rgba,
+        w,
+        h,
+        crown_seed.x.clamp(0.0, (w - 1) as f64),
+        crown_seed.y.clamp(0.0, (h - 1) as f64),
+    )]
 }
 
 #[inline]
@@ -694,48 +722,62 @@ fn compute_hair_valley_and_cost(
 /// Carves a thin continuity-tracked ridge along existing hair creases in an anatomical corridor
 /// so bangs, temples, side locks, and rear hair detach cleanly without flat horizontal cuts.
 #[allow(clippy::too_many_arguments)]
-fn carve_ridge_corridor(
+fn carve_ridge_corridor_uv(
     core: &mut [bool],
     hair_alpha: &[u8],
     valley: &[f32],
     w: usize,
     h: usize,
-    x_range: (f64, f64),
-    y_range: (f64, f64),
+    frame: HeadFrame,
+    u_range: (f64, f64),
+    v_range: (f64, f64),
     ridge_min: f32,
 ) {
-    let x_lo = (x_range.0.floor() as isize).clamp(1, (w as isize).saturating_sub(2)) as usize;
-    let x_hi = (x_range.1.ceil() as isize).clamp(x_lo as isize, (w as isize).saturating_sub(2)) as usize;
-    let y_lo = (y_range.0.floor() as isize).clamp(0, (h as isize).saturating_sub(1)) as usize;
-    let y_hi = (y_range.1.ceil() as isize).clamp(y_lo as isize, (h as isize).saturating_sub(1)) as usize;
-    if x_lo >= x_hi || y_lo >= y_hi {
+    let u_lo = u_range.0.min(u_range.1);
+    let u_hi = u_range.0.max(u_range.1);
+    let v_lo = v_range.0.min(v_range.1).floor() as isize;
+    let v_hi = v_range.0.max(v_range.1).ceil() as isize;
+    if u_hi - u_lo < 2.0 || v_hi <= v_lo {
         return;
     }
 
-    let mut prev_x: Option<usize> = None;
-    for y in y_lo..=y_hi {
-        let row = y * w;
-        let sx0 = prev_x.map(|px| px.saturating_sub(3).max(x_lo)).unwrap_or(x_lo);
-        let sx1 = prev_x.map(|px| (px + 3).min(x_hi)).unwrap_or(x_hi);
-        let mut best_x = sx0;
+    let mut prev_u: Option<f64> = None;
+    for iv in v_lo..=v_hi {
+        let fv = iv as f64;
+        let su0 = prev_u.map(|pu| (pu - 3.5).max(u_lo)).unwrap_or(u_lo);
+        let su1 = prev_u.map(|pu| (pu + 3.5).min(u_hi)).unwrap_or(u_hi);
+        let mut best_u = su0;
+        let mut best_px = None;
         let mut best_v = -1.0f32;
-        for x in sx0..=sx1 {
-            let i = row + x;
-            if hair_alpha[i] > 0 && valley[i] > best_v {
-                best_v = valley[i];
-                best_x = x;
+        let mut u = su0;
+        while u <= su1 {
+            let p = frame.origin + frame.ex * u + frame.ey * fv;
+            let ix = p.x.round() as isize;
+            let iy = p.y.round() as isize;
+            if ix >= 0 && iy >= 0 && ix < w as isize && iy < h as isize {
+                let i = iy as usize * w + ix as usize;
+                if hair_alpha[i] > 0 && valley[i] > best_v {
+                    best_v = valley[i];
+                    best_u = u;
+                    best_px = Some((ix as usize, iy as usize));
+                }
             }
+            u += 1.0;
         }
         if best_v >= ridge_min {
-            core[row + best_x] = false;
-            if best_x + 1 < w && valley[row + best_x + 1] >= ridge_min * 0.6 {
-                core[row + best_x + 1] = false;
-            } else if best_x > 0 {
-                core[row + best_x - 1] = false;
+            if let Some((bx, by)) = best_px {
+                core[by * w + bx] = false;
+                if bx + 1 < w && valley[by * w + bx + 1] >= ridge_min * 0.6 {
+                    core[by * w + bx + 1] = false;
+                } else if bx > 0 {
+                    core[by * w + bx - 1] = false;
+                }
+                prev_u = Some(best_u);
+            } else {
+                prev_u = None;
             }
-            prev_x = Some(best_x);
         } else {
-            prev_x = None;
+            prev_u = None;
         }
     }
 }
@@ -821,8 +863,7 @@ fn classify_seed_role(
     pxs: &[usize],
     input: &HairSplitInput<'_>,
     torso_spans: &[Option<(usize, usize)>],
-    face_cx: f64,
-    eye_mid_y: f64,
+    frame: HeadFrame,
     eye_dist: f64,
     hh: f64,
 ) -> (HairRole, f64, f64) {
@@ -831,10 +872,12 @@ fn classify_seed_role(
     let lm = input.landmarks;
     let mut sx = 0.0;
     let mut sy = 0.0;
-    let mut min_x = w;
-    let mut max_x = 0usize;
-    let mut min_y = h;
-    let mut max_y = 0usize;
+    let mut su = 0.0;
+    let mut sv = 0.0;
+    let mut min_u = f64::INFINITY;
+    let mut max_u = f64::NEG_INFINITY;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
     let mut touches_face = 0usize;
     let mut touches_torso = 0usize;
     let mut lower_px = 0usize;
@@ -843,12 +886,17 @@ fn classify_seed_role(
     for &idx in pxs {
         let x = idx % w;
         let y = idx / w;
-        sx += x as f64;
-        sy += y as f64;
-        min_x = min_x.min(x);
-        max_x = max_x.max(x);
-        min_y = min_y.min(y);
-        max_y = max_y.max(y);
+        let fx = x as f64;
+        let fy = y as f64;
+        let (u, v) = frame.to_local(DVec2::new(fx, fy));
+        sx += fx;
+        sy += fy;
+        su += u;
+        sv += v;
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
 
         let near = [
             x.checked_sub(1).map(|nx| y * w + nx),
@@ -862,7 +910,7 @@ fn classify_seed_role(
         if near.into_iter().flatten().any(|ni| input.torso_mask[ni] > 128) {
             touches_torso += 1;
         }
-        if (y as f64) >= lm.chin.y + eye_dist * 0.1 {
+        if fy >= lm.chin.y + eye_dist * 0.1 || v >= frame.chin_v + eye_dist * 0.1 {
             lower_px += 1;
             if let Some((t_lo, t_hi)) = torso_spans[y] {
                 if x + 4 >= t_lo && x <= t_hi + 4 {
@@ -875,42 +923,45 @@ fn classify_seed_role(
     let cnt = pxs.len().max(1) as f64;
     let cx = sx / cnt;
     let cy = sy / cnt;
-    let abs_dx = (cx - face_cx).abs();
-    let f_min_y = min_y as f64;
-    let f_max_y = max_y as f64;
+    let u_mean = su / cnt;
+    let v_mean = sv / cnt;
+    let abs_du = u_mean.abs();
+    let f_min_v = min_v;
+    let f_max_v = max_v;
     let enclosed_ratio = if lower_px > 0 {
         enclosed_torso as f64 / lower_px as f64
     } else {
         0.0
     };
 
-    // Upper forehead / ahoge / bangs: foreground hair arches above cheek/jawline that do not drape onto torso
-    let is_front = (f_max_y <= lm.chin.y + eye_dist * 0.35
-        && f_min_y <= eye_mid_y + eye_dist * 0.15
-        && (abs_dx <= eye_dist * 1.10 || touches_face >= 4))
-        || (f_min_y <= eye_mid_y - eye_dist * 0.05
-            && cy <= lm.chin.y + eye_dist * 0.05
-            && f_max_y <= lm.chin.y + hh * 0.65
-            && (abs_dx <= eye_dist * 1.15 || touches_face >= 6)
-            && enclosed_ratio < 0.25)
-        || (f_max_y <= lm.crown.y + hh * 0.25 && abs_dx <= eye_dist * 1.15);
+    // Upper forehead / ahoge / bangs aligned along tilted HeadFrame.
+    let is_front = (v_mean <= eye_dist * 0.22
+        && abs_du <= eye_dist * 0.88
+        && f_max_v <= frame.chin_v + eye_dist * 0.15)
+        || (f_max_v <= frame.chin_v + eye_dist * 0.25
+            && f_min_v <= eye_dist * 0.15
+            && (abs_du <= eye_dist * 0.88 || touches_face >= 6)
+            && enclosed_ratio < 0.20)
+        || (f_max_v <= frame.crown_v + hh * 0.32 && abs_du <= eye_dist * 1.12);
 
     let role = if is_front {
         HairRole::Front
     } else {
-        let outer_halo = f_min_y < lm.crown.y + hh * 0.22
-            && abs_dx > eye_dist * 1.48
+        let outer_halo = f_min_v < frame.crown_v + hh * 0.25
+            && abs_du > eye_dist * 1.50
             && enclosed_ratio < 0.22;
-        let drapes_over_front = enclosed_ratio >= 0.34
+        let drapes_over_front = enclosed_ratio >= 0.30
             || touches_torso >= 4
-            || (touches_face >= 2 && f_min_y >= eye_mid_y - eye_dist * 0.45);
-        let side_zone = f_min_y <= lm.chin.y + eye_dist * 0.70
-            && abs_dx >= eye_dist * 0.38
-            && abs_dx <= eye_dist * 1.90
+            || (touches_face >= 2 && f_min_v >= -eye_dist * 0.45);
+        let side_zone = f_min_v <= frame.chin_v + eye_dist * 0.70
+            && abs_du >= eye_dist * 0.36
+            && abs_du <= eye_dist * 1.88
             && !outer_halo
-            && (drapes_over_front || (abs_dx <= eye_dist * 1.48 && f_min_y >= eye_mid_y - eye_dist * 0.45));
+            && (drapes_over_front
+                || (f_max_v >= eye_dist * 0.15 && touches_face >= 2)
+                || (f_max_v >= frame.chin_v - eye_dist * 0.15 && abs_du <= eye_dist * 1.48));
         if side_zone {
-            if cx < face_cx {
+            if u_mean < 0.0 {
                 HairRole::SideR
             } else {
                 HairRole::SideL
@@ -919,90 +970,19 @@ fn classify_seed_role(
             HairRole::Back
         }
     };
+    let _ = (min_u, max_u);
     (role, cx, cy)
 }
 
-/// Splits one wide monolithic hair role component along a thin vertical valley, if applicable.
-fn try_split_wide_hair_component(
-    pixels: &[usize],
-    w: usize,
-    h: usize,
-    min_strand_area: usize,
-    min_width: usize,
-) -> Option<(Vec<usize>, Vec<usize>)> {
-    if pixels.len() < min_strand_area * 2 {
-        return None;
-    }
-    let mut min_x = w;
-    let mut max_x = 0usize;
-    let mut col_counts = vec![0usize; w];
-    for &i in pixels {
-        let x = i % w;
-        min_x = min_x.min(x);
-        max_x = max_x.max(x);
-        col_counts[x] += 1;
-    }
-    let span = max_x.saturating_sub(min_x) + 1;
-    if span < min_width.max(16) {
-        return None;
-    }
-    let pad = (span / 5).max(4);
-    let search_lo = min_x + pad;
-    let search_hi = max_x.saturating_sub(pad);
-    if search_lo >= search_hi {
-        return None;
-    }
-    let mut non_zero_cols: Vec<usize> = (min_x..=max_x)
-        .filter(|&x| col_counts[x] > 0)
-        .map(|x| col_counts[x])
-        .collect();
-    non_zero_cols.sort_unstable();
-    let median = non_zero_cols.get(non_zero_cols.len() / 2).copied().unwrap_or(1).max(1);
-
-    let mid_x = (min_x + max_x) as f64 * 0.5;
-    let mut best_x = search_lo;
-    let mut best_score = usize::MAX;
-    let mut best_dist = f64::MAX;
-    for (x, &cnt) in col_counts.iter().enumerate().take(search_hi + 1).skip(search_lo) {
-        let dist = (x as f64 - mid_x).abs();
-        if cnt < best_score || (cnt == best_score && dist < best_dist) {
-            best_score = cnt;
-            best_x = x;
-            best_dist = dist;
-        }
-    }
-    if best_score as f64 > median as f64 * 0.78 && span < (min_width * 7 / 5) {
-        return None;
-    }
-
-    let mut left = Vec::with_capacity(pixels.len() / 2);
-    let mut right = Vec::with_capacity(pixels.len() / 2);
-    for &i in pixels {
-        if i % w <= best_x {
-            left.push(i);
-        } else {
-            right.push(i);
-        }
-    }
-    if left.len() >= min_strand_area && right.len() >= min_strand_area && h > 0 {
-        Some((left, right))
-    } else {
-        None
-    }
-}
-
-/// Splits combined hair pixels into natural crease-aligned strands (`hair_back*`, `hair_side_R*`,
-/// `hair_side_L*`, `hair_front*`) in Cubism Z-order with 100% alpha conservation and zero overlap.
+/// Groups all segmented hair into up to 4 clean cohesive anatomical layers matching Live2D groups
+/// (`hair_back`, `hair_side_R`, `hair_side_L`, `hair_front`) without confetti sub-shards.
 fn split_hair_layers(input: &HairSplitInput<'_>) -> Vec<(String, Vec<u8>)> {
     let (w, h) = (input.w, input.h);
     let n = w * h;
     let lm = input.landmarks;
-    let eye_dist = ((lm.eye_l.x - lm.eye_r.x).powi(2) + (lm.eye_l.y - lm.eye_r.y).powi(2))
-        .sqrt()
-        .max(24.0);
-    let face_cx = 0.5 * (lm.eye_l.x + lm.eye_r.x);
-    let eye_mid_y = 0.5 * (lm.eye_l.y + lm.eye_r.y);
-    let hh = (lm.chin.y - lm.crown.y).max(eye_dist * 1.4);
+    let frame = HeadFrame::from_landmarks(lm, w, h);
+    let eye_dist = frame.eye_dist.max(24.0);
+    let hh = frame.hh.max(eye_dist * 1.4);
 
     let hair_alpha: Vec<u8> = (0..n)
         .map(|i| input.hair_front_mask[i].max(input.hair_back_mask[i]))
@@ -1015,12 +995,12 @@ fn split_hair_layers(input: &HairSplitInput<'_>) -> Vec<(String, Vec<u8>)> {
         ];
     }
 
-    let hair_max_y = hair_alpha
+    let hair_max_v = hair_alpha
         .iter()
         .enumerate()
-        .filter_map(|(i, &a)| (a > 0).then_some(i / w))
-        .max()
-        .unwrap_or(h - 1) as f64;
+        .filter(|&(_, &a)| a > 0)
+        .map(|(i, _)| frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64)).1)
+        .fold(frame.chin_v + eye_dist, f64::max);
 
     let (valley, seam_cost, valley_thresh) =
         compute_hair_valley_and_cost(input.rgba, &hair_alpha, w, h, eye_dist);
@@ -1029,75 +1009,41 @@ fn split_hair_layers(input: &HairSplitInput<'_>) -> Vec<(String, Vec<u8>)> {
         .map(|i| hair_alpha[i] > 0 && valley[i] < valley_thresh)
         .collect();
 
-    // Cut major anatomical partings along actual dark creases before extracting 4-connected cores.
-    carve_ridge_corridor(
+    // Cut major anatomical partings along tilted HeadFrame creases.
+    carve_ridge_corridor_uv(
         &mut core,
         &hair_alpha,
         &valley,
         w,
         h,
-        (face_cx - eye_dist * 0.34, face_cx + eye_dist * 0.34),
-        (lm.crown.y, eye_mid_y + eye_dist * 0.25),
-        valley_thresh * 0.40,
+        frame,
+        (-eye_dist * 0.30, eye_dist * 0.30),
+        (frame.crown_v, eye_dist * 0.22),
+        valley_thresh * 0.42,
     );
     for sign in [-1.0f64, 1.0] {
-        let (tx0, tx1) = (face_cx + sign * eye_dist * 0.58, face_cx + sign * eye_dist * 1.15);
-        carve_ridge_corridor(
+        carve_ridge_corridor_uv(
             &mut core,
             &hair_alpha,
             &valley,
             w,
             h,
-            (tx0.min(tx1), tx0.max(tx1)),
-            (lm.crown.y + hh * 0.08, lm.chin.y + eye_dist * 0.15),
-            valley_thresh * 0.35,
+            frame,
+            (sign * eye_dist * 0.62, sign * eye_dist * 1.08),
+            (frame.crown_v + hh * 0.12, eye_dist * 0.52),
+            valley_thresh * 0.25,
         );
-        let (sx0, sx1) = (face_cx + sign * eye_dist * 1.15, face_cx + sign * eye_dist * 1.92);
-        carve_ridge_corridor(
+        carve_ridge_corridor_uv(
             &mut core,
             &hair_alpha,
             &valley,
             w,
             h,
-            (sx0.min(sx1), sx0.max(sx1)),
-            (eye_mid_y, hair_max_y),
-            valley_thresh * 0.35,
+            frame,
+            (sign * eye_dist * 1.18, sign * eye_dist * 1.92),
+            (-eye_dist * 0.15, hair_max_v),
+            valley_thresh * 0.32,
         );
-    }
-
-    // Separate upper crown/temple arches from long lower shoulder/chest curls along cheek pinch rows.
-    let pre_cores = find_connected_components_4(&core, w, h);
-    let y_pinch_lo = ((eye_mid_y + eye_dist * 0.12).floor() as isize).max(0) as usize;
-    let y_pinch_hi = ((lm.chin.y + eye_dist * 0.28).ceil() as isize).clamp(y_pinch_lo as isize, (h as isize).saturating_sub(1)) as usize;
-    for comp in pre_cores {
-        if comp.len() < 120 {
-            continue;
-        }
-        let min_cy = comp.iter().map(|&i| i / w).min().unwrap_or(h);
-        let max_cy = comp.iter().map(|&i| i / w).max().unwrap_or(0);
-        if (min_cy as f64) <= lm.crown.y + hh * 0.35 && (max_cy as f64) >= lm.chin.y + hh * 0.60 {
-            let mut row_px: HashMap<usize, Vec<usize>> = HashMap::new();
-            for &i in &comp {
-                let y = i / w;
-                if y >= y_pinch_lo && y <= y_pinch_hi {
-                    row_px.entry(y).or_default().push(i);
-                }
-            }
-            if let Some((&best_y, pxs)) = row_px.iter().min_by(|(ay, apxs), (by, bpxs)| {
-                let amax_v = apxs.iter().map(|&i| valley[i]).fold(0.0f32, f32::max);
-                let bmax_v = bpxs.iter().map(|&i| valley[i]).fold(0.0f32, f32::max);
-                let ascore = (apxs.len() as f64) / (1.0 + 0.06 * amax_v as f64);
-                let bscore = (bpxs.len() as f64) / (1.0 + 0.06 * bmax_v as f64);
-                ascore.total_cmp(&bscore).then_with(|| ay.cmp(by))
-            }) {
-                for &i in pxs {
-                    core[i] = false;
-                    if best_y + 1 < h {
-                        core[i + w] = false;
-                    }
-                }
-            }
-        }
     }
 
     let min_seed_area = ((total_hair_px / 220).max(16)).min((total_hair_px / 24).max(6));
@@ -1106,19 +1052,79 @@ fn split_hair_layers(input: &HairSplitInput<'_>) -> Vec<(String, Vec<u8>)> {
 
     let mut seeds: Vec<SeedStats> = Vec::new();
     let mut seed_of_hair_comp = vec![false; n];
+    let margin = (eye_dist * 0.06).max(6.0);
     for c in raw_cores {
         if c.len() < min_seed_area {
             continue;
         }
+        let mut min_cu = f64::INFINITY;
+        let mut max_cu = f64::NEG_INFINITY;
+        let mut min_cv = f64::INFINITY;
+        let mut max_cv = f64::NEG_INFINITY;
+        let mut front_px_count = 0usize;
+        for &idx in &c {
+            let (u, v) = frame.to_local(DVec2::new((idx % w) as f64, (idx / w) as f64));
+            min_cu = min_cu.min(u);
+            max_cu = max_cu.max(u);
+            min_cv = min_cv.min(v);
+            max_cv = max_cv.max(v);
+            if u.abs() <= eye_dist * 0.72 && v <= eye_dist * 0.32 {
+                front_px_count += 1;
+            }
+        }
+        let spans_macro = front_px_count >= min_seed_area
+            && min_cv <= eye_dist * 0.15
+            && (max_cv >= frame.chin_v + hh * 0.25 || (max_cu - min_cu) >= eye_dist * 1.85);
+        if spans_macro {
+            let mut sub_buckets: [Vec<usize>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+            for &idx in &c {
+                let (u, v) = frame.to_local(DVec2::new((idx % w) as f64, (idx / w) as f64));
+                if u.abs() <= eye_dist * 0.80 - margin * 0.5
+                    && v <= (frame.chin_v - eye_dist * 0.08) - margin * 0.5
+                {
+                    sub_buckets[HairRole::Front as usize].push(idx);
+                } else if u <= -eye_dist * 0.80 - margin * 0.5
+                    && u >= -eye_dist * 1.58 + margin * 0.5
+                    && v >= (frame.crown_v + hh * 0.20) + margin * 0.5
+                {
+                    sub_buckets[HairRole::SideR as usize].push(idx);
+                } else if u >= eye_dist * 0.80 + margin * 0.5
+                    && u <= eye_dist * 1.58 - margin * 0.5
+                    && v >= (frame.crown_v + hh * 0.20) + margin * 0.5
+                {
+                    sub_buckets[HairRole::SideL as usize].push(idx);
+                } else if u.abs() >= eye_dist * 1.58 + margin * 0.5 {
+                    sub_buckets[HairRole::Back as usize].push(idx);
+                }
+            }
+            let non_empty_roles = sub_buckets.iter().filter(|b| b.len() >= min_seed_area).count();
+            if non_empty_roles >= 2 {
+                for role in HairRole::ALL {
+                    let b = std::mem::take(&mut sub_buckets[role as usize]);
+                    if b.len() < min_seed_area {
+                        continue;
+                    }
+                    let mut sx = 0.0;
+                    let mut sy = 0.0;
+                    for &idx in &b {
+                        seed_of_hair_comp[idx] = true;
+                        sx += (idx % w) as f64;
+                        sy += (idx / w) as f64;
+                    }
+                    let cnt = b.len() as f64;
+                    seeds.push(SeedStats { pixels: b, role, cx: sx / cnt, cy: sy / cnt });
+                }
+                continue;
+            }
+        }
         let (role, cx, cy) =
-            classify_seed_role(&c, input, &torso_spans, face_cx, eye_mid_y, eye_dist, hh);
+            classify_seed_role(&c, input, &torso_spans, frame, eye_dist, hh);
         for &idx in &c {
             seed_of_hair_comp[idx] = true;
         }
         seeds.push(SeedStats { pixels: c, role, cx, cy });
     }
 
-    // Ensure any disconnected hair island without a core seed still receives its cleanest interior pixel as seed.
     let hair_bool: Vec<bool> = hair_alpha.iter().map(|&a| a > 0).collect();
     for island in find_connected_components_4(&hair_bool, w, h) {
         if island.iter().any(|&i| seed_of_hair_comp[i]) {
@@ -1126,15 +1132,8 @@ fn split_hair_layers(input: &HairSplitInput<'_>) -> Vec<(String, Vec<u8>)> {
         }
         if let Some(&best_px) = island.iter().min_by(|&&a, &&b| valley[a].total_cmp(&valley[b])) {
             let single = [best_px];
-            let (role, cx, cy) = classify_seed_role(
-                &single,
-                input,
-                &torso_spans,
-                face_cx,
-                eye_mid_y,
-                eye_dist,
-                hh,
-            );
+            let (role, cx, cy) =
+                classify_seed_role(&single, input, &torso_spans, frame, eye_dist, hh);
             seeds.push(SeedStats {
                 pixels: vec![best_px],
                 role,
@@ -1191,7 +1190,6 @@ fn split_hair_layers(input: &HairSplitInput<'_>) -> Vec<(String, Vec<u8>)> {
         }
     }
 
-    // Fallback for any diagonal single-pixel orphan inside hair_alpha.
     for (i, &ha) in hair_alpha.iter().enumerate() {
         if ha > 0 && owner[i] == u32::MAX {
             let fx = (i % w) as f64;
@@ -1210,133 +1208,32 @@ fn split_hair_layers(input: &HairSplitInput<'_>) -> Vec<(String, Vec<u8>)> {
         }
     }
 
-    // Collect pixels per watershed region, then merge regions within each role along weakest seams.
-    let mut region_pxs: Vec<Vec<usize>> = vec![Vec::new(); num_seeds];
+    // Assemble ONE cohesive layer per anatomical HairRole (Back, SideR, SideL, Front).
+    let mut role_masks = [
+        vec![0u8; n],
+        vec![0u8; n],
+        vec![0u8; n],
+        vec![0u8; n],
+    ];
+    let mut role_counts = [0usize; 4];
     for (i, &o) in owner.iter().enumerate() {
         if hair_alpha[i] > 0 && (o as usize) < num_seeds {
-            region_pxs[o as usize].push(i);
+            let r_idx = seeds[o as usize].role as usize;
+            role_masks[r_idx][i] = hair_alpha[i];
+            role_counts[r_idx] += 1;
         }
     }
 
-    let min_strand_area = ((total_hair_px / 48).max(120)).min((total_hair_px / 8).max(24));
-    let mut out = Vec::new();
-
+    let mut out = Vec::with_capacity(4);
     for role in HairRole::ALL {
-        let mut active: Vec<usize> = (0..num_seeds)
-            .filter(|&sid| seeds[sid].role == role && !region_pxs[sid].is_empty())
-            .collect();
-        if active.is_empty() {
-            if role == HairRole::Back || role == HairRole::Front {
-                out.push((role.as_id().to_string(), vec![0u8; n]));
-            }
-            continue;
-        }
-
-        // Compute current centroids from actual claimed pixels and adjacency seam weights inside `role`.
-        let mut centroids: Vec<(f64, f64)> = vec![(0.0, 0.0); num_seeds];
-        for &sid in &active {
-            let pxs = &region_pxs[sid];
-            let sx: f64 = pxs.iter().map(|&i| (i % w) as f64).sum();
-            let sy: f64 = pxs.iter().map(|&i| (i / w) as f64).sum();
-            centroids[sid] = (sx / pxs.len() as f64, sy / pxs.len() as f64);
-        }
-
-        while active.len() > 1 {
-            let smallest_pos = active
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, &sid)| region_pxs[sid].len())
-                .map(|(p, _)| p)
-                .unwrap();
-            let src_sid = active[smallest_pos];
-            if region_pxs[src_sid].len() >= min_strand_area && active.len() <= 3 {
-                break;
-            }
-
-            // Measure shared-border average seam cost to every adjacent region of the SAME role.
-            let mut adj: HashMap<usize, (u64, u32)> = HashMap::new();
-            for &i in &region_pxs[src_sid] {
-                let x = i % w;
-                let y = i / w;
-                let nbs = [
-                    (x > 0).then(|| i - 1),
-                    (x + 1 < w).then(|| i + 1),
-                    (y > 0).then(|| i - w),
-                    (y + 1 < h).then(|| i + w),
-                ];
-                for ni in nbs.into_iter().flatten() {
-                    if hair_alpha[ni] == 0 {
-                        continue;
-                    }
-                    let nb_sid = owner[ni] as usize;
-                    if nb_sid != src_sid && seeds[nb_sid].role == role {
-                        let entry = adj.entry(nb_sid).or_insert((0, 0));
-                        entry.0 += (seam_cost[i] + seam_cost[ni]) as u64 / 2;
-                        entry.1 += 1;
-                    }
-                }
-            }
-
-            let dst_sid = if let Some((&best_nb, _)) = adj.iter().min_by(|(a_id, a_w), (b_id, b_w)| {
-                let aa = a_w.0 as f64 / a_w.1 as f64;
-                let bb = b_w.0 as f64 / b_w.1 as f64;
-                aa.total_cmp(&bb).then_with(|| a_id.cmp(b_id))
-            }) {
-                best_nb
-            } else {
-                let (sx, sy) = centroids[src_sid];
-                active
-                    .iter()
-                    .copied()
-                    .filter(|&sid| sid != src_sid)
-                    .min_by(|&a, &b| {
-                        let da = (centroids[a].0 - sx).powi(2) + (centroids[a].1 - sy).powi(2);
-                        let db = (centroids[b].0 - sx).powi(2) + (centroids[b].1 - sy).powi(2);
-                        da.total_cmp(&db)
-                    })
-                    .unwrap()
-            };
-
-            let moving = std::mem::take(&mut region_pxs[src_sid]);
-            for &i in &moving {
-                owner[i] = dst_sid as u32;
-            }
-            let prev_len = region_pxs[dst_sid].len() as f64;
-            let add_len = moving.len() as f64;
-            let tot = (prev_len + add_len).max(1.0);
-            centroids[dst_sid] = (
-                (centroids[dst_sid].0 * prev_len + centroids[src_sid].0 * add_len) / tot,
-                (centroids[dst_sid].1 * prev_len + centroids[src_sid].1 * add_len) / tot,
-            );
-            region_pxs[dst_sid].extend(moving);
-            active.swap_remove(smallest_pos);
-        }
-
-        let mut strand_lists: Vec<Vec<usize>> =
-            active.into_iter().map(|sid| std::mem::take(&mut region_pxs[sid])).collect();
-        if strand_lists.len() == 1 && (role == HairRole::Front || role == HairRole::Back) {
-            let min_w = (eye_dist * if role == HairRole::Front { 1.45 } else { 1.75 }) as usize;
-            if let Some((left, right)) =
-                try_split_wide_hair_component(&strand_lists[0], w, h, min_strand_area, min_w)
-            {
-                strand_lists = vec![left, right];
-            }
-        }
-        strand_lists.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        for (idx, pxs) in strand_lists.into_iter().enumerate() {
-            let id = if idx == 0 {
-                role.as_id().to_string()
-            } else {
-                format!("{}_{}", role.as_id(), idx + 1)
-            };
-            let mut m = vec![0u8; n];
-            for i in pxs {
-                m[i] = hair_alpha[i];
-            }
-            out.push((id, m));
+        let r_idx = role as usize;
+        if role == HairRole::Back || role == HairRole::Front || role_counts[r_idx] > 0 {
+            out.push((
+                role.as_id().to_string(),
+                std::mem::take(&mut role_masks[r_idx]),
+            ));
         }
     }
-
     out
 }
 
@@ -1439,16 +1336,16 @@ fn find_torso_seeds(
     }
 
     let y_start = ((landmarks.chin.y + eye_dist * 0.18).floor() as usize).min(h);
-    let y_end = ((landmarks.chin.y + hh * 2.4).ceil() as usize).min(h);
-    let x_start = ((face_cx - eye_dist * 2.2).floor() as isize).max(0) as usize;
-    let x_end = ((face_cx + eye_dist * 2.2).ceil() as usize).min(w);
+    let y_end = ((landmarks.chin.y + hh * 2.5).ceil() as usize).min(h);
+    let torso_cx = 0.5 * (face_cx + landmarks.chin.x);
+    let x_start = ((torso_cx - eye_dist * 3.0).floor() as isize).max(0) as usize;
+    let x_end = ((torso_cx + eye_dist * 3.0).ceil() as usize).min(w);
 
-    // 1. Find the dominant garment interior color via a quantized lower-torso histogram so we
-    //    sample broad knit/fabric interior instead of extreme dark hair shadow outliers.
-    let cl_y0 = ((landmarks.chin.y + hh * 0.72).floor() as usize).min(h);
-    let cl_y1 = ((landmarks.chin.y + hh * 2.0).ceil() as usize).min(h);
-    let cl_x0 = ((face_cx - eye_dist * 1.6).floor() as isize).max(0) as usize;
-    let cl_x1 = ((face_cx + eye_dist * 1.6).ceil() as usize).min(w);
+    // 1. Find the dominant garment interior color via a wide quantized lower-torso histogram.
+    let cl_y0 = ((landmarks.chin.y + hh * 0.44).floor() as usize).min(h);
+    let cl_y1 = ((landmarks.chin.y + hh * 2.2).ceil() as usize).min(h);
+    let cl_x0 = ((torso_cx - eye_dist * 2.5).floor() as isize).max(0) as usize;
+    let cl_x1 = ((torso_cx + eye_dist * 2.5).ceil() as usize).min(w);
     #[derive(Default, Clone, Copy)]
     struct ColorBin {
         count: usize,
@@ -1485,7 +1382,7 @@ fn find_torso_seeds(
             }
             let skin_d = color_dist_sq(rgba, i, skin_rgb);
             let skin_opp = opponent_min_dist(rgba, i, &skin_palette);
-            if skin_opp < 26.0 && skin_d < 46.0 {
+            if skin_opp < 26.0 && skin_d < 46.0 && is_warm_skin_candidate(rgba, i, skin_rgb) {
                 continue;
             }
             let p = i * 4;
@@ -1518,8 +1415,8 @@ fn find_torso_seeds(
         .or_else(|| ranked_bins.first())
         .map(|&(_, mean)| mean);
 
-    let mut skin_buckets: [Option<(f64, PromptInput)>; 3] = [None, None, None];
-    let mut clothes_buckets: [Option<(f64, PromptInput)>; 3] = [None, None, None];
+    let mut skin_buckets: [Option<(f64, PromptInput)>; 5] = [None; 5];
+    let mut clothes_buckets: [Option<(f64, PromptInput)>; 5] = [None; 5];
     let mut skin_torso_count = 0usize;
     let mut clothes_count = 0usize;
 
@@ -1540,61 +1437,60 @@ fn find_torso_seeds(
             let skin_opp = opponent_min_dist(rgba, i, &skin_palette);
             let hair_p = palette_min_dist(rgba, i, hair_palette);
             let hair_opp = opponent_min_dist(rgba, i, hair_palette);
-            let dx_rel = (fx - face_cx) / eye_dist;
+            let dx_rel = (fx - torso_cx) / eye_dist;
             let skin_y_limit = if dx_rel.abs() < 0.48 {
                 landmarks.chin.y + hh * 0.60
             } else {
-                landmarks.chin.y + hh * 0.65
+                landmarks.chin.y + hh * 0.72
             };
             let closer_to_modal_clothes = modal_clothes_rgb
                 .is_some_and(|mc| color_dist_sq(rgba, i, mc) + 8.0 < skin_d);
 
+            let bucket = if dx_rel < -1.25 {
+                0
+            } else if dx_rel < -0.45 {
+                1
+            } else if dx_rel <= 0.45 {
+                2
+            } else if dx_rel <= 1.25 {
+                3
+            } else {
+                4
+            };
+
             if skin_opp < 26.0
                 && skin_d < 46.0
+                && is_warm_skin_candidate(rgba, i, skin_rgb)
                 && hair_opp > 24.0
                 && !closer_to_modal_clothes
                 && fy <= skin_y_limit
-                && dx_rel.abs() <= 1.38
+                && dx_rel.abs() <= 2.10
             {
                 skin_torso_count += 1;
                 if dx_rel.abs() >= 0.42 || fy >= landmarks.chin.y + eye_dist * 0.40 {
-                    let side = if dx_rel < -0.50 {
-                        0
-                    } else if dx_rel <= 0.50 {
-                        1
-                    } else {
-                        2
-                    };
                     let score = skin_opp;
-                    if skin_buckets[side].is_none_or(|(best_s, _)| score < best_s) {
-                        skin_buckets[side] = Some((
+                    if skin_buckets[bucket].is_none_or(|(best_s, _)| score < best_s) {
+                        skin_buckets[bucket] = Some((
                             score,
                             PromptInput { x: fx, y: fy, label: 1 },
                         ));
                     }
                 }
-            } else if skin_opp >= 22.0
-                && fy >= landmarks.chin.y + hh * 0.55
-                && (torso_macro_mask[i] > 128 || fy >= landmarks.chin.y + hh * 0.72)
+            } else if (skin_opp >= 22.0 || !is_warm_skin_candidate(rgba, i, skin_rgb))
+                && fy >= landmarks.chin.y + hh * 0.44
+                && (torso_macro_mask[i] > 128 || fy >= landmarks.chin.y + hh * 0.65)
                 && (hair_p > 20.0 || hair_opp > 22.0)
             {
                 clothes_count += 1;
-                if fy >= landmarks.chin.y + hh * 0.74 {
-                    let bucket = if dx_rel < -0.50 {
-                        0
-                    } else if dx_rel <= 0.50 {
-                        1
-                    } else {
-                        2
-                    };
+                if fy >= landmarks.chin.y + hh * 0.65 {
                     let score = if let Some(mc) = modal_clothes_rgb {
                         let md = color_dist_sq(rgba, i, mc);
-                        if md > 54.0 {
+                        if md > 78.0 {
                             continue;
                         }
-                        -md - dx_rel.abs() * 4.0
+                        -md - dx_rel.abs() * 3.0
                     } else {
-                        (hair_opp.min(120.0) + skin_opp.min(90.0)) - dx_rel.abs() * 6.0
+                        (hair_opp.min(120.0) + skin_opp.min(90.0)) - dx_rel.abs() * 4.0
                     };
                     if clothes_buckets[bucket].is_none_or(|(best_s, _)| score > best_s) {
                         clothes_buckets[bucket] = Some((
@@ -1608,17 +1504,132 @@ fn find_torso_seeds(
     }
 
     let skin_pts: Vec<PromptInput> = skin_buckets.into_iter().flatten().map(|(_, p)| p).collect();
-    let clothes_pts: Vec<PromptInput> = clothes_buckets
+    let mut clothes_pts: Vec<PromptInput> = clothes_buckets
         .into_iter()
         .flatten()
         .map(|(_, p)| p)
         .collect();
+    // Rescue contrasting upper collars, V-shirts, and lapels inside the upper torso region.
+    let collar_y0 = ((landmarks.chin.y + hh * 0.24).floor() as usize).min(h);
+    let collar_y1 = ((landmarks.chin.y + hh * 0.95).ceil() as usize).min(h);
+    type CollarSwatchEntry = (usize, [f64; 3], [Option<(f64, PromptInput)>; 2]);
+    let mut collar_swatches: HashMap<(u8, u8, u8), CollarSwatchEntry> = HashMap::new();
+    for y in collar_y0..collar_y1 {
+        let row = y * w;
+        let fy = y as f64;
+        for x in x_start..x_end {
+            let i = row + x;
+            if fg[i] <= 128
+                || face_mask[i] > 128
+                || prelim_hair[i]
+                || (neck_mask[i] > 128 && fy < landmarks.chin.y + hh * 0.34)
+                || (torso_macro_mask[i] <= 128 && fy >= landmarks.chin.y + hh * 0.44)
+            {
+                continue;
+            }
+            let fx = x as f64;
+            let dx_rel = (fx - torso_cx) / eye_dist;
+            if dx_rel.abs() > 1.75 || (dx_rel.abs() < 0.45 && fy < landmarks.chin.y + hh * 0.34) {
+                continue;
+            }
+            let p = i * 4;
+            let r = rgba[p] as f64;
+            let g = rgba[p + 1] as f64;
+            let b = rgba[p + 2] as f64;
+            if 0.299 * r + 0.587 * g + 0.114 * b < 72.0 {
+                continue;
+            }
+            let skin_d = color_dist_sq(rgba, i, skin_rgb);
+            let skin_opp = opponent_min_dist(rgba, i, &skin_palette);
+            let hair_p = palette_min_dist(rgba, i, hair_palette);
+            if skin_opp < 26.0 && skin_d < 52.0 && is_warm_skin_candidate(rgba, i, skin_rgb) {
+                continue;
+            }
+            if hair_p < 40.0 {
+                continue;
+            }
+            if let Some(mc) = modal_clothes_rgb {
+                if color_dist_sq(rgba, i, mc) < 26.0 {
+                    continue;
+                }
+            }
+            let key = (rgba[p] >> 5, rgba[p + 1] >> 5, rgba[p + 2] >> 5);
+            let side = usize::from(fx > torso_cx);
+            let score = hair_p.min(90.0) + skin_opp.min(90.0) - dx_rel.abs() * 6.0;
+            let entry = collar_swatches
+                .entry(key)
+                .or_insert((0, [0.0; 3], [None, None]));
+            entry.0 += 1;
+            entry.1[0] += r;
+            entry.1[1] += g;
+            entry.1[2] += b;
+            if entry.2[side].is_none_or(|(best, _)| score > best) {
+                entry.2[side] = Some((score, PromptInput { x: fx, y: fy, label: 1 }));
+            }
+        }
+    }
+    let mut ranked_collars: Vec<_> = collar_swatches
+        .into_values()
+        .filter(|(cnt, _, _)| *cnt >= 18)
+        .map(|(cnt, sum, sides)| {
+            (
+                cnt,
+                [sum[0] / cnt as f64, sum[1] / cnt as f64, sum[2] / cnt as f64],
+                sides,
+            )
+        })
+        .collect();
+    ranked_collars.sort_by_key(|c| std::cmp::Reverse(c.0));
+    let mut picked_collar_means: Vec<[f64; 3]> = Vec::new();
+    for (_, mean, sides) in ranked_collars {
+        if picked_collar_means.len() >= 4 {
+            break;
+        }
+        let hp = hair_palette
+            .iter()
+            .map(|&hr| ((mean[0] - hr[0]).powi(2) + (mean[1] - hr[1]).powi(2) + (mean[2] - hr[2]).powi(2)).sqrt())
+            .fold(f64::INFINITY, f64::min);
+        let dup = picked_collar_means.iter().any(|&ex| {
+            ((mean[0] - ex[0]).powi(2) + (mean[1] - ex[1]).powi(2) + (mean[2] - ex[2]).powi(2)).sqrt() < 26.0
+        });
+        if hp >= 38.0 && !dup {
+            picked_collar_means.push(mean);
+            clothes_pts.extend(sides.into_iter().flatten().map(|(_, pt)| pt));
+        }
+    }
     let mut clothes_palette: Vec<[f64; 3]> = clothes_pts
         .iter()
         .map(|p| sample_patch_rgb(rgba, w, h, p.x, p.y))
         .collect();
     if let Some(mc) = modal_clothes_rgb {
         clothes_palette.push(mc);
+    }
+    for &(cnt, mean) in &ranked_bins {
+        if clothes_palette.len() >= 8 {
+            break;
+        }
+        if cnt < 48 {
+            continue;
+        }
+        let hp = hair_palette
+            .iter()
+            .map(|&hr| {
+                ((mean[0] - hr[0]).powi(2) + (mean[1] - hr[1]).powi(2) + (mean[2] - hr[2]).powi(2))
+                    .sqrt()
+            })
+            .fold(f64::INFINITY, f64::min);
+        let sd = ((mean[0] - skin_rgb[0]).powi(2)
+            + (mean[1] - skin_rgb[1]).powi(2)
+            + (mean[2] - skin_rgb[2]).powi(2))
+        .sqrt();
+        let dup = clothes_palette.iter().any(|&ex| {
+            ((mean[0] - ex[0]).powi(2) + (mean[1] - ex[1]).powi(2) + (mean[2] - ex[2]).powi(2))
+                .sqrt()
+                < 24.0
+        });
+        if hp >= 22.0 && sd >= 18.0 && !dup {
+            clothes_palette.push(mean);
+        }
     }
 
     TorsoSeeds {
@@ -1727,8 +1738,8 @@ fn propagate_chest_hair(
 
                 let is_hair = skin_d > 26.0
                     && skin_d > hair_p + 10.0
-                    && hair_p < 44.0
-                    && hair_opp < 42.0
+                    && hair_p < 36.0
+                    && hair_opp < 30.0
                     && clothes_ok;
 
                 let p = ni * 4;
@@ -1739,7 +1750,14 @@ fn propagate_chest_hair(
                         hair_geo[ni] = true;
                         q.push_back((ni, 0));
                     }
-                } else if steps < 2 && luma < 85.0 && skin_d > 28.0 && visited_steps[ni] > steps + 1 {
+                } else if steps < 1
+                    && luma < 85.0
+                    && skin_d > 28.0
+                    && hair_opp < 30.0
+                    && clothes_ok
+                    && (ny as f64) <= landmarks.chin.y + eye_dist * 0.90
+                    && visited_steps[ni] > steps + 1
+                {
                     visited_steps[ni] = steps + 1;
                     hair_geo[ni] = true;
                     q.push_back((ni, steps + 1));
@@ -1787,6 +1805,108 @@ fn propagate_chest_hair(
 
 type ForegroundAlphaOutput = (Vec<u8>, Option<Vec<u8>>, Option<String>);
 
+fn clean_u2net_foreground(raw: Vec<u8>, w: usize, h: usize) -> Vec<u8> {
+    let n = w * h;
+    let mut a: Vec<u8> = raw
+        .into_iter()
+        .map(|v| {
+            if v < 28 {
+                0
+            } else if v >= 164 {
+                255
+            } else {
+                (((v as f32 - 28.0) / 136.0) * 255.0).round().clamp(0.0, 255.0) as u8
+            }
+        })
+        .collect();
+    if w.max(h) < 128 {
+        return a;
+    }
+    let bool_fg: Vec<bool> = a.iter().map(|&v| v > 0).collect();
+    let comps = find_connected_components_4(&bool_fg, w, h);
+    let largest = comps.iter().map(|c| c.len()).max().unwrap_or(0);
+    let min_keep = (largest / 120).clamp(32, 240);
+    for comp in comps {
+        if comp.len() < min_keep {
+            for idx in comp {
+                a[idx] = 0;
+            }
+        }
+    }
+    // Fill interior low-alpha holes enclosed inside opaque character silhouette (e.g., pale sweaters/bangs).
+    let mut visited = vec![false; n];
+    let mut q = std::collections::VecDeque::new();
+    for x in 0..w {
+        for y in [0, h - 1] {
+            let idx = y * w + x;
+            if a[idx] < 180 && !visited[idx] {
+                visited[idx] = true;
+                q.push_back(idx);
+            }
+        }
+    }
+    for y in 0..h {
+        for x in [0, w - 1] {
+            let idx = y * w + x;
+            if a[idx] < 180 && !visited[idx] {
+                visited[idx] = true;
+                q.push_back(idx);
+            }
+        }
+    }
+    while let Some(i) = q.pop_front() {
+        let x = i % w;
+        let y = i / w;
+        for nb in [
+            (x > 0).then(|| i - 1),
+            (x + 1 < w).then(|| i + 1),
+            (y > 0).then(|| i - w),
+            (y + 1 < h).then(|| i + w),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !visited[nb] && a[nb] < 180 {
+                visited[nb] = true;
+                q.push_back(nb);
+            }
+        }
+    }
+    for i in 0..n {
+        if !visited[i] && a[i] < 255 {
+            a[i] = 255;
+        }
+    }
+    a
+}
+
+fn has_existing_cutout_alpha(rgba: &[u8], w: usize, h: usize) -> bool {
+    let n = w * h;
+    if n == 0 || w < 2 || h < 2 {
+        return false;
+    }
+    let transparent_px = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] < 16).count();
+    let mut border_total = 0usize;
+    let mut border_trans = 0usize;
+    for x in 0..w {
+        for y in [0, h - 1] {
+            border_total += 1;
+            if rgba[(y * w + x) * 4 + 3] < 16 {
+                border_trans += 1;
+            }
+        }
+    }
+    for y in 0..h {
+        for x in [0, w - 1] {
+            border_total += 1;
+            if rgba[(y * w + x) * 4 + 3] < 16 {
+                border_trans += 1;
+            }
+        }
+    }
+    transparent_px * 50 >= n && border_trans * 2 >= border_total.max(1)
+}
+
 fn resolve_foreground_alpha(
     state: &AnalysisState,
     rgba: &[u8],
@@ -1798,8 +1918,13 @@ fn resolve_foreground_alpha(
     if tolerance <= 0.0 {
         return Ok((core::foreground(rgba, w, h, 0.0), None, None));
     }
+    if has_existing_cutout_alpha(rgba, w, h) {
+        let fg: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+        return Ok((fg, None, None));
+    }
     if let Some(p) = u2net_path {
-        let (a, hash) = inference::background_alpha(std::path::Path::new(p), rgba, w, h)?;
+        let (raw, hash) = inference::background_alpha(std::path::Path::new(p), rgba, w, h)?;
+        let a = clean_u2net_foreground(raw, w, h);
         return Ok((a.clone(), Some(a), Some(hash)));
     }
     let bg_path = state
@@ -1808,7 +1933,8 @@ fn resolve_foreground_alpha(
         .map_err(|_| "Registry lock poisoned".to_string())?
         .resolve_path(ModelRole::Background);
     if let Some(p) = bg_path {
-        if let Ok((a, hash)) = inference::background_alpha(&p, rgba, w, h) {
+        if let Ok((raw, hash)) = inference::background_alpha(&p, rgba, w, h) {
+            let a = clean_u2net_foreground(raw, w, h);
             return Ok((a.clone(), Some(a), Some(hash)));
         }
     }
@@ -1861,6 +1987,39 @@ pub fn propose_parts_with_sam_with_options(
     detail_mode: &str,
     hair_split: bool,
 ) -> Result<PartsProposalOutput, String> {
+    propose_parts_with_sam_with_template(
+        state,
+        rgba,
+        w,
+        h,
+        landmarks,
+        points_28,
+        face_bbox,
+        tolerance,
+        u2net_path,
+        detail_mode,
+        hair_split,
+        hair_split && detail_mode == "detail",
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_parts_with_sam_with_template(
+    state: &AnalysisState,
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    landmarks: &Landmarks,
+    points_28: &[Landmark28Point],
+    face_bbox: Option<[f64; 4]>,
+    tolerance: f64,
+    u2net_path: Option<&str>,
+    detail_mode: &str,
+    hair_split: bool,
+    template_mode: bool,
+    style_overrides: Option<&TemplateStyleSelection>,
+) -> Result<PartsProposalOutput, String> {
     let image_hash = hash_rgba_bytes(rgba, w, h);
 
     // 1. Background removal: explicit u2net_path -> registered Background role -> border flood / alpha.
@@ -1870,7 +2029,14 @@ pub fn propose_parts_with_sam_with_options(
     if let Some(h_u2) = bg_hash {
         model_hashes.insert("background".into(), h_u2);
     }
-    let geo_fallback = core::separate(rgba, w, h, landmarks, tolerance.clamp(0.0, 180.0), u2_alpha.as_deref());
+    let geo_fallback = core::separate(
+        rgba,
+        w,
+        h,
+        landmarks,
+        tolerance.clamp(0.0, 180.0),
+        u2_alpha.as_deref().or(Some(fg.as_slice())),
+    );
 
     // 2. Encode full image + face crop via MobileSAM (reusing cache!).
     let full_cache = get_or_encode_full_sam(state, rgba, w, h, &image_hash)?;
@@ -1951,12 +2117,12 @@ pub fn propose_parts_with_sam_with_options(
             &[
                 PromptInput { x: landmarks.chin.x, y: body_y, label: 1 },
                 PromptInput {
-                    x: (landmarks.chin.x - eye_dist * 1.2).clamp(0.0, (w - 1) as f64),
+                    x: (landmarks.chin.x - eye_dist * 1.45).clamp(0.0, (w - 1) as f64),
                     y: body_y,
                     label: 1,
                 },
                 PromptInput {
-                    x: (landmarks.chin.x + eye_dist * 1.2).clamp(0.0, (w - 1) as f64),
+                    x: (landmarks.chin.x + eye_dist * 1.45).clamp(0.0, (w - 1) as f64),
                     y: body_y,
                     label: 1,
                 },
@@ -2131,6 +2297,21 @@ pub fn propose_parts_with_sam_with_options(
         hair_geo = geo_traced;
 
         let mut hair_combined = hair_upper.clone();
+        let allow_lower_hair = |i: usize| -> bool {
+            let fy = (i / w) as f64;
+            if fy <= landmarks.chin.y + eye_dist * 0.16 || hair_geo[i] {
+                return true;
+            }
+            let skin_d = color_dist_sq(rgba, i, skin_rgb);
+            let hair_p = palette_min_dist(rgba, i, &hair_palette);
+            let hair_c = chroma_min_dist(rgba, i, &hair_palette);
+            let clothes_beat = !torso_seeds.clothes_palette.is_empty() && {
+                let cp = palette_min_dist(rgba, i, &torso_seeds.clothes_palette);
+                let cc = chroma_min_dist(rgba, i, &torso_seeds.clothes_palette);
+                cp + 8.0 < hair_p && (cc + 2.0 < hair_c || hair_p >= 46.0)
+            };
+            hair_p < 46.0 && skin_d > hair_p + 10.0 && !clothes_beat
+        };
         if !lower_hair_pts.is_empty() {
             let mut refined_prompts = base_hair_positives;
             refined_prompts.extend(lower_hair_pts.iter().copied());
@@ -2157,31 +2338,21 @@ pub fn propose_parts_with_sam_with_options(
                 if fg[i] <= 8 {
                     continue;
                 }
-                if hair_geo[i] {
+                if hair_geo[i] || ((*hc > 128 || ref_clean[i] > 128) && allow_lower_hair(i)) {
                     *hc = 255;
-                } else if ref_clean[i] > 128 && *hc <= 128 {
-                    let fy = (i / w) as f64;
-                    if fy <= landmarks.chin.y + eye_dist * 0.15 {
-                        *hc = 255;
-                    } else {
-                        let skin_d = color_dist_sq(rgba, i, skin_rgb);
-                        let hair_p = palette_min_dist(rgba, i, &hair_palette);
-                        let hair_c = chroma_min_dist(rgba, i, &hair_palette);
-                        let clothes_beat = !torso_seeds.clothes_palette.is_empty() && {
-                            let cp = palette_min_dist(rgba, i, &torso_seeds.clothes_palette);
-                            let cc = chroma_min_dist(rgba, i, &torso_seeds.clothes_palette);
-                            cp + 8.0 < hair_p && cc + 2.0 < hair_c
-                        };
-                        if skin_d > hair_p + 10.0 && !clothes_beat {
-                            *hc = 255;
-                        }
-                    }
+                } else {
+                    *hc = 0;
                 }
             }
         } else {
             for (i, hc) in hair_combined.iter_mut().enumerate() {
-                if hair_geo[i] && fg[i] > 8 {
+                if fg[i] <= 8 {
+                    continue;
+                }
+                if hair_geo[i] || (*hc > 128 && allow_lower_hair(i)) {
                     *hc = 255;
+                } else {
+                    *hc = 0;
                 }
             }
         }
@@ -2192,7 +2363,7 @@ pub fn propose_parts_with_sam_with_options(
 
         let mut body_final_mask = body_macro_mask.clone();
         if hair_split && w.max(h) >= 200 {
-            if torso_seeds.skin_torso_count >= 64 && !torso_seeds.skin_pts.is_empty() {
+            if torso_seeds.skin_torso_count >= 96 && !torso_seeds.skin_pts.is_empty() {
                 let mut skin_neg = vec![
                     PromptInput { x: nose_pt.x, y: nose_pt.y, label: 0 },
                     PromptInput { x: landmarks.chin.x, y: landmarks.chin.y, label: 0 },
@@ -2424,6 +2595,11 @@ pub fn propose_parts_with_sam_with_options(
             let skin_opp_d = opponent_min_dist(rgba, i, &skin_palette);
             let hair_p_d = palette_min_dist(rgba, i, &hair_palette);
             let hair_opp_d = opponent_min_dist(rgba, i, &hair_palette);
+            let clothes_p_d = if torso_seeds.clothes_palette.is_empty() {
+                f64::INFINITY
+            } else {
+                palette_min_dist(rgba, i, &torso_seeds.clothes_palette)
+            };
             let clothes_opp_d = if torso_seeds.clothes_palette.is_empty() {
                 f64::INFINITY
             } else {
@@ -2432,14 +2608,36 @@ pub fn propose_parts_with_sam_with_options(
 
             let clothes_beats_hair = !hair_geo[i]
                 && clothes_candidate_active
-                && in_clothes
-                && fy > landmarks.chin.y
-                && clothes_opp_d + 4.0 < hair_opp_d;
+                && fy > landmarks.chin.y + hh * 0.26
+                && ((in_clothes
+                    && (clothes_opp_d <= hair_opp_d + 8.0
+                        || clothes_p_d + 6.0 < hair_p_d
+                        || hair_p_d >= 42.0
+                        || clothes_opp_d < 36.0))
+                    || (body_macro_mask[i] > 128
+                        && clothes_p_d < 34.0
+                        && clothes_p_d + 14.0 < hair_p_d
+                        && hair_p_d >= 42.0));
 
-            if sam_masks.get("eyeR_all").is_some_and(|(m, _)| m[i] > 128) {
+            let pr = rgba[i * 4] as f64;
+            let pg = rgba[i * 4 + 1] as f64;
+            let pb = rgba[i * 4 + 2] as f64;
+            let px_luma = 0.299 * pr + 0.587 * pg + 0.114 * pb;
+            let px_chroma = pr.max(pg).max(pb) - pr.min(pg).min(pb);
+            let bang_over_eye = in_hair
+                && fy <= landmarks.eye_r.y.max(landmarks.eye_l.y) + eye_ry * 0.25
+                && px_luma > 105.0
+                && hair_p_d < 34.0
+                && hair_p_d + 6.0 < skin_d;
+
+            if !bang_over_eye && sam_masks.get("eyeR_all").is_some_and(|(m, _)| m[i] > 128) {
                 let dx = fx - landmarks.eye_r.x;
                 let dy = fy - landmarks.eye_r.y;
-                if dy < -eye_ry * 0.48 {
+                if dy < -eye_ry * 0.48
+                    && !(dx.abs() < eye_rx * 0.56
+                        && ((px_chroma >= 24.0 && px_luma >= 95.0)
+                            || (px_luma >= 218.0 && px_chroma < 18.0)))
+                {
                     chosen = Some("eyeR_upper");
                 } else if dy > eye_ry * 0.60 {
                     chosen = Some("eyeR_lower");
@@ -2448,10 +2646,14 @@ pub fn propose_parts_with_sam_with_options(
                 } else {
                     chosen = Some("eyeR_white");
                 }
-            } else if sam_masks.get("eyeL_all").is_some_and(|(m, _)| m[i] > 128) {
+            } else if !bang_over_eye && sam_masks.get("eyeL_all").is_some_and(|(m, _)| m[i] > 128) {
                 let dx = fx - landmarks.eye_l.x;
                 let dy = fy - landmarks.eye_l.y;
-                if dy < -eye_ry * 0.48 {
+                if dy < -eye_ry * 0.48
+                    && !(dx.abs() < eye_rx * 0.56
+                        && ((px_chroma >= 24.0 && px_luma >= 95.0)
+                            || (px_luma >= 218.0 && px_chroma < 18.0)))
+                {
                     chosen = Some("eyeL_upper");
                 } else if dy > eye_ry * 0.60 {
                     chosen = Some("eyeL_lower");
@@ -2460,9 +2662,9 @@ pub fn propose_parts_with_sam_with_options(
                 } else {
                     chosen = Some("eyeL_white");
                 }
-            } else if sam_masks.get("browR").is_some_and(|(m, _)| m[i] > 128) {
+            } else if !bang_over_eye && sam_masks.get("browR").is_some_and(|(m, _)| m[i] > 128) {
                 chosen = Some("browR");
-            } else if sam_masks.get("browL").is_some_and(|(m, _)| m[i] > 128) {
+            } else if !bang_over_eye && sam_masks.get("browL").is_some_and(|(m, _)| m[i] > 128) {
                 chosen = Some("browL");
             } else if sam_masks.get("mouth_all").is_some_and(|(m, _)| m[i] > 128) {
                 let dy = fy - landmarks.mouth.y;
@@ -2491,15 +2693,26 @@ pub fn propose_parts_with_sam_with_options(
                 let nx = (fx - neck_cx) / (eye_dist * 0.58);
                 let ny = (fy - (landmarks.chin.y + hh * 0.20)).max(0.0) / (hh * 0.42);
                 let outside_neck_oval = nx * nx + ny * ny > 1.0;
-                !(has_exposed_torso_skin && in_body && outside_neck_oval)
+                let clothes_collar = clothes_candidate_active
+                    && (in_clothes || fy > landmarks.chin.y + hh * 0.28)
+                    && (!is_warm_skin_candidate(rgba, i, skin_rgb)
+                        || skin_opp_d >= 24.0
+                        || (clothes_p_d < 34.0 && clothes_p_d + 10.0 < skin_d));
+                !clothes_collar && !(has_exposed_torso_skin && in_body && outside_neck_oval)
             } {
                 chosen = Some("neck");
             } else if in_body || in_clothes || body_macro_mask[i] > 128 {
                 if hair_geo[i]
-                    || (!in_clothes && hair_opp_d + 4.0 < clothes_opp_d && hair_opp_d + 8.0 < skin_opp_d)
-                    || (hair_p_d < 36.0
-                        && hair_opp_d + 14.0 < clothes_opp_d
-                        && hair_opp_d + 14.0 < skin_opp_d)
+                    || (!in_clothes
+                        && hair_p_d < 46.0
+                        && hair_p_d <= clothes_p_d + 8.0
+                        && hair_opp_d + 6.0 < clothes_opp_d
+                        && hair_opp_d + 8.0 < skin_opp_d)
+                    || (hair_p_d < 46.0
+                        && hair_p_d <= clothes_p_d + 4.0
+                        && hair_opp_d < 20.0
+                        && hair_opp_d + 10.0 < clothes_opp_d
+                        && hair_opp_d + 10.0 < skin_opp_d)
                 {
                     chosen = Some(if fy < landmarks.chin.y + eye_dist * 0.15 {
                         "hair_front"
@@ -2507,17 +2720,22 @@ pub fn propose_parts_with_sam_with_options(
                         "hair_back"
                     });
                 } else if clothes_candidate_active {
+                    let warm_skin = is_warm_skin_candidate(rgba, i, skin_rgb);
                     let is_skin_px = has_exposed_torso_skin
+                        && skin_d < 56.0
                         && ((in_body
                             && !in_clothes
-                            && skin_opp_d < 32.0
-                            && skin_opp_d <= clothes_opp_d + 4.0)
-                            || (skin_opp_d < 28.0
+                            && fy <= landmarks.chin.y + hh * 0.85
+                            && (warm_skin || skin_opp_d < 34.0)
+                            && skin_opp_d <= clothes_opp_d + 10.0
+                            && skin_opp_d <= hair_opp_d + 8.0)
+                            || (warm_skin
+                                && skin_opp_d < 28.0
                                 && skin_opp_d + 8.0 < clothes_opp_d
                                 && fy < landmarks.chin.y + hh * 0.90));
                     if is_skin_px {
                         chosen = Some("body");
-                    } else if in_clothes || clothes_opp_d + 6.0 < hair_opp_d {
+                    } else if in_clothes || clothes_opp_d <= hair_opp_d + 8.0 || fy > landmarks.chin.y + hh * 0.34 {
                         chosen = Some("clothes");
                     } else {
                         chosen = Some("hair_back");
@@ -2540,15 +2758,16 @@ pub fn propose_parts_with_sam_with_options(
                 }
             } else {
                 let mut idx = geo_owner(i);
-                // Prevent exposed collarbone/shoulder/jaw skin or garments missed by SAM from falling into hair_back,
-                // and route hair vs garment continuously without a hard horizontal y-cut.
+                let torso_cx = 0.5 * (face_cx + landmarks.chin.x);
+                let warm_skin = is_warm_skin_candidate(rgba, i, skin_rgb);
                 if (idx == id_index["hair_back"] || idx == id_index["body"])
+                    && warm_skin
                     && fy > landmarks.eye_l.y - eye_dist * 0.15
                     && skin_opp_d + 8.0 < hair_opp_d
                     && skin_d < 52.0
                     && (!clothes_candidate_active || skin_opp_d <= clothes_opp_d + 4.0)
                 {
-                    if (fx - face_cx).abs() < eye_dist * 0.52
+                    if (fx - torso_cx).abs() < eye_dist * 0.52
                         && fy >= landmarks.chin.y
                         && fy <= landmarks.chin.y + hh * 0.45
                     {
@@ -2561,17 +2780,30 @@ pub fn propose_parts_with_sam_with_options(
                 } else if clothes_candidate_active
                     && (idx == id_index["hair_back"] || idx == id_index["body"])
                 {
-                    if hair_geo[i] || (hair_p_d < 44.0 && hair_opp_d + 4.0 < clothes_opp_d) {
+                    if hair_geo[i] || (hair_p_d < 38.0 && hair_opp_d + 6.0 < clothes_opp_d && hair_opp_d + 6.0 < skin_opp_d) {
                         idx = id_index["hair_back"];
-                    } else if fy > landmarks.chin.y + hh * 0.40
-                        && (fx - face_cx).abs() <= eye_dist * 1.65
+                    } else if fy > landmarks.chin.y + hh * 0.28
+                        && (fx - torso_cx).abs() <= eye_dist * 2.80
                         && (in_clothes
-                            || (clothes_opp_d < 34.0
-                                && clothes_opp_d + 8.0 < hair_opp_d
-                                && clothes_opp_d + 6.0 < skin_opp_d))
+                            || (!warm_skin
+                                && (clothes_opp_d < 44.0 || clothes_p_d < 38.0)
+                                && clothes_opp_d <= hair_opp_d + 6.0)
+                            || (clothes_p_d < 34.0 && clothes_p_d + 8.0 < skin_d)
+                            || (fy > landmarks.chin.y + hh * 0.45
+                                && skin_d >= 56.0
+                                && skin_opp_d >= 18.0
+                                && (clothes_opp_d < 54.0 || clothes_p_d < 50.0 || !warm_skin)))
                     {
                         route_to_clothes = true;
-                    } else if idx == id_index["body"] {
+                    } else if idx == id_index["body"]
+                        && (fx - torso_cx).abs() < eye_dist * 0.52
+                        && fy <= landmarks.chin.y + hh * 0.45
+                        && (warm_skin && skin_opp_d < 24.0)
+                    {
+                        idx = id_index["neck"];
+                    } else if idx == id_index["body"] && fy > landmarks.chin.y + hh * 0.34 && !warm_skin {
+                        route_to_clothes = true;
+                    } else if idx == id_index["body"] && (fx - torso_cx).abs() > eye_dist * 1.55 && hair_opp_d < 34.0 && hair_p_d < 46.0 {
                         idx = id_index["hair_back"];
                     }
                 }
@@ -2610,12 +2842,13 @@ pub fn propose_parts_with_sam_with_options(
         None
     };
 
-    // 4 & 5. Optional parent collapsing + multi-layer hair split + clothes layer + diagnostics.
+    // 4 & 5. Optional parent collapsing + multi-layer hair split + template synthesis + diagnostics.
     finalize_part_proposal(
         rgba,
         w,
         h,
         landmarks,
+        points_28,
         part_masks,
         sam_hits,
         total_hits,
@@ -2623,9 +2856,13 @@ pub fn propose_parts_with_sam_with_options(
         clothes_extra,
         detail_mode,
         hair_split,
+        template_mode,
+        style_overrides,
         "mobilesam-vit-t+landmark-partition-v1",
         model_hashes,
-        if hair_split {
+        if template_mode && detail_mode == "detail" {
+            "template-hybrid-v2"
+        } else if hair_split {
             "sam-hybrid-hair-split-v3"
         } else {
             "sam-hybrid-partition-v1"
@@ -2634,12 +2871,83 @@ pub fn propose_parts_with_sam_with_options(
     )
 }
 
+fn absorb_tiny_islands(part_ids: &[String], masks: &mut [Vec<u8>], w: usize, h: usize) {
+    let n = w * h;
+    if masks.is_empty() || n == 0 {
+        return;
+    }
+    let mut owner = vec![u16::MAX; n];
+    for (p, m) in masks.iter().enumerate() {
+        for i in 0..n {
+            if m[i] > 8 {
+                owner[i] = p as u16;
+            }
+        }
+    }
+    let mut visited = vec![false; n];
+    let mut q = VecDeque::new();
+    for p in 0..masks.len() {
+        let id = part_ids[p].as_str();
+        let min_keep = if id.starts_with("eye") || id.starts_with("brow") || id.starts_with("mouth") {
+            12
+        } else {
+            120
+        };
+        visited.fill(false);
+        for start in 0..n {
+            if owner[start] as usize != p || visited[start] {
+                continue;
+            }
+            visited[start] = true;
+            q.push_back(start);
+            let mut comp = Vec::new();
+            let mut border_votes: HashMap<usize, usize> = HashMap::new();
+            while let Some(idx) = q.pop_front() {
+                comp.push(idx);
+                let x = idx % w;
+                let y = idx / w;
+                let nbs = [
+                    (x > 0).then(|| idx - 1),
+                    (x + 1 < w).then(|| idx + 1),
+                    (y > 0).then(|| idx - w),
+                    (y + 1 < h).then(|| idx + w),
+                ];
+                for ni in nbs.into_iter().flatten() {
+                    let no = owner[ni] as usize;
+                    if no == p {
+                        if !visited[ni] {
+                            visited[ni] = true;
+                            q.push_back(ni);
+                        }
+                    } else if no < masks.len() {
+                        *border_votes.entry(no).or_insert(0) += 1;
+                    }
+                }
+            }
+            if comp.len() < min_keep {
+                if let Some((&best_nb, _)) = border_votes
+                    .iter()
+                    .max_by(|(a_id, a_c), (b_id, b_c)| a_c.cmp(b_c).then_with(|| b_id.cmp(a_id)))
+                {
+                    for idx in comp {
+                        let a = masks[p][idx];
+                        masks[p][idx] = 0;
+                        masks[best_nb][idx] = masks[best_nb][idx].max(a);
+                        owner[idx] = best_nb as u16;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_part_proposal(
     rgba: &[u8],
     w: usize,
     h: usize,
     landmarks: &Landmarks,
+    points_28: &[Landmark28Point],
     final_masks: Vec<Vec<u8>>,
     sam_hits: Vec<usize>,
     total_hits: Vec<usize>,
@@ -2647,6 +2955,8 @@ fn finalize_part_proposal(
     clothes_extra: Option<ClothesExtra>,
     detail_mode: &str,
     hair_split: bool,
+    template_mode: bool,
+    style_overrides: Option<&TemplateStyleSelection>,
     provider: &str,
     model_hashes: HashMap<String, String>,
     postprocess_version: &str,
@@ -2855,6 +3165,50 @@ fn finalize_part_proposal(
         final_confidences = reordered_conf;
     }
 
+    if w.max(h) >= 200 {
+        absorb_tiny_islands(&final_ids, &mut final_masks, w, h);
+    }
+
+    let mut fill_masks: Vec<Option<Vec<u8>>> = vec![None; final_ids.len()];
+    let mut fill_kinds: Vec<String> = vec!["none".into(); final_ids.len()];
+    let mut textures: Vec<Option<String>> = vec![None; final_ids.len()];
+    let mut style_match: Option<StyleMatchReport> = None;
+    let mut effective_postprocess = postprocess_version.to_string();
+
+    if (template_mode
+        || style_overrides.is_some_and(crate::analysis::templates::has_explicit_style_override))
+        && detail_mode == "detail"
+        && w.max(h) >= 200
+    {
+        let default_sel = TemplateStyleSelection::default();
+        let sel = style_overrides.unwrap_or(&default_sel);
+        let tpl = synthesize_template_bank(
+            rgba,
+            w,
+            h,
+            landmarks,
+            points_28,
+            &final_ids,
+            &final_masks,
+            &final_provenances,
+            &final_confidences,
+            sel,
+        );
+        final_ids = tpl.part_ids;
+        final_masks = tpl.masks;
+        final_provenances = tpl.provenances;
+        final_confidences = tpl.confidences;
+        fill_masks = tpl
+            .fill_masks
+            .into_iter()
+            .map(|m| m.iter().any(|&v| v > 0).then_some(m))
+            .collect();
+        fill_kinds = tpl.fill_kinds;
+        textures = tpl.textures;
+        style_match = Some(tpl.style_match);
+        effective_postprocess = "template-hybrid-v2".to_string();
+    }
+
     let eye_r_cx = final_ids
         .iter()
         .position(|id| id == "eyeR_iris" || id == "eyeR_all" || id == "eyeR_white")
@@ -2890,11 +3244,15 @@ fn finalize_part_proposal(
     Ok(PartsProposalOutput {
         part_ids: final_ids,
         masks: final_masks,
+        fill_masks,
+        fill_kinds,
+        textures,
         metas,
         provider: provider.into(),
         model_hashes,
-        postprocess_version: postprocess_version.into(),
+        postprocess_version: effective_postprocess,
         image_hash,
+        style_match,
     })
 }
 
@@ -2941,6 +3299,39 @@ pub fn propose_parts_auto_with_options(
     detail_mode: &str,
     hair_split: bool,
 ) -> Result<PartsProposalOutput, String> {
+    propose_parts_auto_with_template(
+        state,
+        rgba,
+        w,
+        h,
+        landmarks,
+        points_28,
+        face_bbox,
+        tolerance,
+        u2net_path,
+        detail_mode,
+        hair_split,
+        hair_split && detail_mode == "detail",
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn propose_parts_auto_with_template(
+    state: &AnalysisState,
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    landmarks: &Landmarks,
+    points_28: &[Landmark28Point],
+    face_bbox: Option<[f64; 4]>,
+    tolerance: f64,
+    u2net_path: Option<&str>,
+    detail_mode: &str,
+    hair_split: bool,
+    template_mode: bool,
+    style_overrides: Option<&TemplateStyleSelection>,
+) -> Result<PartsProposalOutput, String> {
     let has_sam = {
         let reg = state
             .registry
@@ -2950,7 +3341,7 @@ pub fn propose_parts_auto_with_options(
             && reg.resolve_path(ModelRole::PartDecoder).is_some()
     };
     if has_sam {
-        if let Ok(sam_out) = propose_parts_with_sam_with_options(
+        if let Ok(sam_out) = propose_parts_with_sam_with_template(
             state,
             rgba,
             w,
@@ -2962,13 +3353,15 @@ pub fn propose_parts_auto_with_options(
             u2net_path,
             detail_mode,
             hair_split,
+            template_mode,
+            style_overrides,
         ) {
             return Ok(sam_out);
         }
     }
 
     let image_hash = hash_rgba_bytes(rgba, w, h);
-    let (_fg, u2_alpha, bg_hash) =
+    let (fg, u2_alpha, bg_hash) =
         resolve_foreground_alpha(state, rgba, w, h, tolerance, u2net_path)?;
     let masks = core::separate(
         rgba,
@@ -2976,7 +3369,7 @@ pub fn propose_parts_auto_with_options(
         h,
         landmarks,
         tolerance.clamp(0.0, 180.0),
-        u2_alpha.as_deref(),
+        u2_alpha.as_deref().or(Some(fg.as_slice())),
     );
     let mut model_hashes = HashMap::new();
     let provider = if let Some(h_u2) = bg_hash {
@@ -2996,6 +3389,7 @@ pub fn propose_parts_auto_with_options(
         w,
         h,
         landmarks,
+        points_28,
         masks,
         sam_hits,
         total_hits,
@@ -3003,6 +3397,8 @@ pub fn propose_parts_auto_with_options(
         None,
         detail_mode,
         hair_split,
+        template_mode,
+        style_overrides,
         provider,
         model_hashes,
         "geometry-template-v1",

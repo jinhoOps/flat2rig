@@ -1,5 +1,5 @@
 import type { Project } from "./types";
-import { defaultLandmarks, effectiveMask, maskedPixels } from "./engine";
+import { compositePartTexture, defaultLandmarks } from "./engine";
 export function canvas(w: number, h: number) {
   const c = document.createElement("canvas");
   c.width = w;
@@ -86,11 +86,11 @@ export async function partCanvases(project: Project) {
     source = pixels(original, project.width, project.height);
   return Promise.all(
     project.parts.map(async (p) => {
-      const data = p.texture
+      const tex = p.texture
         ? pixels(await loadImage(p.texture), project.width, project.height)
-        : source;
+        : undefined;
       return pixelsCanvas(
-        maskedPixels(data, effectiveMask(p)),
+        compositePartTexture(p, source, tex),
         project.width,
         project.height,
       );

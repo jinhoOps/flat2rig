@@ -333,15 +333,45 @@ pub fn rig_landmarks_from_28(
         return Err(format!("Expected 28 landmarks, got {}", points_28.len()));
     }
     let eye_r = mean_points(points_28, &[11, 12, 13, 14, 15, 16]);
-    let eye_l = mean_points(points_28, &[17, 18, 19, 20, 21, 22]);
+    let eye_l = mean_points(points_28, &[17, 20, 18, 19, 21, 22]);
     let mouth = mean_points(points_28, &[24, 25, 26, 27]);
-    let chin = Point {
+    let raw_chin = Point {
         x: points_28[2].x,
         y: points_28[2].y,
     };
 
     let eye_mid_x = 0.5 * (eye_r.x + eye_l.x);
     let eye_mid_y = 0.5 * (eye_r.y + eye_l.y);
+    let dx = eye_l.x - eye_r.x;
+    let dy = eye_l.y - eye_r.y;
+    let eye_dist = dx.hypot(dy).max(12.0);
+    let (ex_x, ex_y) = if dx >= 0.0 {
+        (dx / eye_dist, dy / eye_dist)
+    } else {
+        (1.0, 0.0)
+    };
+    let (ey_x, ey_y) = (-ex_y, ex_x);
+
+    // Guard against hand-on-chin / fluffy-hood occlusions pulling points_28[2] far out onto the cheek.
+    let mouth_u = (mouth.x - eye_mid_x) * ex_x + (mouth.y - eye_mid_y) * ex_y;
+    let mouth_v = (mouth.x - eye_mid_x) * ey_x + (mouth.y - eye_mid_y) * ey_y;
+    let raw_chin_u = (raw_chin.x - eye_mid_x) * ex_x + (raw_chin.y - eye_mid_y) * ex_y;
+    let raw_chin_v = (raw_chin.x - eye_mid_x) * ey_x + (raw_chin.y - eye_mid_y) * ey_y;
+    let safe_chin_u = if (raw_chin_u - mouth_u).abs() > eye_dist * 0.32 {
+        (mouth_u + (raw_chin_u - mouth_u).clamp(-eye_dist * 0.22, eye_dist * 0.22))
+            .clamp(-eye_dist * 0.36, eye_dist * 0.36)
+    } else {
+        raw_chin_u
+    };
+    let min_chin_v = (mouth_v + eye_dist * 0.18).max(eye_dist * 0.42);
+    let safe_chin_v = raw_chin_v.clamp(min_chin_v, eye_dist * 1.65);
+    let chin = Point {
+        x: (eye_mid_x + ex_x * safe_chin_u + ey_x * safe_chin_v)
+            .clamp(0.0, (img_w.saturating_sub(1)) as f64),
+        y: (eye_mid_y + ex_y * safe_chin_u + ey_y * safe_chin_v)
+            .clamp(0.0, (img_h.saturating_sub(1)) as f64),
+    };
+
     let brow_mid = mean_points(points_28, &[6, 9]);
     let up_x = eye_mid_x - chin.x;
     let up_y = eye_mid_y - chin.y;

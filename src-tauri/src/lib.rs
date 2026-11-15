@@ -1,13 +1,18 @@
 pub mod analysis;
 pub mod core;
 pub mod inference;
+pub mod updater;
 use analysis::{
     detector::{detect_faces, FaceCandidate, DEFAULT_FACE_SCORE_THRESHOLD},
     landmarks::{detect_landmarks, Landmark28Point, RigLandmarkProvenance},
     models::{atomic_write_bytes, download_and_install_model, ModelRole, ModelStatusEntry},
-    parts::{propose_parts_auto, propose_parts_auto_with_options, refine_part_with_prompts, PartProposalMeta},
+    parts::{
+        propose_parts_auto, propose_parts_auto_with_template, refine_part_with_prompts,
+        PartProposalMeta,
+    },
     segmentation::PromptInput,
     state::{hash_rgba_bytes, AnalysisState},
+    templates::{StyleMatchReport, TemplateStyleSelection},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
@@ -312,11 +317,15 @@ struct ProposePartsResponse {
     job_id: u64,
     part_ids: Vec<String>,
     masks: Vec<String>,
+    fill_masks: Vec<Option<String>>,
+    fill_kinds: Vec<String>,
+    textures: Vec<Option<String>>,
     metas: Vec<PartProposalMeta>,
     provider: String,
     model_hashes: HashMap<String, String>,
     postprocess_version: String,
     image_hash: String,
+    style_match: Option<StyleMatchReport>,
 }
 
 #[derive(Serialize)]
@@ -409,6 +418,8 @@ async fn propose_parts(
     model_path: Option<String>,
     detail_mode: Option<String>,
     hair_split: Option<bool>,
+    template_mode: Option<bool>,
+    style_overrides: Option<TemplateStyleSelection>,
     job_id: Option<u64>,
 ) -> Result<ProposePartsResponse, String> {
     let state = app.state::<AnalysisState>();
@@ -427,7 +438,9 @@ async fn propose_parts(
         let data = core::decode_bytes(&rgba, n * 4)?;
         let pts28 = points_28.unwrap_or_default();
         let mode = detail_mode.unwrap_or_else(|| "detail".into());
-        let out = propose_parts_auto_with_options(
+        let hs = hair_split.unwrap_or(true);
+        let use_tpl = template_mode.unwrap_or(hs && mode == "detail");
+        let out = propose_parts_auto_with_template(
             &state,
             &data,
             width,
@@ -438,7 +451,9 @@ async fn propose_parts(
             tolerance.clamp(0., 180.),
             model_path.as_deref(),
             &mode,
-            hair_split.unwrap_or(true),
+            hs,
+            use_tpl,
+            style_overrides.as_ref(),
         )?;
         if state.is_stale_or_cancelled(my_job) {
             return Err("CANCELLED".into());
@@ -447,11 +462,19 @@ async fn propose_parts(
             job_id: my_job,
             part_ids: out.part_ids,
             masks: out.masks.iter().map(|m| STANDARD.encode(m)).collect(),
+            fill_masks: out
+                .fill_masks
+                .iter()
+                .map(|fm| fm.as_ref().map(|m| STANDARD.encode(m)))
+                .collect(),
+            fill_kinds: out.fill_kinds,
+            textures: out.textures,
             metas: out.metas,
             provider: out.provider,
             model_hashes: out.model_hashes,
             postprocess_version: out.postprocess_version,
             image_hash: out.image_hash,
+            style_match: out.style_match,
         })
     })
     .await
@@ -564,7 +587,7 @@ async fn build_rig(
                 None => None,
             };
             let effective = core::effective_part_mask(&visible, fill.as_deref());
-            let mesh = core::mesh_for_part(&effective, width, height, 14, &landmarks);
+            let mesh = core::art_mesh_for_part(&effective, width, height, 14, &part.id, &landmarks);
             let quality =
                 core::check_mesh_quality(&mesh, &effective, width, height, &part.id, &landmarks);
             let mut samples = Vec::new();
@@ -573,9 +596,24 @@ async fn build_rig(
                 ("angleY", vec![-10., 0., 10.]),
                 ("angleZ", vec![-15., 0., 15.]),
                 ("eyeL", vec![0., 1.]),
+                ("eyeLSmile", vec![0., 1.]),
                 ("eyeR", vec![0., 1.]),
+                ("eyeRSmile", vec![0., 1.]),
+                ("eyeBallX", vec![-1., 0., 1.]),
+                ("eyeBallY", vec![-1., 0., 1.]),
+                ("browLY", vec![-1., 0., 1.]),
+                ("browLForm", vec![-1., 0., 1.]),
+                ("browRY", vec![-1., 0., 1.]),
+                ("browRForm", vec![-1., 0., 1.]),
+                ("mouthForm", vec![-1., 0., 1.]),
                 ("mouth", vec![0., 1.]),
+                ("bodyAngleX", vec![-10., 0., 10.]),
+                ("bodyAngleY", vec![-10., 0., 10.]),
+                ("bodyAngleZ", vec![-10., 0., 10.]),
+                ("breath", vec![0., 1.]),
                 ("hair", vec![-1., 0., 1.]),
+                ("hairSide", vec![-1., 0., 1.]),
+                ("hairBack", vec![-1., 0., 1.]),
             ] {
                 for value in values {
                     let mut pose = core::Pose::default();
@@ -584,9 +622,24 @@ async fn build_rig(
                         "angleY" => pose.angle_y = value,
                         "angleZ" => pose.angle_z = value,
                         "eyeL" => pose.eye_l = value,
+                        "eyeLSmile" => pose.eye_l_smile = value,
                         "eyeR" => pose.eye_r = value,
+                        "eyeRSmile" => pose.eye_r_smile = value,
+                        "eyeBallX" => pose.eye_ball_x = value,
+                        "eyeBallY" => pose.eye_ball_y = value,
+                        "browLY" => pose.brow_l_y = value,
+                        "browLForm" => pose.brow_l_form = value,
+                        "browRY" => pose.brow_r_y = value,
+                        "browRForm" => pose.brow_r_form = value,
+                        "mouthForm" => pose.mouth_form = value,
                         "mouth" => pose.mouth = value,
-                        _ => pose.hair = value,
+                        "bodyAngleX" => pose.body_angle_x = value,
+                        "bodyAngleY" => pose.body_angle_y = value,
+                        "bodyAngleZ" => pose.body_angle_z = value,
+                        "breath" => pose.breath = value,
+                        "hair" => pose.hair = value,
+                        "hairSide" => pose.hair_side = value,
+                        _ => pose.hair_back = value,
                     };
                     samples.push(Sample {
                         parameter: parameter.into(),
@@ -710,6 +763,7 @@ pub fn run() {
             let analysis_state =
                 AnalysisState::new(app_data_dir).map_err(std::io::Error::other)?;
             app.manage(analysis_state);
+            app.manage(updater::PendingUpdate::default());
             if std::env::var_os("FLAT2RIG_HEADLESS_SMOKE").is_some() {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;
@@ -718,6 +772,8 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             generate_parts,
             propose_parts,
@@ -731,7 +787,11 @@ pub fn run() {
             download_model,
             cancel_analysis,
             analyze_face,
-            detect_landmarks_for_face
+            detect_landmarks_for_face,
+            updater::get_app_version,
+            updater::check_app_update,
+            updater::install_app_update,
+            updater::relaunch_app
         ])
         .run(tauri::generate_context!())
         .expect("failed to run flat2rig");

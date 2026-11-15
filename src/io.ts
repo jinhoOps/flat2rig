@@ -1,10 +1,14 @@
 import { zip, unzipSync, strToU8, strFromU8, type Zippable } from "fflate";
 import { writePsdUint8Array, readPsd } from "ag-psd";
 import {
+  ALLOWED_BLEND_MODES,
+  describeDynamicPart,
   HAIR_ROLE_META,
   PART_DEFS,
   PARAM_DEFS,
+  PARAM_GROUPS,
   type HairRole,
+  type PartRole,
   type Project,
   type Part,
 } from "./types";
@@ -76,6 +80,7 @@ function migrateV1ToV2(p: Record<string, unknown>, parts: Part[]): Project {
     },
     parts: parts.map((part, index) => ({
       ...part,
+      blendMode: part.blendMode ?? "normal",
       provenance: part.provenance ?? "geometry",
       fillKind: part.fillKind ?? (part.generated ? "neighbor" : "none"),
       compositeOrder: part.compositeOrder ?? index,
@@ -122,7 +127,7 @@ export function loadProject(bytes: Uint8Array): Project {
     throw new Error("잘못된 프로젝트 정보입니다.");
   const ids = new Set<string>();
   const validProvenances = ["model", "prompted", "geometry", "manual"];
-  const validFillKinds = ["none", "neighbor", "external"];
+  const validFillKinds = ["none", "neighbor", "external", "template"];
   for (let idx = 0; idx < p.parts.length; idx++) {
     const part = p.parts[idx];
     if (
@@ -136,7 +141,8 @@ export function loadProject(bytes: Uint8Array): Project {
       typeof part.visible !== "boolean" ||
       (part.texture && !validDataURL(part.texture)) ||
       (part.provenance && !validProvenances.includes(part.provenance)) ||
-      (part.fillKind && !validFillKinds.includes(part.fillKind))
+      (part.fillKind && !validFillKinds.includes(part.fillKind)) ||
+      (part.blendMode && !ALLOWED_BLEND_MODES.includes(part.blendMode))
     )
       throw new Error("잘못된 파츠 정보입니다.");
     ids.add(part.id);
@@ -177,12 +183,16 @@ function quote(value: unknown) {
   return `"${String(value ?? "").replace(/"/g, '""')}"`;
 }
 export function referenceCsv() {
+  const groupLabels = new Map<string, string>(
+    PARAM_GROUPS.map((g) => [g.id, `${g.label} (${g.id})`]),
+  );
   return (
     "\uFEFF" +
     [
       [
         "ID",
         "Name",
+        "Group",
         "Minimum",
         "Default",
         "Maximum",
@@ -192,6 +202,7 @@ export function referenceCsv() {
       ...PARAM_DEFS.map((p) => [
         p.id,
         p.name,
+        groupLabels.get(p.groupId) ?? p.groupId,
         p.min,
         p.value,
         p.max,
@@ -287,6 +298,9 @@ export function readCsvTemplate(text: string): CsvTemplate {
 }
 export function cubismCsv(template: CsvTemplate) {
   const { headers, sample, columns: c } = template;
+  const groupLabels = new Map<string, string>(
+    PARAM_GROUPS.map((g) => [g.id, g.label]),
+  );
   const rows = PARAM_DEFS.map((p) => {
     const r = headers.map(() => "");
     const vals: Record<string, unknown> = {
@@ -294,12 +308,12 @@ export function cubismCsv(template: CsvTemplate) {
       type: sample[c.type],
       id: p.id,
       name: p.name,
-      group: "",
+      group: p.groupId,
       min: p.min,
       value: p.value,
       max: p.max,
       repeat: "false",
-      description: "flat2rig draft; keyforms must be created in Cubism",
+      description: `flat2rig draft (${groupLabels.get(p.groupId) ?? p.groupId}); keyforms must be created in Cubism`,
     };
     for (const [key, value] of Object.entries(vals))
       if (c[key] !== undefined) r[c[key]] = String(value);
@@ -337,34 +351,57 @@ export async function exportPsd(
   const images = canvases ?? (await partCanvases(project)),
     composite = canvas(project.width, project.height),
     ctx = composite.getContext("2d")!;
-  // Visibility is a viewport aid. Export all non-missing approved/draft parts visibly in compositeOrder.
-  const children = orderedEntries(project.parts).flatMap(({ part: p, index: i }) => {
+  // Visibility is a viewport aid. Export all non-missing approved/draft parts visibly in compositeOrder,
+  // grouped by Cubism part hierarchy folders (`뒷머리`, `몸`, `얼굴`, `입`, `눈 R`, `눈 L`, `눈썹`, `앞옆머리`).
+  type LeafLayer = {
+    name: string;
+    left: number;
+    top: number;
+    canvas: HTMLCanvasElement;
+    blendMode: "normal";
+    hidden: boolean;
+  };
+  const folders: Array<{ name: string; opened: boolean; children: LeafLayer[] }> = [];
+  let leafCount = 0;
+  for (const { part: p, index: i } of orderedEntries(project.parts)) {
     const eff = effectiveMask(p);
     if (
       p.status === "missing" ||
       !bounds(eff, project.width, project.height)
     )
-      return [];
+      continue;
+    const blendMode = p.blendMode ?? "normal";
+    if (blendMode !== "normal") {
+      throw new Error(
+        `현재 PSD 내보내기는 일반(normal) 합성 모드만 지원합니다 (${p.id}: ${blendMode}). multiply/additive 모드는 실제 Cubism Editor 가져오기 검증 전까지 조용히 normal로 바꾸어 내보내지 않습니다.`,
+      );
+    }
     ctx.drawImage(images[i], 0, 0);
-    return [
-      {
-        name: `${p.id} · ${p.name}`,
-        left: 0,
-        top: 0,
-        canvas: images[i],
-        blendMode: "normal" as const,
-        hidden: false,
-      },
-    ];
-  });
-  if (!children.length)
+    leafCount += 1;
+    const leaf: LeafLayer = {
+      name: `${p.id} · ${p.name}`,
+      left: 0,
+      top: 0,
+      canvas: images[i],
+      blendMode: "normal",
+      hidden: false,
+    };
+    const groupName = p.group || "기타";
+    const tail = folders[folders.length - 1];
+    if (tail && tail.name === groupName) {
+      tail.children.push(leaf);
+    } else {
+      folders.push({ name: groupName, opened: true, children: [leaf] });
+    }
+  }
+  if (!leafCount)
     throw new Error("내보낼 파츠가 없습니다. 먼저 분리 초안을 생성하세요.");
   const bytes = writePsdUint8Array(
     {
       width: project.width,
       height: project.height,
       canvas: composite,
-      children,
+      children: folders,
     },
     { trimImageData: true, noBackground: true, generateThumbnail: false },
   );
@@ -373,9 +410,15 @@ export async function exportPsd(
     skipCompositeImageData: true,
     skipThumbnail: true,
   });
+  const countLeaves = (layers: typeof check.children): number =>
+    (layers ?? []).reduce(
+      (sum, layer) => sum + (layer.children ? countLeaves(layer.children) : 1),
+      0,
+    );
   if (
     check.width !== project.width ||
-    check.children?.length !== children.length
+    check.children?.length !== folders.length ||
+    countLeaves(check.children) !== leafCount
   )
     throw new Error("PSD 구조 검증 실패");
   return bytes;
@@ -388,7 +431,7 @@ export function handoff(project: Project, csv: boolean) {
           .map(([k, v]) => `${k}=${v.slice(0, 12)}`)
           .join(", ")
       : project.modelHash || "사용하지 않음";
-  return `# ${project.name} — Cubism 작업 인계\n\n- 캔버스: ${project.width} × ${project.height}px (원본 ${project.originalWidth} × ${project.originalHeight})\n- 생성 경로: ${project.provider}\n- 모델 SHA-256: ${modelHashesText}\n- 좌표: 원본 작업 캔버스 좌상단 (0,0), X 오른쪽, Y 아래. 좌우는 캐릭터 기준.\n- 미확인 파츠: ${unresolved.map((p) => p.id + " (" + p.status + ")").join(", ") || "없음"}\n\n## 가져오기\n1. character_import.psd를 Cubism Editor에서 열어 새 모델을 만듭니다. 레이어 순서와 알파를 확인합니다.\n2. ${csv ? "parameters.csv는 불러온 Cubism CSV 샘플의 형식으로 생성했습니다. 백업 후 파라미터 일괄 설정에서 UTF-8로 가져오고, 전체 삭제 옵션은 끕니다. 실제 버전 호환성은 확인이 필요합니다." : "parameters-reference.csv는 참고용 목록입니다. 공식 가져오기 파일이 아닙니다. Cubism에서 파라미터를 수동 생성하거나 flat2rig에 Editor의 CSV 샘플을 불러오세요."}\n3. guides/landmarks.png와 rig-draft.json을 참고하여 ArtMesh와 디포머를 정리합니다. 자체 JSON은 Editor로 직접 가져오지 않습니다.\n4. 목을 피벗으로 HeadRotation → HeadXY → Eyes/Mouth/Hair 디포머를 구성합니다. 눈 흰자를 클리핑 대상으로 활용하되 원화에 맞게 조정합니다.\n5. 눈 개폐 0/1, 입 개폐 0/1, 머리 X/Y -10/0/10, Z -15/0/15의 변형 키를 수동으로 작성합니다. 전체 -30~30 품질은 보장하지 않습니다.\n6. 작은 조합 입력부터 구멍, 눈꺼풀 경계, 입 안 노출을 확인하고 가림 영역을 보완합니다.\n7. 머리카락 흔들림 변형 키를 먼저 만든 뒤 Cubism에서 물리를 설정하고 .cmo3로 저장합니다.\n\n## 알려진 한계\n- 얼굴 검출(YOLOv3)·28점 랜드마크(HRNetV2)에서 crown 좌표는 기하 추정값입니다.\n- 파츠 분리는 MobileSAM + 랜드마크 하이브리드 분할 또는 기하 폴백이며, 수동 보정(브러시·클릭 프롬프트) 및 검토 상태(status)와 출처(provenance)를 분리해 기록합니다.\n- 가림 보완(neighbor)은 가시 마스크와 분리 저장되는 경계 픽셀 외삽으로, 생성형 인페인팅이 아니며 가려진 눈·입·머리카락 내부 디테일은 복원되지 않습니다.\n- PSD는 이미지만 전달합니다. 메쉬, 키폼, 클리핑, 물리는 자동 적용되지 않습니다.\n- 레이어 숨김/솔로는 편집기 표시 보조입니다. 내보내기는 미해당 파츠를 제외한 전체 파츠를 표시합니다.\n- 자동 PSD 재읽기는 통과했으나 실제 Cubism Editor에서의 가져오기는 별도 검증해야 합니다.\n\n## 파츠\n${orderedEntries(project.parts).map(({ part: p }, i) => `${i}. ${p.id} — ${p.name} [검토:${p.status}, 출처:${p.provenance ?? "geometry"}, 보완:${p.fillKind ?? "none"}]`).join("\n")}\n\n공식 참고: https://docs.live2d.com/en/cubism-editor-manual/psd-import/\n`;
+  return `# ${project.name} — Cubism 작업 인계\n\n- 캔버스: ${project.width} × ${project.height}px (원본 ${project.originalWidth} × ${project.originalHeight})\n- 생성 경로: ${project.provider}\n- 모델 SHA-256: ${modelHashesText}\n- 좌표: 원본 작업 캔버스 좌상단 (0,0), X 오른쪽, Y 아래. 좌우는 캐릭터 기준.\n- 미확인 파츠: ${unresolved.map((p) => p.id + " (" + p.status + ")").join(", ") || "없음"}\n\n## 가져오기\n1. character_import.psd를 Cubism Editor에서 열어 새 모델을 만듭니다. 레이어 순서와 알파를 확인합니다.\n2. ${csv ? "parameters.csv는 불러온 Cubism CSV 샘플의 형식으로 생성했습니다. 백업 후 파라미터 일괄 설정에서 UTF-8로 가져오고, 전체 삭제 옵션은 끕니다. 실제 버전 호환성은 확인이 필요합니다." : "parameters-reference.csv는 참고용 목록입니다. 공식 가져오기 파일이 아닙니다. Cubism에서 파라미터를 수동 생성하거나 flat2rig에 Editor의 CSV 샘플을 불러오세요."}\n3. guides/landmarks.png와 rig-draft.json의 파츠별 ArtMesh 토폴로지 초안을 참고하여 Cubism Editor에서 ArtMesh와 디포머를 정리합니다. 자체 JSON은 Editor로 직접 가져오지 않습니다.\n4. 목을 피벗으로 HeadRotation → HeadXY → Eyes/Mouth/Hair 디포머를 구성합니다. 눈 흰자를 클리핑 대상으로 활용하되 원화에 맞게 조정합니다.\n5. 눈 개폐 0/1, 입 개폐 0/1, 머리 X/Y -10/0/10, Z -15/0/15의 변형 키를 수동으로 작성합니다. 전체 -30~30 품질은 보장하지 않습니다.\n6. 작은 조합 입력부터 구멍, 눈꺼풀 경계, 입 안 노출을 확인하고 가림 영역을 보완합니다.\n7. 머리카락 흔들림 변형 키를 먼저 만든 뒤 Cubism에서 물리를 설정하고 .cmo3로 저장합니다.\n\n## 알려진 한계\n- 얼굴 검출(YOLOv3)·28점 랜드마크(HRNetV2)에서 crown 좌표는 기하 추정값입니다.\n- 파츠 분리는 한 레이어당 한 파츠 원칙과 움직임·가림 영역 기준의 MobileSAM + 랜드마크 하이브리드 분할 또는 기하 폴백이며, 수동 보정(브러시·클릭 프롬프트) 및 검토 상태(status)와 출처(provenance)를 분리해 기록합니다.\n- 가림 보완(template / neighbor)은 가시 마스크(\`mask\`)와 분리(\`fillMask\`) 저장되며, 실루엣 템플릿 투영 및 모션용 예비 형상(눈동자·눈꺼풀·입안)은 자동 생성되지 않는 원화 부위를 보강한 초안이므로 필요시 수동 보정하세요.\n- 레이어 합성 모드는 normal · multiply · additive 3종으로 제한되며, 현재 PSD 내보내기는 normal만 지원합니다. multiply/additive는 실제 Cubism Editor 가져오기 검증 전까지 지원 표시나 조용한 normal 변환을 하지 않습니다.\n- PSD는 이미지 레이어와 오프셋만 전달합니다. ArtMesh, 키폼, 클리핑, 물리는 자동 적용되지 않습니다.\n- 레이어 숨김/솔로는 편집기 표시 보조입니다. 내보내기는 미해당 파츠를 제외한 전체 파츠를 표시합니다.\n- 자동 PSD 재읽기는 통과했으나 실제 Cubism Editor에서의 가져오기는 별도 검증해야 합니다.\n\n## 파츠\n${orderedEntries(project.parts).map(({ part: p }, i) => `${i}. ${p.id} — ${p.name} [검토:${p.status}, 출처:${p.provenance ?? "geometry"}, 보완:${p.fillKind ?? "none"}, 합성:${p.blendMode ?? "normal"}]`).join("\n")}\n\n공식 참고: https://docs.live2d.com/en/cubism-editor-manual/psd-import/\n`;
 }
 export async function exportBundle(
   project: Project,
@@ -447,17 +490,27 @@ export async function exportBundle(
         schemaVersion: 1,
         format: "flat2rig-rig-draft",
         directlyImportableInCubism: false,
+        meshKind: "part-role-art-mesh-preview",
+        supportedPsdBlendModes: ["normal"],
         coordinateSystem: "pixels-top-left-y-down",
         width: project.width,
         height: project.height,
         landmarks: project.landmarks,
+        partBlendModes: Object.fromEntries(
+          project.parts.map((p) => [p.id, p.blendMode ?? "normal"]),
+        ),
         parameters: PARAM_DEFS,
         deformerSuggestions: [
+          "Body_All (몸)",
+          "Hair_Back (뒷머리)",
+          "Face_All (얼굴)",
           "HeadRotation",
           "HeadXY",
-          "Eyes",
+          "Eyes (눈동자→눈흰자 클리핑)",
+          "EyeballXY",
+          "Brows",
           "Mouth",
-          "Hair",
+          "HairFront / HairSide / HairBack",
         ],
         parts: rig,
       },
@@ -497,6 +550,10 @@ export async function exportBundle(
         createdAt: new Date().toISOString(),
         psdStructureRoundTrip: "passed",
         cubismEditorImport: "not-tested",
+        supportedPsdBlendModes: ["normal"],
+        nonNormalBlendParts: project.parts
+          .filter((p) => (p.blendMode ?? "normal") !== "normal")
+          .map((p) => ({ id: p.id, blendMode: p.blendMode })),
         csv: template ? "sample-derived-not-editor-tested" : "reference-only",
         unapproved: project.parts
           .filter((p) => p.status === "draft")
@@ -563,22 +620,191 @@ export function newHairPart(
   };
 }
 
-export function insertHairPartInOrder(parts: Part[], added: Part): Part[] {
-  const role = added.role;
-  const list = [...parts];
-  let insertAt = list.length;
-  if (role === "hair_back") {
-    let lastBack = -1;
-    list.forEach((p, i) => {
-      if (p.id.startsWith("hair_back") || p.role === "hair_back") lastBack = i;
-    });
-    insertAt = lastBack >= 0 ? lastBack + 1 : 0;
-  } else if (role === "hair_side_L" || role === "hair_side_R") {
-    const firstFront = list.findIndex(
-      (p) => p.id.startsWith("hair_front") || p.role === "hair_front",
-    );
-    insertAt = firstFront >= 0 ? firstFront : list.length;
+export function newDynamicPart(
+  baseId: HairRole | "hat" | "clothes_outer" | "acc_glasses" | "acc_hairpin",
+  existingParts: Part[],
+  w: number,
+  h: number,
+): Part {
+  if (baseId in HAIR_ROLE_META) {
+    return newHairPart(baseId as HairRole, existingParts, w, h);
   }
+  const existingIds = new Set(existingParts.map((p) => p.id));
+  let id: string = baseId;
+  let idx = 2;
+  while (existingIds.has(id)) {
+    id = `${baseId}_${idx}`;
+    idx++;
+  }
+  const meta = describeDynamicPart(id);
+  return {
+    id,
+    name: meta.name,
+    group: meta.group,
+    color: meta.color,
+    role: meta.role,
+    visible: true,
+    status: "draft",
+    provenance: "manual",
+    mask: new Uint8Array(w * h),
+  };
+}
+
+const CANONICAL_LAYER_ORDER: readonly string[] = [
+  "hair_back",
+  "body",
+  "neck",
+  "clothes",
+  "face",
+  "clothes_hands",
+  "eyeR_white",
+  "eyeR_iris",
+  "eyeR_lower",
+  "eyeR_upper",
+  "eyeL_white",
+  "eyeL_iris",
+  "eyeL_lower",
+  "eyeL_upper",
+  "browR",
+  "browL",
+  "mouth_inner",
+  "mouth_lower",
+  "mouth_upper",
+  "acc_glasses",
+  "hair_side_R",
+  "hair_side_L",
+  "hair_front",
+  "hat",
+  "acc_hairpin",
+  "acc_ribbon",
+];
+
+const CANONICAL_INDEX = new Map(CANONICAL_LAYER_ORDER.map((id, i) => [id, i]));
+
+function partLayerRank(part: Pick<Part, "id" | "role">): number {
+  const exact = CANONICAL_INDEX.get(part.id);
+  if (exact !== undefined) return exact;
+  const role: PartRole | undefined = part.role;
+  const prefixTable: readonly [string, PartRole | undefined, string, number][] = [
+    ["hair_back_", "hair_back", "hair_back", 0.5],
+    ["clothes_hands", "hands", "clothes_hands", 0],
+    ["clothes_", "clothes", "clothes", 0.5],
+    ["hair_side_R", "hair_side_R", "hair_side_R", 0.5],
+    ["hair_side_L", "hair_side_L", "hair_side_L", 0.5],
+    ["hair_front_", "hair_front", "hair_front", 0.5],
+    ["hat_", "hat", "hat", 0.5],
+    ["acc_glasses", undefined, "acc_glasses", 0],
+    ["acc_hairpin", undefined, "acc_hairpin", 0],
+    ["acc_ribbon", undefined, "acc_ribbon", 0],
+  ];
+  for (const [prefix, matchRole, anchor, offset] of prefixTable) {
+    if (part.id.startsWith(prefix) || (matchRole && role === matchRole)) {
+      return (CANONICAL_INDEX.get(anchor) ?? CANONICAL_LAYER_ORDER.length) + offset;
+    }
+  }
+  if (role === "face") return CANONICAL_INDEX.get("face")!;
+  if (role === "eye") return CANONICAL_INDEX.get("eyeL_upper")! + 0.25;
+  if (role === "mouth") return CANONICAL_INDEX.get("mouth_upper")! + 0.25;
+  return CANONICAL_LAYER_ORDER.length;
+}
+
+export function insertHairPartInOrder(parts: Part[], added: Part): Part[] {
+  const list = [...parts];
+  const rank = partLayerRank(added);
+  const idx = list.findIndex((p) => partLayerRank(p) > rank);
+  const insertAt = idx >= 0 ? idx : list.length;
   list.splice(insertAt, 0, added);
-  return list.map((p, idx) => ({ ...p, compositeOrder: idx }));
+  return list.map((p, i) => ({ ...p, compositeOrder: i }));
+}
+
+export function isPreservedPart(part: Part): boolean {
+  return (
+    part.status === "approved" ||
+    part.provenance === "manual" ||
+    part.provenance === "prompted"
+  );
+}
+
+export function mergePreservedParts(
+  prevParts: Part[],
+  nextParts: Part[],
+): { parts: Part[]; preservedCount: number } {
+  const prevById = new Map(prevParts.map((t) => [t.id, t]));
+  const preservedIds = new Set<string>();
+  let preservedCount = 0;
+
+  let merged: Part[] = nextParts.map((nextPart) => {
+    const prev = prevById.get(nextPart.id);
+    if (prev && isPreservedPart(prev)) {
+      preservedIds.add(prev.id);
+      preservedCount++;
+      return { ...prev, compositeOrder: nextPart.compositeOrder };
+    }
+    return nextPart;
+  });
+
+  // Keep dynamic extra parts (extra hair strands, hats, wearables) that user approved or edited manually.
+  for (const prev of prevParts) {
+    if (isPreservedPart(prev) && !preservedIds.has(prev.id)) {
+      merged = insertHairPartInOrder(merged, prev);
+      preservedIds.add(prev.id);
+      preservedCount++;
+    }
+  }
+
+  if (preservedIds.size > 0 && merged.length > 0) {
+    const len = merged[0].mask.length;
+    const ownerIdx = new Int32Array(len).fill(-1);
+    const preservedList = merged.filter((part) => preservedIds.has(part.id));
+    const pairOverlaps = new Map<string, number>();
+
+    for (let pIdx = 0; pIdx < preservedList.length; pIdx++) {
+      const part = preservedList[pIdx];
+      for (let i = 0; i < len; i++) {
+        if (part.mask[i] === 0) continue;
+        const prevOwnerIdx = ownerIdx[i];
+        if (prevOwnerIdx >= 0 && prevOwnerIdx !== pIdx) {
+          const ownerId = preservedList[prevOwnerIdx].id;
+          const key = `${ownerId}::${part.id}`;
+          pairOverlaps.set(key, (pairOverlaps.get(key) ?? 0) + 1);
+        } else {
+          ownerIdx[i] = pIdx;
+        }
+      }
+    }
+
+    if (pairOverlaps.size > 0) {
+      const summary = [...pairOverlaps.entries()]
+        .map(([pair, px]) => `${pair.replace("::", "·")}(${px}px)`)
+        .join(", ");
+      throw new Error(
+        `보존된 파츠끼리 이미 겹쳐 있어 병합을 진행할 수 없습니다: ${summary}. 브러시/지우개로 겹친 영역을 먼저 정리해 주세요.`,
+      );
+    }
+
+    merged = merged.map((part, idx) => {
+      if (preservedIds.has(part.id)) {
+        return { ...part, compositeOrder: idx };
+      }
+      let touched = false;
+      for (let i = 0; i < len; i++) {
+        if (ownerIdx[i] >= 0 && part.mask[i] > 0) {
+          touched = true;
+          break;
+        }
+      }
+      if (!touched) {
+        return { ...part, compositeOrder: idx };
+      }
+      const nextMask = part.mask.slice();
+      for (let i = 0; i < len; i++) {
+        if (ownerIdx[i] >= 0) nextMask[i] = 0;
+      }
+      return { ...part, mask: nextMask, compositeOrder: idx };
+    });
+  } else {
+    merged = merged.map((part, idx) => ({ ...part, compositeOrder: idx }));
+  }
+
+  return { parts: merged, preservedCount };
 }

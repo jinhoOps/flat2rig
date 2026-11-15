@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowDown,
@@ -40,6 +40,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import type {
+  BlendMode,
   FillKind,
   HairRole,
   LandmarkId,
@@ -52,34 +53,49 @@ import type {
   Point,
   Project,
   PromptPoint,
+  TemplateStyleSelection,
   Tool,
 } from "./types";
-import { isHairPart, PARAM_DEFS, REST } from "./types";
+import {
+  isHairPart,
+  PARAM_DEFS,
+  PARAM_GROUPS,
+  REST,
+  TEMPLATE_STYLE_CATALOG,
+} from "./types";
 import { bounds, clamp, faceBoxLandmarks, paint } from "./engine";
 import { loadImage, pixels, pixelsCanvas, readImage } from "./images";
 import {
   analyzeFace,
   buildRig,
   cancelAnalysis,
+  checkAppUpdate,
   chooseOnnxModel,
   desktop,
   detectLandmarksForFace,
   downloadModel,
   fillOcclusionNative,
+  getAppVersion,
   getModelStatus,
+  installAppUpdate,
   proposeParts,
   refinePartPrompt,
+  relaunchApp,
   saveFile,
   setModelPath as setRegisteredModelPath,
   type FaceAnalysisResponse,
   type MeshQualityReport,
   type RefinePromptResult,
+  type UpdateCheckResult,
 } from "./native";
 import {
   exportBundle,
   exportPsd,
   insertHairPartInOrder,
+  isPreservedPart,
   loadProject,
+  mergePreservedParts,
+  newDynamicPart,
   newHairPart,
   newPart,
   readCsvTemplate,
@@ -88,7 +104,11 @@ import {
   type CsvTemplate,
 } from "./io";
 import Viewport from "./Viewport";
-import { demoFile } from "./demo";
+import {
+  demoFile,
+  downloadSpriteGuide,
+  renderSpriteGuideCanvas,
+} from "./demo";
 import { BrandMark, BrandWordmark } from "./brand/Brand";
 import BrandLoop from "./brand/BrandLoop";
 
@@ -116,6 +136,21 @@ function diagnosticLabel(d: string): string {
   return d;
 }
 
+const TEMPLATE_FEATURE_KEYS: readonly (keyof TemplateStyleSelection)[] = [
+  "faceStyle",
+  "hairFrontStyle",
+  "hairSideStyle",
+  "hairBackStyle",
+  "eyeStyle",
+  "mouthStyle",
+  "clothesStyle",
+];
+
+function countStyleOverrides(sel?: TemplateStyleSelection): number {
+  if (!sel) return 0;
+  return TEMPLATE_FEATURE_KEYS.filter((k) => sel[k] && sel[k] !== "auto").length;
+}
+
 export default function App() {
   const [project, setProject] = useState<Project | null>(null),
     projectRef = useRef<Project | null>(null);
@@ -132,9 +167,13 @@ export default function App() {
     [original, setOriginal] = useState(false),
     [solo, setSolo] = useState(false);
   const [detailMode, setDetailMode] = useState<"detail" | "parent">("detail");
+  const [templateMode, setTemplateMode] = useState(true);
   const [hairSplit, setHairSplit] = useState(true);
+  const [styleSelection, setStyleSelection] = useState<TemplateStyleSelection>({});
+  const [styleMode, setStyleMode] = useState<"preserve" | "override">("preserve");
   const [subtractHairOnPrompt, setSubtractHairOnPrompt] = useState(true);
   const [parameters, setParameters] = useState<Parameters>({ ...REST }),
+    [paramGroupFilter, setParamGroupFilter] = useState<string>("all"),
     [playing, setPlaying] = useState(false);
   const [meshes, setMeshes] = useState<Map<string, Mesh>>(new Map()),
     [meshWarnings, setMeshWarnings] = useState<MeshQualityReport[]>([]),
@@ -175,9 +214,73 @@ export default function App() {
     };
   }, []);
   const [modal, setModal] = useState<
-    "export" | "regenerate" | "reanalysis" | "models" | "help" | null
+    "export" | "regenerate" | "reanalysis" | "models" | "help" | "spriteGuide" | "updates" | null
   >(null),
     [dirty, setDirty] = useState(false);
+  const [appVersion, setAppVersion] = useState("0.2.0-1");
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [updateCustomUrl, setUpdateCustomUrl] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateDownloaded, setUpdateDownloaded] = useState(false);
+  const [updateProgressPct, setUpdateProgressPct] = useState<number | null>(null);
+  useEffect(() => {
+    if (!desktop) return;
+    void getAppVersion().then(setAppVersion);
+    const timer = setTimeout(() => {
+      void checkAppUpdate()
+        .then((res) => setUpdateInfo(res))
+        .catch(() => {});
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, []);
+  const runUpdateCheck = async (customUrl?: string) => {
+    setCheckingUpdate(true);
+    try {
+      const res = await checkAppUpdate(customUrl ?? updateCustomUrl);
+      setUpdateInfo(res);
+    } catch (e) {
+      setUpdateInfo({
+        status: "unavailable",
+        currentVersion: appVersion,
+        signed: false,
+        endpointUsed: customUrl ?? updateCustomUrl,
+        releaseUrl: "https://github.com/jinhoOps/flat2rig/releases",
+        message: String(e),
+      });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+  const runUpdateInstall = async () => {
+    setInstallingUpdate(true);
+    setUpdateProgressPct(0);
+    try {
+      await installAppUpdate((ev) => {
+        if (ev.event === "Started") {
+          setUpdateProgressPct(0);
+        } else if (ev.event === "Progress") {
+          const total = ev.data.contentLength ?? 0;
+          setUpdateProgressPct(
+            total > 0 ? Math.min(99, Math.round((ev.data.downloaded / total) * 100)) : 50,
+          );
+        } else if (ev.event === "Finished") {
+          setUpdateProgressPct(100);
+        }
+      });
+      setUpdateDownloaded(true);
+      notify("업데이트 설치 준비가 완료되었습니다. 앱을 재시작하면 적용됩니다.");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setInstallingUpdate(false);
+    }
+  };
+  const [guideZoom, setGuideZoom] = useState<"fit" | 100 | 150 | 200>("fit");
+  const [spriteGuideUrl, setSpriteGuideUrl] = useState<string>("");
+  useEffect(() => {
+    setSpriteGuideUrl(renderSpriteGuideCanvas().toDataURL("image/png"));
+  }, []);
   const [historyCount, setHistoryCount] = useState([0, 0]);
   const history = useRef<Project[]>([]),
     future = useRef<Project[]>([]),
@@ -249,6 +352,9 @@ export default function App() {
     setOriginal(false);
     setCompareDiff(false);
     setDetailMode(p.detailMode ?? "detail");
+    const loadedSel = p.styleSelection ?? {};
+    setStyleSelection(loadedSel);
+    setStyleMode(countStyleOverrides(loadedSel) > 0 ? "override" : "preserve");
     setTab("prepare");
     setTool(p.parts.length ? "select" : "face");
     setSelected(
@@ -414,10 +520,25 @@ export default function App() {
       notify(res.message);
     });
   };
-  const generate = (overrideMode?: "detail" | "parent") => {
+  const generate = (
+    overrideMode?: "detail" | "parent",
+    overrideStyles?: TemplateStyleSelection,
+    preserveApproved = false,
+  ) => {
     const p = projectRef.current;
     if (!p) return;
     const mode = overrideMode ?? detailMode;
+    const rawStyles = overrideStyles ?? styleSelection;
+    const effectiveMode =
+      overrideStyles !== undefined
+        ? countStyleOverrides(overrideStyles) > 0
+          ? "override"
+          : "preserve"
+        : styleMode;
+    const styles: TemplateStyleSelection =
+      effectiveMode === "preserve"
+        ? { proportionMode: rawStyles.proportionMode ?? "auto" }
+        : rawStyles;
     setModal(null);
     setPromptResult(null);
     const jobId = ++analysisJobSeq.current;
@@ -436,16 +557,23 @@ export default function App() {
           modelPath,
           detailMode: mode,
           hairSplit,
+          templateMode: templateMode && mode === "detail",
+          styleOverrides: styles,
           jobId,
         },
         signal,
       );
       signal.throwIfAborted();
+      const { parts: mergedParts, preservedCount } = preserveApproved
+        ? mergePreservedParts(p.parts, result.parts)
+        : { parts: result.parts, preservedCount: 0 };
       commit({
         ...p,
-        parts: result.parts,
+        parts: mergedParts,
         provider: result.provider,
         detailMode: mode,
+        styleMatch: result.styleMatch,
+        styleSelection: styles,
         modelHash:
           result.modelHashes.part_decoder ??
           result.modelHashes.background ??
@@ -456,13 +584,16 @@ export default function App() {
           parts: result.postprocessVersion,
         },
       });
-      if (!result.parts.some((t) => t.id === selected)) {
-        setSelected(result.parts[0]?.id ?? "face");
+      if (!mergedParts.some((t) => t.id === selected)) {
+        setSelected(mergedParts[0]?.id ?? "face");
       }
       setTool("select");
       setTab("prepare");
+      const overrideCount = countStyleOverrides(styles);
+      const propLabel =
+        result.styleMatch?.resolved.proportionMode === "sd" ? "SD형" : "일반 LD";
       notify(
-        `${result.parts.length}개 파츠 초안이 준비됐습니다 (${mode === "parent" ? "눈·입 통합 모드" : "세부 파츠 모드"}). 경계와 가림 영역을 확인하세요.`,
+        `${mergedParts.length}개 파츠가 ${result.styleMatch ? (overrideCount > 0 ? `명시적 스타일 변경(${overrideCount}개 부위 · ${propLabel})` : `원화 유지 + 가림 보완(${propLabel})`) : mode === "parent" ? "눈·입 통합 모드" : "세부 파츠 모드"}로 준비됐습니다.${preservedCount ? ` (수정·확인 ${preservedCount}개 보존)` : ""}`,
       );
     });
   };
@@ -621,15 +752,25 @@ export default function App() {
       chin: "estimated",
       crown: "estimated",
     };
-  const addHairLayer = (role: HairRole) => {
+  const addDynamicLayer = (
+    kind: HairRole | "hat" | "clothes_outer" | "acc_glasses" | "acc_hairpin",
+  ) => {
     const p = projectRef.current;
     if (!p) return;
-    const added = newHairPart(role, p.parts, p.width, p.height);
+    const added =
+      kind === "hair_front" ||
+      kind === "hair_side_L" ||
+      kind === "hair_side_R" ||
+      kind === "hair_back"
+        ? newHairPart(kind, p.parts, p.width, p.height)
+        : newDynamicPart(kind, p.parts, p.width, p.height);
     const nextParts = insertHairPartInOrder(p.parts, added);
     commit({ ...p, parts: nextParts });
     setSelected(added.id);
     setTool(desktop ? "prompt" : "add");
-    notify(`${added.name} 레이어를 추가했습니다. ${desktop ? "클릭 보정(P)으로 머리카락 가닥을 클릭하세요." : "브러시로 영역을 칠하세요."}`);
+    notify(
+      `${added.name} 레이어를 추가했습니다. ${desktop ? "클릭 보정(P)으로 해당 영역을 클릭하세요." : "브러시로 영역을 칠하세요."}`,
+    );
   };
   const applyPromptMaskToParts = (
     parts: Part[],
@@ -644,9 +785,17 @@ export default function App() {
       subtractHairOnPrompt && !!targetPart && isHairPart(targetPart);
     return parts.map((t) => {
       if (t.id === targetId) {
+        let nextFill = t.fillMask;
+        if (t.fillMask) {
+          nextFill = t.fillMask.slice();
+          for (let i = 0; i < nextFill.length; i++) {
+            if (mask[i] > 0) nextFill[i] = 0;
+          }
+        }
         return {
           ...t,
           mask,
+          ...(nextFill ? { fillMask: nextFill } : {}),
           provenance: "prompted",
           status: "draft",
           ...(nextPrompts ? { prompts: nextPrompts } : {}),
@@ -779,18 +928,20 @@ export default function App() {
     gesture.current = { before: p, part: selected, start: pt, last: pt };
     const parts = p.parts.map((t) =>
       t.id === selected
-        ? { ...t, status: "draft" as const, provenance: "manual" as const, mask: t.mask.slice() }
+        ? {
+            ...t,
+            status: "draft" as const,
+            provenance: "manual" as const,
+            mask: t.mask.slice(),
+            fillMask: t.fillMask?.slice(),
+          }
         : t,
     );
-    paint(
-      parts.find((t) => t.id === selected)!.mask,
-      p.width,
-      p.height,
-      pt,
-      pt,
-      radius,
-      tool === "erase",
-    );
+    const active = parts.find((t) => t.id === selected)!;
+    paint(active.mask, p.width, p.height, pt, pt, radius, tool === "erase");
+    if (tool === "add" && active.fillMask) {
+      paint(active.fillMask, p.width, p.height, pt, pt, radius, true);
+    }
     update({ ...p, parts, revision: p.revision + 1 });
   };
   const move = (pt: Point) => {
@@ -824,6 +975,9 @@ export default function App() {
     } else if (g.part) {
       const part = p.parts.find((t) => t.id === g.part)!;
       paint(part.mask, p.width, p.height, g.last, pt, radius, tool === "erase");
+      if (tool === "add" && part.fillMask) {
+        paint(part.fillMask, p.width, p.height, g.last, pt, radius, true);
+      }
       update({
         ...p,
         parts: p.parts.map((t) => (t.id === g.part ? { ...t } : t)),
@@ -1200,12 +1354,30 @@ export default function App() {
           {project?.name ?? "새 프로젝트"}
           {dirty && <i className="dirty-dot" />}
         </span>
-        <span className="version">MVP / 0.1</span>
+        <span className="version">v{appVersion}</span>
         <div className="header-actions">
           <span className="local-status">
             <i />
             {desktop ? "로컬 처리" : "브라우저 미리보기"}
           </span>
+          <button
+            className={
+              updateInfo?.status === "available"
+                ? "compact-pill active"
+                : undefined
+            }
+            disabled={!!busy}
+            onClick={() => {
+              if (!updateInfo && !checkingUpdate) void runUpdateCheck();
+              setModal("updates");
+            }}
+            title="앱 버전 확인 및 자동 업데이트"
+          >
+            <RefreshCw size={14} className={checkingUpdate ? "spin" : ""} />
+            {updateInfo?.status === "available" && updateInfo.latestVersion
+              ? `업데이트 v${updateInfo.latestVersion}`
+              : "업데이트"}
+          </button>
           <button
             disabled={!!busy}
             onClick={() => {
@@ -1289,14 +1461,18 @@ export default function App() {
                   ["hair_side_R", "+ 오른옆"],
                   ["hair_side_L", "+ 왼옆"],
                   ["hair_back", "+ 뒷머리"],
+                  ["hat", "+ 모자"],
+                  ["clothes_outer", "+ 의상"],
+                  ["acc_glasses", "+ 안경"],
+                  ["acc_hairpin", "+ 악세"],
                 ] as const
-              ).map(([role, label]) => (
+              ).map(([kind, label]) => (
                 <button
-                  key={role}
+                  key={kind}
                   className="compact-pill"
                   disabled={!!busy}
-                  onClick={() => addHairLayer(role)}
-                  title="새 머리카락 가닥 레이어 추가"
+                  onClick={() => addDynamicLayer(kind)}
+                  title={`${label.replace("+ ", "")} 분리 레이어 추가`}
                 >
                   {label}
                 </button>
@@ -1315,64 +1491,89 @@ export default function App() {
                 </p>
               </div>
             ) : (
-              [...project!.parts].reverse().map((p, i) => (
-                <button
-                  className={`layer ${selected === p.id ? "selected" : ""} ${p.status === "missing" ? "missing" : ""}`}
-                  key={p.id}
-                  disabled={!!busy}
-                  onClick={() => setSelected(p.id)}
-                >
-                  <span
-                    className="layer-visibility"
-                    role="checkbox"
-                    aria-checked={p.visible}
-                    aria-label={`${p.name} 표시`}
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === " ") {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        toggleVisible(p.id);
-                      }
-                    }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      toggleVisible(p.id);
-                    }}
-                  >
-                    {p.visible ? <Eye size={13} /> : <EyeOff size={13} />}
-                  </span>
-                  <span
-                    className="layer-thumb"
-                    style={{ "--part-color": p.color } as React.CSSProperties}
-                  >
-                    <Layers size={14} />
-                  </span>
-                  <span className="layer-label">
-                    <strong>{p.name}</strong>
-                    <small>
-                      {p.id} · {partProvenanceLabel(p.provenance)}
-                      {p.diagnostics?.length
-                        ? ` · ⚠${diagnosticLabel(p.diagnostics[0])}`
-                        : ""}
-                    </small>
-                  </span>
-                  <span
-                    className={`status-dot ${p.status}`}
-                    title={
-                      p.status === "approved"
-                        ? "확인됨"
-                        : p.status === "missing"
-                          ? "미해당"
-                          : "확인 필요"
-                    }
-                  >
-                    {p.status === "approved" && <Check size={10} />}
-                  </span>
-                  <GripVertical className="grip" size={12} />
-                  <span className="sr-only">{i + 1}</span>
-                </button>
-              ))
+              (() => {
+                const rev = [...project!.parts].reverse();
+                return rev.map((p, i) => {
+                  const groupName = p.group || "기타";
+                  const prevGroup =
+                    i > 0 ? rev[i - 1].group || "기타" : null;
+                  const showHeader = groupName !== prevGroup;
+                  let runCount = 0;
+                  if (showHeader) {
+                    for (
+                      let k = i;
+                      k < rev.length && (rev[k].group || "기타") === groupName;
+                      k++
+                    )
+                      runCount++;
+                  }
+                  return (
+                    <Fragment key={p.id}>
+                      {showHeader && (
+                        <div className="layer-group-header">
+                          <span>{groupName}</span>
+                          <span className="param-group-badge">{runCount}</span>
+                        </div>
+                      )}
+                      <button
+                        className={`layer ${selected === p.id ? "selected" : ""} ${p.status === "missing" ? "missing" : ""}`}
+                        disabled={!!busy}
+                        onClick={() => setSelected(p.id)}
+                      >
+                        <span
+                          className="layer-visibility"
+                          role="checkbox"
+                          aria-checked={p.visible}
+                          aria-label={`${p.name} 표시`}
+                          tabIndex={0}
+                          onKeyDown={(e) => {
+                            if (e.key === " ") {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              toggleVisible(p.id);
+                            }
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleVisible(p.id);
+                          }}
+                        >
+                          {p.visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                        </span>
+                        <span
+                          className="layer-thumb"
+                          style={{ "--part-color": p.color } as React.CSSProperties}
+                        >
+                          <Layers size={14} />
+                        </span>
+                        <span className="layer-label">
+                          <strong>{p.name}</strong>
+                          <small>
+                            {p.id} · {partProvenanceLabel(p.provenance)}
+                            {p.diagnostics?.length
+                              ? ` · ⚠${diagnosticLabel(p.diagnostics[0])}`
+                              : ""}
+                          </small>
+                        </span>
+                        <span
+                          className={`status-dot ${p.status}`}
+                          title={
+                            p.status === "approved"
+                              ? "확인됨"
+                              : p.status === "missing"
+                                ? "미해당"
+                                : "확인 필요"
+                          }
+                        >
+                          {p.status === "approved" && <Check size={12} />}
+                        </span>
+                        <GripVertical className="grip" size={14} />
+                        <span className="sr-only">{i + 1}</span>
+                      </button>
+                    </Fragment>
+                  );
+                });
+              })()
             )}
           </div>
           <div className="layer-footer">
@@ -1602,7 +1803,7 @@ export default function App() {
                   <p>
                     PNG 또는 JPG 파일 한 장을 끌어 놓으세요.
                     <br />
-                    정면 캐릭터 흉상 · 작업 해상도 최대 2,048px
+                    정면 캐릭터 흉상 (일반 LD · SD 치비) · 최대 2,048px
                   </p>
                   <button
                     className="primary large"
@@ -1613,7 +1814,7 @@ export default function App() {
                     파일 선택
                   </button>
                   <span className="drop-hint">
-                    파츠 분리 · 마스크 보정 · Cubism용 PSD 내보내기
+                    LD/SD 실루엣 매칭 · 모션용 21파츠 분리 · Cubism용 PSD
                   </span>
                   <button
                     className="text-button"
@@ -1622,18 +1823,29 @@ export default function App() {
                       void demoFile().then(openImage);
                     }}
                   >
-                    샘플 이미지 열기
+                    샘플 일러스트로 바로 체험
                     <ChevronRight size={13} />
+                  </button>
+                  <button
+                    className="text-button guide-link-btn"
+                    disabled={!!busy}
+                    onClick={() => {
+                      setGuideZoom("fit");
+                      setModal("spriteGuide");
+                    }}
+                  >
+                    <CircleHelp size={14} />
+                    권장 일러스트 · 파츠 예시 시트 보기 (?)
                   </button>
                 </div>
                 <div className="welcome-features">
                   <span>
                     <Layers size={14} />
-                    18개 파츠 초안
+                    21개 모션 실루엣 파츠
                   </span>
                   <span>
                     <Box size={14} />
-                    메쉬 · 변형 확인
+                    메쉬 · 22 파라미터 변형
                   </span>
                   <span>
                     <FileImage size={14} />
@@ -1784,7 +1996,7 @@ export default function App() {
                   </div>
                   <div className="field-label">
                     분할 단위
-                    <span>{detailMode === "parent" ? "통합(눈·입)" : "세부 18파츠"}</span>
+                    <span>{detailMode === "parent" ? "통합(눈·입)" : "세부 파츠"}</span>
                   </div>
                   <div className="two-buttons compact">
                     <button
@@ -1797,7 +2009,7 @@ export default function App() {
                         }
                       }}
                     >
-                      세부 18파츠
+                      세부 파츠
                     </button>
                     <button
                       className={detailMode === "parent" ? "active" : ""}
@@ -1813,6 +2025,20 @@ export default function App() {
                     </button>
                   </div>
                   <div className="check-options">
+                    {detailMode === "detail" && (
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={templateMode}
+                          disabled={!!busy}
+                          onChange={(e) => {
+                            setTemplateMode(e.target.checked);
+                            if (total > 0) setModal("regenerate");
+                          }}
+                        />
+                        실루엣 스타일 매칭 (LD/SD 모션 보완)
+                      </label>
+                    )}
                     <label>
                       <input
                         type="checkbox"
@@ -1823,9 +2049,107 @@ export default function App() {
                           if (total > 0) setModal("regenerate");
                         }}
                       />
-                      다중 머리카락 분리 (앞·옆·뒷)
+                      다중 머리카락 분리 (앞·옆·뒷머리)
                     </label>
                   </div>
+                  {detailMode === "detail" && templateMode && (
+                    <div className="template-match-box">
+                      <div className="template-match-header">
+                        <span>분리 · 보완 방식</span>
+                        {project?.styleMatch && (
+                          <em>
+                            {project.styleMatch.resolved.proportionMode === "sd"
+                              ? "SD형"
+                              : "일반 LD"}
+                            {" · "}
+                            {countStyleOverrides(project.styleSelection) > 0
+                              ? `스타일 변경 (${countStyleOverrides(project.styleSelection)}개)`
+                              : "원화 유지"}
+                          </em>
+                        )}
+                      </div>
+                      <div className="seg" style={{ marginBottom: 8 }}>
+                        <button
+                          className={styleMode === "preserve" ? "on" : ""}
+                          disabled={!!busy}
+                          onClick={() => setStyleMode("preserve")}
+                        >
+                          원화 유지 (기본)
+                        </button>
+                        <button
+                          className={styleMode === "override" ? "on" : ""}
+                          disabled={!!busy}
+                          onClick={() => setStyleMode("override")}
+                        >
+                          스타일 변경
+                        </button>
+                      </div>
+                      <div className="style-preset-grid">
+                        {(styleMode === "preserve"
+                          ? TEMPLATE_STYLE_CATALOG.slice(0, 1)
+                          : TEMPLATE_STYLE_CATALOG
+                        ).map((cat) => {
+                          const curVal = styleSelection[cat.key] ?? "auto";
+                          const matchedId = project?.styleMatch?.resolved?.[cat.key];
+                          const matchedOpt = matchedId
+                            ? cat.options.find((o) => o.id === matchedId)?.label
+                            : undefined;
+                          return (
+                            <label key={cat.key} className="style-preset-field">
+                              <span>
+                                {cat.label}
+                                {curVal === "auto" && matchedOpt && (
+                                  <small> · {matchedOpt}</small>
+                                )}
+                              </span>
+                              <select
+                                aria-label={cat.label}
+                                value={curVal}
+                                disabled={!!busy}
+                                onChange={(e) =>
+                                  setStyleSelection((prev) => ({
+                                    ...prev,
+                                    [cat.key]: e.target.value,
+                                  }))
+                                }
+                              >
+                                {cat.options.map((opt) => (
+                                  <option key={opt.id} value={opt.id}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      {styleMode === "preserve" && (
+                        <small className="subtle-hint" style={{ display: "block", marginTop: 6 }}>
+                          원화의 선과 색을 그대로 유지하고 가려진 모션 영역만 보완합니다.
+                        </small>
+                      )}
+                      {total > 0 && (
+                        <button
+                          className="full"
+                          disabled={!project || !!busy}
+                          onClick={() =>
+                            generate(
+                              undefined,
+                              styleMode === "preserve"
+                                ? { proportionMode: styleSelection.proportionMode ?? "auto" }
+                                : styleSelection,
+                              true,
+                            )
+                          }
+                        >
+                          <RefreshCw size={14} />
+                          {styleMode === "preserve"
+                            ? "원화 유지 모드로 다시 적용 (수정·확인 파츠 유지)"
+                            : "선택 스타일 적용 (수정·확인 파츠 유지)"}
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <button
                     className="model-button"
                     disabled={!!busy}
@@ -2098,6 +2422,23 @@ export default function App() {
                           뒤로
                         </button>
                       </div>
+                      <label className="field-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 6, marginBottom: 6 }}>
+                        <span className="tiny">합성 모드 (normal만 PSD 지원)</span>
+                        <select
+                          aria-label="레이어 합성 모드"
+                          disabled={!!busy}
+                          value={part.blendMode ?? "normal"}
+                          onChange={(e) =>
+                            patchPart({
+                              blendMode: e.target.value as BlendMode,
+                            })
+                          }
+                        >
+                          <option value="normal">일반 (Normal)</option>
+                          <option value="multiply">곱하기 (Multiply)</option>
+                          <option value="additive">가산 (Additive)</option>
+                        </select>
+                      </label>
                       <button
                         className={`full approve ${part.status === "approved" ? "is-approved" : ""}`}
                         disabled={
@@ -2162,7 +2503,39 @@ export default function App() {
                     <br />
                     Cubism의 최종 키폼과 다를 수 있습니다.
                   </p>
-                  {PARAM_DEFS.map((def) => (
+                  <div
+                    className="param-group-tabs"
+                    role="tablist"
+                    aria-label="파라미터 그룹 필터"
+                  >
+                    <button
+                      type="button"
+                      className={`param-group-tab ${paramGroupFilter === "all" ? "active" : ""}`}
+                      onClick={() => setParamGroupFilter("all")}
+                    >
+                      전체
+                      <span className="param-group-badge">
+                        {PARAM_DEFS.length}
+                      </span>
+                    </button>
+                    {PARAM_GROUPS.map((g) => (
+                      <button
+                        type="button"
+                        key={g.id}
+                        className={`param-group-tab ${paramGroupFilter === g.id ? "active" : ""}`}
+                        onClick={() => setParamGroupFilter(g.id)}
+                      >
+                        {g.label}
+                        <span className="param-group-badge">
+                          {PARAM_DEFS.filter((d) => d.groupId === g.id).length}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  {(paramGroupFilter === "all"
+                    ? PARAM_DEFS
+                    : PARAM_DEFS.filter((d) => d.groupId === paramGroupFilter)
+                  ).map((def) => (
                     <div className="parameter" key={def.key}>
                       <label htmlFor={def.key}>
                         {def.name}
@@ -2284,7 +2657,7 @@ export default function App() {
           }}
         >
           <div
-            className="modal"
+            className={`modal${modal === "spriteGuide" ? " modal-wide" : ""}`}
             role="dialog"
             aria-modal="true"
             aria-label={
@@ -2292,11 +2665,15 @@ export default function App() {
                 ? "내보내기"
                 : modal === "help"
                   ? "사용 가이드"
-                  : modal === "reanalysis"
-                    ? "랜드마크 재추출 확인"
-                    : modal === "models"
-                      ? "모델 관리"
-                      : "파츠 재생성"
+                  : modal === "spriteGuide"
+                    ? "권장 일러스트 및 파츠 예시 시트"
+                    : modal === "reanalysis"
+                      ? "랜드마크 재추출 확인"
+                      : modal === "models"
+                        ? "모델 관리"
+                        : modal === "updates"
+                          ? "앱 자동 업데이트"
+                          : "파츠 재생성"
             }
           >
             <button
@@ -2531,27 +2908,230 @@ export default function App() {
                 )}
               </>
             ) : modal === "regenerate" ? (
+              (() => {
+                const hasPreservedParts =
+                  project?.parts.some((t) => isPreservedPart(t)) ?? false;
+                return (
+                  <>
+                    <h2>파츠 초안을 다시 만들까요?</h2>
+                    <p>
+                      {hasPreservedParts
+                        ? "수동 편집하거나 확인함으로 표시한 파츠와 추가 머리카락은 유지한 채 나머지 파츠만 다시 생성하거나, 전체를 새로 초기화할 수 있습니다."
+                        : "현재 마스크와 파츠 보완 이미지가 새 초안으로 바뀝니다. 작업 후 실행 취소로 복원할 수 있습니다."}
+                    </p>
+                    {hasPreservedParts && (
+                      <button
+                        className="primary full"
+                        style={{ marginBottom: 10 }}
+                        onClick={() => generate(undefined, undefined, true)}
+                      >
+                        수정·확인 파츠 유지 후 다시 생성
+                      </button>
+                    )}
+                    <div className="two-buttons">
+                      <button onClick={() => setModal(null)}>돌아가기</button>
+                      <button
+                        className={hasPreservedParts ? "" : "primary"}
+                        onClick={() => generate(undefined, undefined, false)}
+                      >
+                        {hasPreservedParts ? "전체 초기화" : "다시 생성"}
+                      </button>
+                    </div>
+                  </>
+                );
+              })()
+            ) : modal === "spriteGuide" ? (
               <>
-                <h2>파츠 초안을 다시 만들까요?</h2>
+                <div className="sprite-guide-head-row">
+                  <div>
+                    <span className="eyebrow">SPRITE PREPARATION GUIDE</span>
+                    <h2>권장 일러스트 구도 &amp; LD/SD 실루엣 21파츠 예시</h2>
+                  </div>
+                  <div className="sprite-guide-zoom-controls" role="group" aria-label="시트 배율">
+                    {(["fit", 100, 150, 200] as const).map((level) => (
+                      <button
+                        key={String(level)}
+                        className={`compact-pill${guideZoom === level ? " active" : ""}`}
+                        onClick={() => setGuideZoom(level)}
+                      >
+                        {level === "fit" ? "창 맞춤" : `${level}%`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <p>
-                  현재 마스크와 파츠 보완 이미지가 새 초안으로 바뀝니다. 작업 후
-                  실행 취소로 복원할 수 있습니다.
+                  일반 등신(LD)과 SD 치비(2~3등신)를 자동 구분해 모션 예비 파츠(원형 동공·눈꺼풀·입안·뒷머리)까지 구성합니다. 배율 버튼이나 이미지를 클릭해 크게 확대해 확인하세요.
                 </p>
-                <div className="two-buttons">
-                  <button onClick={() => setModal(null)}>돌아가기</button>
-                  <button className="primary" onClick={() => generate()}>
-                    다시 생성
+                {spriteGuideUrl && (
+                  <div className="sprite-guide-viewport">
+                    <img
+                      className="sprite-guide-modal-img"
+                      style={
+                        guideZoom === "fit"
+                          ? { width: "100%", height: "auto" }
+                          : {
+                              width: `${Math.round(12.4 * guideZoom)}px`,
+                              maxWidth: "none",
+                              height: "auto",
+                              cursor: guideZoom === 200 ? "zoom-out" : "zoom-in",
+                            }
+                      }
+                      src={spriteGuideUrl}
+                      alt="일러스트 구도 및 21개 파츠 스프라이트 분해 예시"
+                      onClick={() =>
+                        setGuideZoom((z) => (z === "fit" ? 150 : z === 150 ? 200 : "fit"))
+                      }
+                      title="클릭하여 창 맞춤 / 150% / 200% 전환"
+                    />
+                  </div>
+                )}
+                <div className="two-buttons" style={{ marginTop: 14 }}>
+                  <button onClick={() => setModal("help")}>
+                    ← 사용 가이드로
                   </button>
+                  <button
+                    onClick={() => {
+                      downloadSpriteGuide();
+                      notify("스프라이트 준비 가이드 PNG를 저장했습니다.");
+                    }}
+                  >
+                    <Download size={14} />
+                    고해상도 가이드 PNG 저장
+                  </button>
+                  <button
+                    className="primary"
+                    onClick={() => {
+                      setModal(null);
+                      void demoFile().then(openImage);
+                    }}
+                  >
+                    샘플 일러스트로 체험
+                  </button>
+                </div>
+              </>
+            ) : modal === "updates" ? (
+              <>
+                <span className="eyebrow">AUTO UPDATE</span>
+                <h2>앱 버전 및 자동 업데이트</h2>
+                <p>
+                  현재 설치된 버전은 <strong>v{appVersion}</strong>입니다. 서명 검증(Minisign)된 공식 업데이트 매니페스트만 자동 설치합니다.
+                </p>
+                <div className="update-box">
+                  <div className="model-row-head">
+                    <div>
+                      <strong>
+                        {updateInfo?.status === "available"
+                          ? `새 버전 v${updateInfo.latestVersion ?? ""} 사용 가능`
+                          : updateInfo?.status === "unsigned-release"
+                            ? `릴리스 v${updateInfo.latestVersion ?? ""} (수동 다운로드 안내)`
+                            : updateInfo?.status === "up-to-date"
+                              ? "최신 버전 사용 중"
+                              : checkingUpdate
+                                ? "업데이트 확인 중…"
+                                : "업데이트 상태"}
+                      </strong>
+                      <small>
+                        {updateInfo?.message ??
+                          "업데이트 확인 버튼을 눌러 최신 배포 버전을 조회하세요."}
+                      </small>
+                    </div>
+                    <span
+                      className={`prov-chip ${
+                        updateInfo?.status === "available"
+                          ? "prov-manual"
+                          : updateInfo?.status === "up-to-date"
+                            ? "prov-model"
+                            : "prov-estimated"
+                      }`}
+                    >
+                      {updateInfo?.status === "available"
+                        ? "설치 가능"
+                        : updateInfo?.status === "up-to-date"
+                          ? "최신"
+                          : updateInfo?.status === "unsigned-release"
+                            ? "서명 미배포"
+                            : "대기"}
+                    </span>
+                  </div>
+                  {updateInfo?.notes && (
+                    <pre className="update-notes">{updateInfo.notes}</pre>
+                  )}
+                  {installingUpdate && updateProgressPct !== null && (
+                    <div className="update-progress">
+                      <div
+                        className="update-progress-bar"
+                        style={{ width: `${updateProgressPct}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+                <label className="style-preset-field" style={{ marginTop: 10 }}>
+                  <span>업데이트 매니페스트 URL (선택 · 비우면 공식 GitHub Releases 사용)</span>
+                  <input
+                    type="url"
+                    placeholder="https://github.com/jinhoOps/flat2rig/releases/latest/download/latest.json"
+                    value={updateCustomUrl}
+                    disabled={checkingUpdate || installingUpdate}
+                    onChange={(e) => setUpdateCustomUrl(e.target.value)}
+                  />
+                </label>
+                <div className="two-buttons" style={{ marginTop: 14 }}>
+                  <button
+                    disabled={checkingUpdate || installingUpdate}
+                    onClick={() => void runUpdateCheck()}
+                  >
+                    <RefreshCw size={14} className={checkingUpdate ? "spin" : ""} />
+                    {checkingUpdate ? "확인 중…" : "지금 다시 확인"}
+                  </button>
+                  {updateDownloaded ? (
+                    <button className="primary" onClick={() => void relaunchApp()}>
+                      앱 재시작하여 업데이트 적용
+                    </button>
+                  ) : updateInfo?.status === "available" ? (
+                    <button
+                      className="primary"
+                      disabled={installingUpdate || !desktop}
+                      onClick={() => void runUpdateInstall()}
+                    >
+                      <Download size={14} />
+                      {installingUpdate
+                        ? `설치 중 (${updateProgressPct ?? 0}%)`
+                        : "지금 다운로드 및 설치"}
+                    </button>
+                  ) : (
+                    <button onClick={() => setModal(null)}>닫기</button>
+                  )}
                 </div>
               </>
             ) : (
               <>
                 <span className="eyebrow">GUIDE</span>
                 <h2>작업 순서</h2>
+                <div className="modal-actions-row">
+                  <button
+                    className="primary"
+                    onClick={() => {
+                      setGuideZoom("fit");
+                      setModal("spriteGuide");
+                    }}
+                  >
+                    <CircleHelp size={15} />
+                    권장 일러스트 · 파츠 예시 시트 확대 보기
+                  </button>
+                  <button
+                    onClick={() => {
+                      downloadSpriteGuide();
+                      notify("스프라이트 준비 가이드 PNG를 저장했습니다.");
+                    }}
+                  >
+                    <Download size={14} />
+                    가이드 PNG 저장
+                  </button>
+                </div>
                 <ol className="help-list">
                   <li>
-                    <strong>이미지 열기</strong>정면 흉상 PNG/JPEG를 준비합니다.
-                    작업 해상도는 긴 변 최대 2,048px입니다.
+                    <strong>이미지 열기 (일반 LD / SD 치비)</strong>정면 흉상 PNG/JPEG를 준비합니다.
+                    작업 해상도는 긴 변 최대 2,048px입니다. 일반 등신과 SD 치비는 자동 판별되며 실루엣 패널에서 수동 전환할 수 있습니다.
                   </li>
                   <li>
                     <strong>얼굴과 랜드마크 맞추기</strong>YOLOv3+HRNetV2가

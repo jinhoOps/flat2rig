@@ -146,9 +146,62 @@ fn neighbors(i: usize, w: usize, h: usize) -> Vec<usize> {
     }
     out
 }
-fn ellipse(p: DVec2, c: DVec2, rx: f64, ry: f64) -> bool {
-    ((p - c) / DVec2::new(rx.max(1.), ry.max(1.))).length_squared() <= 1.
+#[inline]
+fn ellipse_uv(u: f64, v: f64, cu: f64, cv: f64, rx: f64, ry: f64) -> bool {
+    let dx = (u - cu) / rx.max(1.);
+    let dy = (v - cv) / ry.max(1.);
+    dx * dx + dy * dy <= 1.
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeadFrame {
+    pub origin: DVec2,
+    pub ex: DVec2,
+    pub ey: DVec2,
+    pub eye_dist: f64,
+    pub hh: f64,
+    pub chin_v: f64,
+    pub crown_v: f64,
+}
+
+impl HeadFrame {
+    pub(crate) fn from_landmarks(lm: &Landmarks, w: usize, h: usize) -> Self {
+        let eye_l = lm.eye_l.v();
+        let eye_r = lm.eye_r.v();
+        let origin = (eye_l + eye_r) * 0.5;
+        let diff = eye_l - eye_r;
+        let raw_len = diff.length();
+        let eye_dist = raw_len.max(w as f64 * 0.05);
+        // Character left (+ex) aligns with image +X unless landmarks are inverted.
+        let ex = if raw_len > 1e-4 && diff.x >= 0.0 {
+            diff / raw_len
+        } else {
+            DVec2::X
+        };
+        let ey = DVec2::new(-ex.y, ex.x);
+        let crown_v = (lm.crown.v() - origin).dot(ey);
+        let chin_v = (lm.chin.v() - origin).dot(ey);
+        let hh = (chin_v - crown_v)
+            .max(lm.chin.y - lm.crown.y)
+            .max(h as f64 * 0.12);
+        Self {
+            origin,
+            ex,
+            ey,
+            eye_dist,
+            hh,
+            chin_v,
+            crown_v,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn to_local(self, p: DVec2) -> (f64, f64) {
+        let d = p - self.origin;
+        (d.dot(self.ex), d.dot(self.ey))
+    }
+}
+
 pub fn separate(
     data: &[u8],
     w: usize,
@@ -161,50 +214,56 @@ pub fn separate(
         .map(Vec::from)
         .unwrap_or_else(|| foreground(data, w, h, tolerance));
     let mut parts = vec![vec![0; w * h]; IDS.len()];
-    let dist = lm.eye_l.v().distance(lm.eye_r.v()).max(w as f64 * 0.05);
+    let frame = HeadFrame::from_landmarks(lm, w, h);
+    let dist = frame.eye_dist;
     let ew = dist * 0.32;
     let eh = dist * 0.16;
-    let cx = (lm.eye_l.x + lm.eye_r.x) / 2.;
-    let hh = (lm.chin.y - lm.crown.y).max(h as f64 * 0.12);
-    let center = DVec2::new(cx, lm.crown.y + hh * 0.55);
+    let hh = frame.hh;
+    let face_cv = frame.crown_v + hh * 0.55;
+    let (eye_r_u, eye_r_v) = frame.to_local(lm.eye_r.v());
+    let (eye_l_u, eye_l_v) = frame.to_local(lm.eye_l.v());
+    let (mouth_u, mouth_v) = frame.to_local(lm.mouth.v());
     for i in 0..w * h {
         if fg[i] == 0 {
             continue;
         }
         let p = DVec2::new((i % w) as f64, (i / w) as f64);
+        let (u, v) = frame.to_local(p);
         let mut idx = 0;
-        if p.y > lm.chin.y + hh * 0.22 {
+        if v > frame.chin_v + hh * 0.22 {
             idx = 1;
-        } else if p.y > lm.chin.y && (p.x - cx).abs() < dist * 1.02 * 0.42 {
+        } else if v > frame.chin_v && u.abs() < dist * 1.02 * 0.42 {
             idx = 2;
         }
-        if ellipse(p, center, dist * 1.02, hh * 0.49) {
+        if ellipse_uv(u, v, 0.0, face_cv, dist * 1.02, hh * 0.49) {
             idx = 3;
         }
-        if p.y < lm.eye_l.y - hh * 0.22 && ellipse(p, center, dist * 1.02 * 1.1, hh * 0.49 * 1.1) {
+        if v < eye_l_v.min(eye_r_v) - hh * 0.22
+            && ellipse_uv(u, v, 0.0, face_cv, dist * 1.02 * 1.1, hh * 0.49 * 1.1)
+        {
             idx = 17;
         }
-        for (side, eye) in [(0, lm.eye_r.v()), (1, lm.eye_l.v())] {
-            if ellipse(p, eye - DVec2::new(0., eh * 2.1), ew * 1.02, eh * 0.3) {
+        for (side, (eu, ev)) in [(0, (eye_r_u, eye_r_v)), (1, (eye_l_u, eye_l_v))] {
+            if ellipse_uv(u, v, eu, ev - eh * 2.1, ew * 1.02, eh * 0.3) {
                 idx = 12 + side;
             }
-            if ellipse(p, eye, ew, eh) {
+            if ellipse_uv(u, v, eu, ev, ew, eh) {
                 idx = 4 + side * 4;
-                if ellipse(p, eye, ew * 0.46, eh * 0.95) {
+                if ellipse_uv(u, v, eu, ev, ew * 0.46, eh * 0.95) {
                     idx += 1;
                 }
-                if p.y < eye.y - eh * 0.55 {
+                if v < ev - eh * 0.55 {
                     idx = 7 + side * 4;
                 }
-                if p.y > eye.y + eh * 0.65 {
+                if v > ev + eh * 0.65 {
                     idx = 6 + side * 4;
                 }
             }
         }
-        if ellipse(p, lm.mouth.v(), dist * 0.18, dist * 0.065) {
-            idx = if p.y < lm.mouth.y - dist * 0.018 {
+        if ellipse_uv(u, v, mouth_u, mouth_v, dist * 0.18, dist * 0.065) {
+            idx = if v < mouth_v - dist * 0.018 {
                 16
-            } else if p.y > lm.mouth.y + dist * 0.018 {
+            } else if v > mouth_v + dist * 0.018 {
                 15
             } else {
                 14
@@ -244,12 +303,318 @@ pub fn mesh_for(mask: &[u8], w: usize, h: usize, density: usize) -> Mesh {
 }
 
 pub fn mesh_for_part(mask: &[u8], w: usize, h: usize, density: usize, lm: &Landmarks) -> Mesh {
-    mesh_for_with_anchors(
+    art_mesh_for_part(mask, w, h, density, "face", lm)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArtMeshRole {
+    Eyelid,
+    Iris,
+    EyeAperture,
+    LinearBrowOrLip,
+    Hair,
+    Face,
+    StructuralBody,
+    Generic,
+}
+
+fn classify_art_mesh_role(id: &str) -> ArtMeshRole {
+    if id.is_empty() {
+        ArtMeshRole::Generic
+    } else if id.ends_with("_upper") && id.starts_with("eye")
+        || id.ends_with("_lower") && id.starts_with("eye")
+    {
+        ArtMeshRole::Eyelid
+    } else if id.starts_with("eye") && id.ends_with("_iris") {
+        ArtMeshRole::Iris
+    } else if (id.starts_with("eye") && id.ends_with("_white")) || id == "mouth_inner" {
+        ArtMeshRole::EyeAperture
+    } else if id.starts_with("brow") || id == "mouth_upper" || id == "mouth_lower" {
+        ArtMeshRole::LinearBrowOrLip
+    } else if id.starts_with("hair_") || id == "hair" {
+        ArtMeshRole::Hair
+    } else if id == "face" {
+        ArtMeshRole::Face
+    } else {
+        ArtMeshRole::StructuralBody
+    }
+}
+
+/// Traces ordered simple contour loops around `mask > 8` via pixel-crack edge following.
+/// Returns `(points, is_outer)` where points lie slightly (`0.14px`) inside active pixels.
+fn trace_contour_loops(
+    mask: &[u8],
+    w: usize,
+    left: usize,
+    right: usize,
+    top: usize,
+    bottom: usize,
+) -> Vec<(Vec<DVec2>, bool)> {
+    let bw = right - left + 1;
+    let bh = bottom - top + 1;
+    let gw = bw + 1;
+    let mut out_bits = vec![0u8; gw * (bh + 1)];
+    let active = |lx: isize, ly: isize| -> bool {
+        lx >= 0
+            && ly >= 0
+            && (lx as usize) < bw
+            && (ly as usize) < bh
+            && mask[(top + ly as usize) * w + (left + lx as usize)] > 8
+    };
+
+    // Directions: 0 = +x, 1 = -y, 2 = -x, 3 = +y (solid lies to the left of each directed edge).
+    for py in 0..bh as isize {
+        for px in 0..bw as isize {
+            if !active(px, py) {
+                continue;
+            }
+            let ux = px as usize;
+            let uy = py as usize;
+            if !active(px, py + 1) {
+                out_bits[(uy + 1) * gw + ux] |= 1 << 0;
+            }
+            if !active(px + 1, py) {
+                out_bits[(uy + 1) * gw + (ux + 1)] |= 1 << 1;
+            }
+            if !active(px, py - 1) {
+                out_bits[uy * gw + (ux + 1)] |= 1 << 2;
+            }
+            if !active(px - 1, py) {
+                out_bits[uy * gw + ux] |= 1 << 3;
+            }
+        }
+    }
+
+    const DX: [isize; 4] = [1, 0, -1, 0];
+    const DY: [isize; 4] = [0, -1, 0, 1];
+    let mut loops = Vec::new();
+    for start_idx in 0..out_bits.len() {
+        while out_bits[start_idx] != 0 {
+            let start_dir = out_bits[start_idx].trailing_zeros() as usize;
+            let mut cur_x = (start_idx % gw) as isize;
+            let mut cur_y = (start_idx / gw) as isize;
+            let mut dir = start_dir;
+            let mut pts: Vec<DVec2> = Vec::new();
+            let mut area2 = 0.0f64;
+            let max_steps = gw * (bh + 1) * 4;
+            for step in 0..max_steps {
+                let idx = (cur_y as usize) * gw + (cur_x as usize);
+                if (out_bits[idx] & (1 << dir)) == 0 {
+                    break;
+                }
+                out_bits[idx] &= !(1 << dir);
+                let cx = left as f64 + cur_x as f64;
+                let cy = top as f64 + cur_y as f64;
+                let mid = match dir {
+                    0 => DVec2::new(cx + 0.5, cy - 0.14),
+                    1 => DVec2::new(cx - 0.14, cy - 0.5),
+                    2 => DVec2::new(cx - 0.5, cy + 0.14),
+                    _ => DVec2::new(cx + 0.14, cy + 0.5),
+                };
+                if let Some(&prev) = pts.last() {
+                    area2 += prev.x * mid.y - mid.x * prev.y;
+                }
+                pts.push(mid);
+                cur_x += DX[dir];
+                cur_y += DY[dir];
+                let next_idx = (cur_y as usize) * gw + (cur_x as usize);
+                if next_idx == start_idx && step > 0 && (out_bits[next_idx] & (1 << start_dir)) == 0 {
+                    break;
+                }
+                let turn_order = [(dir + 1) & 3, dir, (dir + 3) & 3, (dir + 2) & 3];
+                if let Some(&nd) = turn_order
+                    .iter()
+                    .find(|&&cand| (out_bits[next_idx] & (1 << cand)) != 0)
+                {
+                    dir = nd;
+                } else {
+                    break;
+                }
+            }
+            if pts.len() >= 3 {
+                let first = pts[0];
+                let last = *pts.last().unwrap();
+                area2 += last.x * first.y - first.x * last.y;
+                loops.push((pts, area2 < 0.0));
+            }
+        }
+    }
+    loops
+}
+
+fn smooth_and_resample_loop(
+    raw: &[DVec2],
+    contour_step: f64,
+    valid: &dyn Fn(DVec2) -> bool,
+) -> Vec<(DVec2, DVec2)> {
+    let m = raw.len();
+    if m < 3 {
+        return Vec::new();
+    }
+    let mut cur = raw.to_vec();
+    if m >= 8 {
+        for _ in 0..2 {
+            let mut next = cur.clone();
+            for i in 0..m {
+                let prev = cur[(i + m - 1) % m];
+                let p = cur[i];
+                let nxt = cur[(i + 1) % m];
+                let v1 = p - prev;
+                let v2 = nxt - p;
+                let l1 = v1.length();
+                let l2 = v2.length();
+                if l1 > 1e-6 && l2 > 1e-6 && v1.dot(v2) / (l1 * l2) < 0.35 {
+                    continue;
+                }
+                let cand = prev * 0.25 + p * 0.5 + nxt * 0.25;
+                if valid(cand) {
+                    next[i] = cand;
+                }
+            }
+            cur = next;
+        }
+    }
+
+    let mut perim = 0.0;
+    for i in 0..m {
+        perim += cur[i].distance(cur[(i + 1) % m]);
+    }
+    if perim < 1.0 {
+        return Vec::new();
+    }
+    let step = contour_step.min((perim / 6.0).max(0.8)).max(0.8);
+    let mut sampled = Vec::new();
+    let mut acc = 0.0;
+    sampled.push(cur[0]);
+    let mut prev_dir = (cur[1] - cur[0]).normalize_or_zero();
+    for i in 0..m {
+        let a = cur[i];
+        let b = cur[(i + 1) % m];
+        let seg = b - a;
+        let seg_len = seg.length();
+        if seg_len < 1e-6 {
+            continue;
+        }
+        let dir = seg / seg_len;
+        let last = *sampled.last().unwrap();
+        if prev_dir.dot(dir) < 0.65 && last.distance(a) >= (step * 0.35).max(0.6) && valid(a) {
+            sampled.push(a);
+            acc = 0.0;
+        }
+        acc += seg_len;
+        if acc >= step {
+            let cand = if valid(b) { b } else { a };
+            if sampled.last().unwrap().distance(cand) >= (step * 0.35).max(0.5) && valid(cand) {
+                sampled.push(cand);
+                acc = 0.0;
+            }
+        }
+        prev_dir = dir;
+    }
+    if sampled.len() >= 2 && sampled[0].distance(*sampled.last().unwrap()) < step * 0.4 {
+        sampled.pop();
+    }
+    let k = sampled.len();
+    if k < 3 {
+        return Vec::new();
+    }
+    (0..k)
+        .map(|i| {
+            let prev = sampled[(i + k - 1) % k];
+            let nxt = sampled[(i + 1) % k];
+            let tangent = nxt - prev;
+            let in_normal = DVec2::new(tangent.y, -tangent.x).normalize_or_zero();
+            (sampled[i], in_normal)
+        })
+        .collect()
+}
+
+fn chamfer_boundary_distance(
+    mask: &[u8],
+    w: usize,
+    left: usize,
+    right: usize,
+    top: usize,
+    bottom: usize,
+) -> Vec<u16> {
+    let bw = right - left + 1;
+    let bh = bottom - top + 1;
+    let mut dist = vec![u16::MAX; bw * bh];
+    let mut q = VecDeque::new();
+    for ly in 0..bh {
+        for lx in 0..bw {
+            let idx = (top + ly) * w + (left + lx);
+            if mask[idx] <= 8 {
+                continue;
+            }
+            let x = left + lx;
+            let y = top + ly;
+            let touches_out = lx == 0
+                || ly == 0
+                || lx + 1 == bw
+                || ly + 1 == bh
+                || mask[y * w + (x - 1)] <= 8
+                || mask[y * w + (x + 1)] <= 8
+                || mask[(y - 1) * w + x] <= 8
+                || mask[(y + 1) * w + x] <= 8;
+            if touches_out {
+                let d_idx = ly * bw + lx;
+                dist[d_idx] = 10;
+                q.push_back((lx, ly));
+            }
+        }
+    }
+    const OFF: [(isize, isize, u16); 8] = [
+        (-1, 0, 10),
+        (1, 0, 10),
+        (0, -1, 10),
+        (0, 1, 10),
+        (-1, -1, 14),
+        (1, -1, 14),
+        (-1, 1, 14),
+        (1, 1, 14),
+    ];
+    while let Some((cx, cy)) = q.pop_front() {
+        let cur_d = dist[cy * bw + cx];
+        for (dx, dy, cost) in OFF {
+            let nx = cx as isize + dx;
+            let ny = cy as isize + dy;
+            if nx < 0 || ny < 0 || (nx as usize) >= bw || (ny as usize) >= bh {
+                continue;
+            }
+            let ux = nx as usize;
+            let uy = ny as usize;
+            if mask[(top + uy) * w + (left + ux)] <= 8 {
+                continue;
+            }
+            let nd = cur_d.saturating_add(cost);
+            let n_idx = uy * bw + ux;
+            if nd < dist[n_idx] {
+                dist[n_idx] = nd;
+                q.push_back((ux, uy));
+            }
+        }
+    }
+    dist
+}
+
+/// Builds a contour-, margin- and role-aware Cubism ArtMesh for a Drawable mask.
+pub fn art_mesh_for_part(
+    mask: &[u8],
+    w: usize,
+    h: usize,
+    density: usize,
+    part_id: &str,
+    lm: &Landmarks,
+) -> Mesh {
+    build_art_mesh(
         mask,
         w,
         h,
         density,
-        &[lm.eye_l, lm.eye_r, lm.mouth, lm.chin, lm.crown],
+        classify_art_mesh_role(part_id),
+        Some(lm),
+        &[],
     )
 }
 
@@ -261,6 +626,18 @@ pub fn mesh_for_with_anchors(
     density: usize,
     anchors: &[Point],
 ) -> Mesh {
+    build_art_mesh(mask, w, h, density, ArtMeshRole::Generic, None, anchors)
+}
+
+fn build_art_mesh(
+    mask: &[u8],
+    w: usize,
+    h: usize,
+    density: usize,
+    role: ArtMeshRole,
+    lm: Option<&Landmarks>,
+    anchors: &[Point],
+) -> Mesh {
     let mut mesh = Mesh {
         vertices: Vec::new(),
         triangles: Vec::new(),
@@ -269,9 +646,28 @@ pub fn mesh_for_with_anchors(
     let Some((left, right, top, bottom)) = mask_bounds(mask, w) else {
         return mesh;
     };
-    let span = (right - left + 1).max(bottom - top + 1) as f64;
-    let step = (span / density.clamp(6, 32) as f64).max(3.);
-    let contour_min_dist_sq = (step * 0.45).max(2.0).powi(2);
+    let bw = right - left + 1;
+    let bh = bottom - top + 1;
+    let span = bw.max(bh) as f64;
+    let d_clamped = density.clamp(6, 32) as f64;
+    let (ring_step, contour_step) = match role {
+        ArtMeshRole::Eyelid
+        | ArtMeshRole::Iris
+        | ArtMeshRole::EyeAperture
+        | ArtMeshRole::LinearBrowOrLip => {
+            let r = (span / (d_clamped * 1.15)).clamp(2.2, 14.0);
+            (r, (r * 0.60).clamp(1.8, 8.5))
+        }
+        ArtMeshRole::Hair | ArtMeshRole::Face => {
+            let r = (span / d_clamped).clamp(3.0, 22.0);
+            (r, (r * 0.52).clamp(2.4, 12.0))
+        }
+        ArtMeshRole::StructuralBody | ArtMeshRole::Generic => {
+            let r = (span / d_clamped).clamp(3.0, 28.0);
+            (r, (r * 0.48).clamp(2.8, 13.0))
+        }
+    };
+
     let valid = |p: DVec2| {
         let px = p.x + 1e-6;
         let py = p.y + 1e-6;
@@ -282,62 +678,387 @@ pub fn mesh_for_with_anchors(
             && mask[py as usize * w + px as usize] > 8
     };
 
-    let push_if_far = |verts: &mut Vec<Point>, cand: DVec2, min_sq: f64| {
+    let mut vert_normals: Vec<Option<DVec2>> = Vec::new();
+    let push_if_far = |verts: &mut Vec<Point>,
+                       normals: &mut Vec<Option<DVec2>>,
+                       cand: DVec2,
+                       min_sq: f64,
+                       in_n: Option<DVec2>| {
         if !valid(cand) {
             return;
         }
-        let too_close = verts.iter().any(|v| {
+        for (i, v) in verts.iter().enumerate() {
             let dx = v.x - cand.x;
             let dy = v.y - cand.y;
-            dx * dx + dy * dy < min_sq
-        });
-        if !too_close {
-            verts.push(cand.into());
+            let dist_sq = dx * dx + dy * dy;
+            // Preserve thin opposite-side silhouette walls (>=0.42px apart) while declustering same-side edges.
+            let allowed_sq = match (in_n, normals[i]) {
+                (Some(na), Some(nb)) if na.dot(nb) < 0.0 => min_sq.min(0.42 * 0.42),
+                _ => min_sq,
+            };
+            if dist_sq < allowed_sq {
+                return;
+            }
         }
+        verts.push(cand.into());
+        normals.push(in_n);
     };
 
-    // 1. Sample contour boundary pixels first so silhouette shapes are never clipped.
-    for y in top..=bottom {
-        let row = y * w;
-        for x in left..=right {
-            if mask[row + x] <= 8 {
-                continue;
+    // 1. Ordered closed contour rings (outer perimeter + internal holes) with corner preservation.
+    let raw_loops = trace_contour_loops(mask, w, left, right, top, bottom);
+    let contour_min_sq = (contour_step * 0.46).clamp(1.2, 8.0).powi(2);
+    let inset_min_sq = (ring_step * 0.42).max(1.5).powi(2);
+    let mut inset_candidates: Vec<(DVec2, DVec2)> = Vec::new();
+    for (raw_pts, is_outer) in &raw_loops {
+        let resampled = smooth_and_resample_loop(raw_pts, contour_step, &valid);
+        for &(pt, in_n) in &resampled {
+            push_if_far(
+                &mut mesh.vertices,
+                &mut vert_normals,
+                pt,
+                contour_min_sq,
+                Some(in_n),
+            );
+            if *is_outer && in_n.length_squared() > 0.5 {
+                inset_candidates.push((pt + in_n * (ring_step * 0.55), in_n));
             }
-            let is_boundary = x == 0
-                || y == 0
-                || x + 1 >= w
-                || y + 1 >= h
-                || mask[row + x - 1] <= 8
-                || mask[row + x + 1] <= 8
-                || mask[(y - 1) * w + x] <= 8
-                || mask[(y + 1) * w + x] <= 8;
-            if is_boundary {
+        }
+    }
+
+    // 2. Inset contour belt (ArtMesh smooth edge strip around outer contour).
+    for &(pt, in_n) in &inset_candidates {
+        push_if_far(
+            &mut mesh.vertices,
+            &mut vert_normals,
+            pt,
+            inset_min_sq,
+            Some(in_n),
+        );
+    }
+
+    // 3. Part-role structural deformation guide vertices (replacing uniform rectangular grids).
+    let guide_min_sq = (ring_step * 0.40).max(1.4).powi(2);
+    let dist_map = chamfer_boundary_distance(mask, w, left, right, top, bottom);
+    match role {
+        ArtMeshRole::Eyelid => {
+            let cols = ((bw as f64 / (ring_step * 0.55)).round() as usize).clamp(7, 15);
+            for c in 0..cols {
+                let x = (left as f64 + (c as f64 / (cols - 1) as f64) * (bw.saturating_sub(1)) as f64)
+                    .round() as usize;
+                let mut y0 = None;
+                let mut y1 = 0usize;
+                for y in top..=bottom {
+                    if mask[y * w + x] > 8 {
+                        if y0.is_none() {
+                            y0 = Some(y);
+                        }
+                        y1 = y;
+                    }
+                }
+                if let Some(yt) = y0 {
+                    let span_y = (y1 - yt) as f64;
+                    if span_y >= 2.0 {
+                        for frac in [0.22, 0.50, 0.78] {
+                            push_if_far(
+                                &mut mesh.vertices,
+                                &mut vert_normals,
+                                DVec2::new(x as f64 + 0.5, yt as f64 + 0.5 + span_y * frac),
+                                guide_min_sq * 0.75,
+                                None,
+                            );
+                        }
+                    } else {
+                        push_if_far(
+                            &mut mesh.vertices,
+                            &mut vert_normals,
+                            DVec2::new(x as f64 + 0.5, (yt + y1) as f64 * 0.5 + 0.5),
+                            guide_min_sq * 0.75,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        ArtMeshRole::Iris => {
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+            let mut cnt = 0.0;
+            for y in top..=bottom {
+                for x in left..=right {
+                    if mask[y * w + x] > 8 {
+                        sx += x as f64 + 0.5;
+                        sy += y as f64 + 0.5;
+                        cnt += 1.0;
+                    }
+                }
+            }
+            if cnt > 0.0 {
+                let cx = sx / cnt;
+                let cy = sy / cnt;
+                let rx = (bw as f64 * 0.5).max(1.0);
+                let ry = (bh as f64 * 0.5).max(1.0);
                 push_if_far(
                     &mut mesh.vertices,
-                    DVec2::new(x as f64, y as f64),
-                    contour_min_dist_sq,
+                    &mut vert_normals,
+                    DVec2::new(cx, cy),
+                    guide_min_sq * 0.5,
+                    None,
+                );
+                let sectors = 12usize;
+                for r_frac in [0.36, 0.68] {
+                    for s in 0..sectors {
+                        let ang = (s as f64 / sectors as f64) * std::f64::consts::TAU;
+                        let p = DVec2::new(cx + rx * r_frac * ang.cos(), cy + ry * r_frac * ang.sin());
+                        push_if_far(
+                            &mut mesh.vertices,
+                            &mut vert_normals,
+                            p,
+                            guide_min_sq * 0.65,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        ArtMeshRole::EyeAperture => {
+            let cx = (left + right) as f64 * 0.5 + 0.5;
+            let cy = (top + bottom) as f64 * 0.5 + 0.5;
+            let rx = (bw as f64 * 0.5).max(1.0);
+            let ry = (bh as f64 * 0.5).max(1.0);
+            push_if_far(
+                &mut mesh.vertices,
+                &mut vert_normals,
+                DVec2::new(cx, cy),
+                guide_min_sq * 0.5,
+                None,
+            );
+            for s in 0..10 {
+                let ang = (s as f64 / 10.0) * std::f64::consts::TAU;
+                push_if_far(
+                    &mut mesh.vertices,
+                    &mut vert_normals,
+                    DVec2::new(cx + rx * 0.50 * ang.cos(), cy + ry * 0.50 * ang.sin()),
+                    guide_min_sq * 0.70,
+                    None,
+                );
+            }
+        }
+        ArtMeshRole::LinearBrowOrLip => {
+            let cols = ((bw as f64 / (ring_step * 0.55)).round() as usize).clamp(7, 13);
+            for c in 0..cols {
+                let x = (left as f64 + (c as f64 / (cols - 1) as f64) * (bw.saturating_sub(1)) as f64)
+                    .round() as usize;
+                let mut sum_y = 0.0;
+                let mut y_cnt = 0.0;
+                let mut min_y = bottom;
+                let mut max_y = top;
+                for y in top..=bottom {
+                    if mask[y * w + x] > 8 {
+                        sum_y += y as f64 + 0.5;
+                        y_cnt += 1.0;
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                    }
+                }
+                if y_cnt > 0.0 {
+                    let mid_y = sum_y / y_cnt;
+                    push_if_far(
+                        &mut mesh.vertices,
+                        &mut vert_normals,
+                        DVec2::new(x as f64 + 0.5, mid_y),
+                        guide_min_sq * 0.6,
+                        None,
+                    );
+                    if max_y > min_y + 3 {
+                        for frac in [0.25, 0.75] {
+                            push_if_far(
+                                &mut mesh.vertices,
+                                &mut vert_normals,
+                                DVec2::new(
+                                    x as f64 + 0.5,
+                                    min_y as f64 + 0.5 + (max_y - min_y) as f64 * frac,
+                                ),
+                                guide_min_sq * 0.75,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        ArtMeshRole::Hair => {
+            // Root-to-tip lock flow ribs: sparser at scalp root, denser along flexible lower strands.
+            let mut y = top as f64 + ring_step * 0.5;
+            let root_cutoff = top as f64 + bh as f64 * 0.36;
+            while y <= bottom as f64 {
+                let iy = (y.round() as usize).clamp(top, bottom);
+                let row_step = if y < root_cutoff { ring_step * 1.12 } else { ring_step * 0.68 };
+                let mut x = left;
+                while x <= right {
+                    if mask[iy * w + x] <= 8 {
+                        x += 1;
+                        continue;
+                    }
+                    let seg_start = x;
+                    while x < right && mask[iy * w + x + 1] > 8 {
+                        x += 1;
+                    }
+                    let seg_w = (x - seg_start + 1) as f64;
+                    let fracs: &[f64] = if seg_w >= ring_step * 2.2 {
+                        &[0.20, 0.40, 0.60, 0.80]
+                    } else if seg_w >= ring_step * 1.2 {
+                        &[0.25, 0.50, 0.75]
+                    } else {
+                        &[0.50]
+                    };
+                    for &f in fracs {
+                        push_if_far(
+                            &mut mesh.vertices,
+                            &mut vert_normals,
+                            DVec2::new(seg_start as f64 + 0.5 + (seg_w - 1.0) * f, iy as f64 + 0.5),
+                            (row_step * 0.48).max(1.6).powi(2),
+                            None,
+                        );
+                    }
+                    x += 1;
+                }
+                y += row_step;
+            }
+        }
+        ArtMeshRole::Face => {
+            if let Some(lm) = lm {
+                let mid_x = (lm.eye_l.x + lm.eye_r.x) * 0.5;
+                let eye_d = (lm.eye_l.x - lm.eye_r.x).abs().max(8.0);
+                // Midline symmetry spine (crown -> nose -> mouth -> chin).
+                let steps = ((bh as f64 / (ring_step * 0.65)).round() as usize).clamp(5, 18);
+                for s in 1..steps {
+                    let fy = top as f64 + (s as f64 / steps as f64) * bh as f64;
+                    let t = ((fy - lm.crown.y) / (lm.chin.y - lm.crown.y).max(1.0)).clamp(0.0, 1.0);
+                    let fx = mid_x + (lm.chin.x - mid_x) * t;
+                    push_if_far(
+                        &mut mesh.vertices,
+                        &mut vert_normals,
+                        DVec2::new(fx, fy),
+                        guide_min_sq * 0.75,
+                        None,
+                    );
+                }
+                for pt in [lm.chin, lm.mouth, lm.eye_l, lm.eye_r, lm.crown] {
+                    push_if_far(
+                        &mut mesh.vertices,
+                        &mut vert_normals,
+                        pt.v(),
+                        guide_min_sq * 0.5,
+                        None,
+                    );
+                }
+                for center in [lm.eye_r.v(), lm.eye_l.v(), lm.mouth.v()] {
+                    let r = (eye_d * 0.22).max(ring_step * 0.7);
+                    for s in 0..6 {
+                        let ang = (s as f64 / 6.0) * std::f64::consts::TAU;
+                        push_if_far(
+                            &mut mesh.vertices,
+                            &mut vert_normals,
+                            center + DVec2::new(r * ang.cos(), r * 0.75 * ang.sin()),
+                            guide_min_sq * 0.75,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        ArtMeshRole::StructuralBody => {
+            if let Some(lm) = lm {
+                let mid_x = (lm.eye_l.x + lm.eye_r.x) * 0.5;
+                let steps = ((bh as f64 / (ring_step * 0.75)).round() as usize).clamp(4, 16);
+                for s in 1..steps {
+                    let fy = top as f64 + (s as f64 / steps as f64) * bh as f64;
+                    push_if_far(
+                        &mut mesh.vertices,
+                        &mut vert_normals,
+                        DVec2::new(mid_x, fy),
+                        guide_min_sq * 0.75,
+                        None,
+                    );
+                }
+            }
+        }
+        ArtMeshRole::Generic => {
+            for a in anchors {
+                push_if_far(
+                    &mut mesh.vertices,
+                    &mut vert_normals,
+                    a.v(),
+                    guide_min_sq * 0.5,
+                    None,
                 );
             }
         }
     }
 
-    // 2. Inject interior landmark anchors strictly inside active mask.
-    for a in anchors {
-        push_if_far(&mut mesh.vertices, a.v(), contour_min_dist_sq * 0.5);
-    }
-
-    // 3. Fill interior uniform grid points without duplicating contour vertices.
-    let grid_min_dist_sq = (step * 0.35).max(1.5).powi(2);
-    let mut y = top as f64;
-    while y <= bottom as f64 {
-        let mut x = left as f64;
-        while x <= right as f64 {
-            push_if_far(&mut mesh.vertices, DVec2::new(x, y), grid_min_dist_sq);
-            x += step;
+    // 4. Organic distance-field interior rings (hexagonal contour-following bands, zero rigid XY checkerboard).
+    let max_d = dist_map
+        .iter()
+        .copied()
+        .filter(|&d| d != u16::MAX)
+        .max()
+        .unwrap_or(10) as f64
+        / 10.0;
+    let band_gap = (ring_step * 0.866).max(2.0);
+    let mut band_d = (ring_step * 1.15).max(2.5);
+    let mut band_idx = 0usize;
+    while band_d <= max_d + 0.5 {
+        let lo_d = ((band_d - 0.65).max(0.5) * 10.0) as u16;
+        let hi_d = ((band_d + 0.65) * 10.0) as u16;
+        let stagger = if band_idx % 2 == 1 { 0.5 * ring_step } else { 0.0 };
+        let stride = (ring_step * 0.45).floor().max(1.0) as usize;
+        for ly in (0..bh).step_by(stride) {
+            for lx in (0..bw).step_by(stride) {
+                let d_val = dist_map[ly * bw + lx];
+                if d_val != u16::MAX && d_val >= lo_d && d_val <= hi_d {
+                    let cand = DVec2::new(
+                        (left + lx) as f64 + 0.5 + (stagger % 1.0),
+                        (top + ly) as f64 + 0.5,
+                    );
+                    push_if_far(
+                        &mut mesh.vertices,
+                        &mut vert_normals,
+                        cand,
+                        guide_min_sq,
+                        None,
+                    );
+                }
+            }
         }
-        y += step;
+        band_d += band_gap;
+        band_idx += 1;
     }
 
+    // Guarantee broad interior coverage on large convex regions without dropping into checkerboard patterns.
+    let fill_stride = (ring_step * 0.85).round().max(2.0) as usize;
+    let mut row_i = 0usize;
+    let mut y = top + fill_stride / 2;
+    while y <= bottom {
+        let x_offset = if row_i % 2 == 1 { fill_stride / 2 } else { 0 };
+        let mut x = left + x_offset;
+        while x <= right {
+            if mask[y * w + x] > 8 {
+                let cand = DVec2::new(x as f64 + 0.5, y as f64 + 0.5);
+                push_if_far(
+                    &mut mesh.vertices,
+                    &mut vert_normals,
+                    cand,
+                    guide_min_sq,
+                    None,
+                );
+            }
+            x += fill_stride;
+        }
+        y += fill_stride;
+        row_i += 1;
+    }
+
+    // 5. Delaunay triangulation + strict hole-safe sliver filtering + orphan vertex compaction.
     if mesh.vertices.len() >= 3 {
         let points: Vec<_> = mesh
             .vertices
@@ -345,33 +1066,65 @@ pub fn mesh_for_with_anchors(
             .map(|p| delaunator::Point { x: p.x, y: p.y })
             .collect();
         let result = delaunator::triangulate(&points);
+        let thin_part = mesh.vertices.len() < 40;
+        let max_edge = if thin_part {
+            (span * 0.90).max(18.0)
+        } else {
+            (ring_step * 2.75).max(18.0)
+        };
+        let min_cov = if thin_part { 52 } else { 68 };
         for ids in result.triangles.as_chunks::<3>().0 {
             let a = mesh.vertices[ids[0]].v();
             let b = mesh.vertices[ids[1]].v();
             let c = mesh.vertices[ids[2]].v();
-            let steps = a
-                .distance(b)
-                .max(a.distance(c))
-                .max(b.distance(c))
-                .ceil()
-                .max(2.) as usize;
-            let mut okay = true;
-            'outer: for u in 0..=steps {
+            let max_e = a.distance(b).max(a.distance(c)).max(b.distance(c));
+            if max_e > max_edge {
+                continue;
+            }
+            let min_aspect = if thin_part { 0.025 } else { 0.048 };
+            let cross = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs();
+            if cross < min_aspect * max_e * max_e {
+                continue;
+            }
+            let centroid = (a + b + c) / 3.0;
+            let q1 = a * 0.5 + b * 0.25 + c * 0.25;
+            let q2 = a * 0.25 + b * 0.5 + c * 0.25;
+            let q3 = a * 0.25 + b * 0.25 + c * 0.5;
+            if !valid(centroid) || !valid(q1) || !valid(q2) || !valid(q3) {
+                continue;
+            }
+            let steps: usize = 4;
+            let mut total = 0usize;
+            let mut valid_samples = 0usize;
+            for u in 0..=steps {
                 for v in 0..=steps - u {
+                    total += 1;
                     let p = a
                         + (b - a) * (u as f64 / steps as f64)
                         + (c - a) * (v as f64 / steps as f64);
-                    if !valid(p) {
-                        okay = false;
-                        break 'outer;
+                    if valid(p) {
+                        valid_samples += 1;
                     }
                 }
             }
-            if okay {
+            if valid_samples * 100 >= total * min_cov {
                 mesh.triangles.extend_from_slice(ids);
             }
         }
     }
+
+    // Compact away orphan vertices unused by surviving ArtMesh triangles.
+    let mut remap = vec![usize::MAX; mesh.vertices.len()];
+    let mut compact_verts = Vec::with_capacity(mesh.vertices.len());
+    for tri in &mut mesh.triangles {
+        let old = *tri;
+        if remap[old] == usize::MAX {
+            remap[old] = compact_verts.len();
+            compact_verts.push(mesh.vertices[old]);
+        }
+        *tri = remap[old];
+    }
+    mesh.vertices = compact_verts;
     mesh.uv = mesh
         .vertices
         .iter()
@@ -383,15 +1136,30 @@ pub fn mesh_for_with_anchors(
     mesh
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Pose {
     pub angle_x: f64,
     pub angle_y: f64,
     pub angle_z: f64,
     pub eye_l: f64,
+    pub eye_l_smile: f64,
     pub eye_r: f64,
+    pub eye_r_smile: f64,
+    pub eye_ball_x: f64,
+    pub eye_ball_y: f64,
+    pub brow_l_y: f64,
+    pub brow_l_form: f64,
+    pub brow_r_y: f64,
+    pub brow_r_form: f64,
+    pub mouth_form: f64,
     pub mouth: f64,
+    pub body_angle_x: f64,
+    pub body_angle_y: f64,
+    pub body_angle_z: f64,
+    pub breath: f64,
     pub hair: f64,
+    pub hair_side: f64,
+    pub hair_back: f64,
 }
 impl Default for Pose {
     fn default() -> Self {
@@ -400,9 +1168,24 @@ impl Default for Pose {
             angle_y: 0.,
             angle_z: 0.,
             eye_l: 1.,
+            eye_l_smile: 0.,
             eye_r: 1.,
+            eye_r_smile: 0.,
+            eye_ball_x: 0.,
+            eye_ball_y: 0.,
+            brow_l_y: 0.,
+            brow_l_form: 0.,
+            brow_r_y: 0.,
+            brow_r_form: 0.,
+            mouth_form: 0.,
             mouth: 0.,
+            body_angle_x: 0.,
+            body_angle_y: 0.,
+            body_angle_z: 0.,
+            breath: 0.,
             hair: 0.,
+            hair_side: 0.,
+            hair_back: 0.,
         }
     }
 }
@@ -423,20 +1206,80 @@ fn hair_sway_profile(id: &str) -> (f64, f64) {
     }
 }
 
+fn apply_body_sway(p: DVec2, body_pivot: DVec2, hh: f64, pose: &Pose, scale: f64) -> DVec2 {
+    if pose.body_angle_x == 0.
+        && pose.body_angle_y == 0.
+        && pose.body_angle_z == 0.
+        && pose.breath == 0.
+    {
+        return p;
+    }
+    let lift_weight = ((body_pivot.y - p.y) / (hh * 1.35)).clamp(0.0, 1.35);
+    let shifted = DVec2::new(
+        p.x + pose.body_angle_x * hh * 0.0022 * lift_weight * scale,
+        p.y + (pose.body_angle_y * hh * 0.0014 - pose.breath * hh * 0.015) * lift_weight * scale,
+    );
+    let rot = glam::DMat2::from_angle((pose.body_angle_z * 0.45 * scale).to_radians());
+    body_pivot + rot * (shifted - body_pivot)
+}
+
 pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
-    if id == "body" || id.starts_with("clothes") {
-        return point;
+    let hh = (lm.chin.y - lm.crown.y).max(1.);
+    let dist = lm.eye_l.v().distance(lm.eye_r.v()).max(1.);
+    let cx = (lm.eye_l.x + lm.eye_r.x) / 2.;
+    let body_pivot = DVec2::new(cx, lm.chin.y + hh * 1.15);
+    if id == "body" || id.starts_with("clothes") || id == "hands" || id.starts_with("hands_") {
+        return apply_body_sway(point.v(), body_pivot, hh, pose, 1.0).into();
     }
     let mut p = point.v();
-    let hh = (lm.chin.y - lm.crown.y).max(1.);
-    let cx = (lm.eye_l.x + lm.eye_r.x) / 2.;
     if id.starts_with("eye") {
-        let (eye, open) = if id.starts_with("eyeL") {
-            (lm.eye_l, pose.eye_l)
+        let (eye, open, smile) = if id.starts_with("eyeL") {
+            (lm.eye_l, pose.eye_l, pose.eye_l_smile)
         } else {
-            (lm.eye_r, pose.eye_r)
+            (lm.eye_r, pose.eye_r, pose.eye_r_smile)
         };
-        p.y = eye.y + (p.y - eye.y) * open.max(0.04);
+        if id.ends_with("_iris") {
+            p.x += pose.eye_ball_x * dist * 0.045;
+            p.y -= pose.eye_ball_y * dist * 0.025;
+            p.y = eye.y + (p.y - eye.y) * open.clamp(0.04, 1.3);
+        } else if id.ends_with("_upper") {
+            // Stretch upper lid skin smoothly down from brow-ridge anchor while flattening
+            // the lash arch onto `close_y` so outer lash corners never droop onto the cheek.
+            let close = (1.0 - open).clamp(0.0, 1.0);
+            let widen = (open - 1.0).clamp(0.0, 0.3);
+            let lid_anchor_y = eye.y - dist * 0.34;
+            let close_y = eye.y + dist * 0.04;
+            let span_y = (close_y - lid_anchor_y).max(1.0);
+            let u = ((p.y - lid_anchor_y) / span_y).clamp(0.0, 1.0);
+            if close > 0.0 && u > 0.0 && u < 1.0 {
+                let target_u = 1.0 - (1.0 - u).powf(3.6);
+                let closed_y = lid_anchor_y + span_y * target_u;
+                p.y += (closed_y - p.y) * close;
+            } else if widen > 0.0 && u > 0.0 {
+                p.y -= span_y * 0.18 * u * widen;
+            }
+        } else {
+            p.y = eye.y + (p.y - eye.y) * open.max(0.04);
+            if id.ends_with("_lower") {
+                p.y -= smile * dist * 0.032;
+            }
+        }
+    }
+    if id.starts_with("brow") {
+        let (brow_y, brow_form) = if id.starts_with("browL") {
+            (pose.brow_l_y, pose.brow_l_form)
+        } else {
+            (pose.brow_r_y, pose.brow_r_form)
+        };
+        p.y -= brow_y * hh * 0.045;
+        let inner_factor = 1.0 - ((p.x - cx).abs() / (dist * 0.65)).clamp(0.0, 1.0);
+        p.y -= brow_form * hh * 0.028 * inner_factor;
+    }
+    if id.starts_with("mouth") {
+        let mdx = p.x - lm.mouth.x;
+        let corner_w = (mdx.abs() / (dist * 0.18).max(1.)).clamp(0., 1.2);
+        p.x += mdx * pose.mouth_form * 0.14;
+        p.y -= pose.mouth_form * hh * 0.016 * corner_w * corner_w;
     }
     if id == "mouth_upper" {
         p.y -= pose.mouth * hh * 0.012;
@@ -456,12 +1299,34 @@ pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
     p.y += pose.angle_y * hh * 0.0018 * weight;
     if id.starts_with("hair") {
         let (amp, root_offset) = hair_sway_profile(id);
+        let role_param = if id.starts_with("hair_side") {
+            pose.hair_side
+        } else if id.starts_with("hair_back") {
+            pose.hair_back
+        } else {
+            0.0
+        };
+        let sway_param = (pose.hair + role_param).clamp(-1.5, 1.5);
         let root_y = lm.crown.y + hh * root_offset;
-        p.x += pose.hair * hh * 0.04 * amp * ((p.y - root_y) / hh).clamp(0., 1.8);
+        p.x += sway_param * hh * 0.04 * amp * ((p.y - root_y) / hh).clamp(0., 1.8);
+    } else if id.starts_with("hat") {
+        // Crown stays locked to the skull; lower hood flaps breathe subtly with hair sway.
+        let sway_param = pose.hair.clamp(-1.5, 1.5);
+        let root_y = lm.crown.y + hh * 0.45;
+        p.x += sway_param * hh * 0.04 * 0.18 * ((p.y - root_y) / hh).clamp(0., 1.8);
+    } else if id == "acc_hairpin" || id == "acc_ribbon" || id.starts_with("acc_ribbon") {
+        let sway_param = pose.hair.clamp(-1.5, 1.5);
+        p.x += sway_param * hh * 0.04 * 0.45 * ((p.y - lm.crown.y) / hh).clamp(0., 1.8);
     }
     let pivot = DVec2::new(cx, lm.chin.y);
     let rot = glam::DMat2::from_angle(pose.angle_z.to_radians() * weight);
-    (pivot + rot * (p - pivot)).into()
+    let head_posed = pivot + rot * (p - pivot);
+    let body_follow = if id == "neck" {
+        0.45 + 0.55 * weight
+    } else {
+        1.0
+    };
+    apply_body_sway(head_posed, body_pivot, hh, pose, body_follow).into()
 }
 /// Combines a part's strict visible mask with any separated occlusion fill mask.
 pub fn effective_part_mask(visible_mask: &[u8], fill_mask: Option<&[u8]>) -> Vec<u8> {
@@ -717,16 +1582,28 @@ pub fn check_mesh_quality(
     let extreme_poses = [
         Pose { angle_x: -30., angle_y: -30., angle_z: -30., ..Pose::default() },
         Pose { angle_x: 30., angle_y: 30., angle_z: 30., ..Pose::default() },
-        Pose { angle_x: -30., angle_y: 30., angle_z: 15., ..Pose::default() },
-        Pose { angle_x: 30., angle_y: -30., angle_z: -15., ..Pose::default() },
-        Pose { eye_l: 0., eye_r: 0., ..Pose::default() },
-        Pose { eye_l: 1.2, eye_r: 1.2, ..Pose::default() },
-        Pose { mouth: 0., ..Pose::default() },
-        Pose { mouth: 1., ..Pose::default() },
-        Pose { hair: -1., ..Pose::default() },
-        Pose { hair: 1., ..Pose::default() },
-        Pose { angle_x: 30., angle_y: -30., angle_z: 30., eye_l: 0., eye_r: 0., mouth: 1., hair: -1. },
-        Pose { angle_x: -30., angle_y: 30., angle_z: -30., eye_l: 0., eye_r: 0., mouth: 1., hair: 1. },
+        Pose { angle_x: -30., angle_y: 30., angle_z: 15., body_angle_x: -10., body_angle_z: -10., ..Pose::default() },
+        Pose { angle_x: 30., angle_y: -30., angle_z: -15., body_angle_x: 10., body_angle_z: 10., ..Pose::default() },
+        Pose { eye_l: 0., eye_r: 0., eye_l_smile: 1., eye_r_smile: 1., eye_ball_x: -1., eye_ball_y: 1., ..Pose::default() },
+        Pose { eye_l: 1.2, eye_r: 1.2, eye_ball_x: 1., eye_ball_y: -1., ..Pose::default() },
+        Pose { mouth: 0., mouth_form: -1., brow_l_y: -1., brow_l_form: -1., brow_r_y: -1., brow_r_form: -1., ..Pose::default() },
+        Pose { mouth: 1., mouth_form: 1., brow_l_y: 1., brow_l_form: 1., brow_r_y: 1., brow_r_form: 1., ..Pose::default() },
+        Pose { hair: -1., hair_side: -1., hair_back: -1., ..Pose::default() },
+        Pose { hair: 1., hair_side: 1., hair_back: 1., breath: 1., ..Pose::default() },
+        Pose {
+            angle_x: 30., angle_y: -30., angle_z: 30.,
+            eye_l: 0., eye_r: 0., mouth: 1., mouth_form: 1.,
+            body_angle_x: 10., body_angle_y: -10., body_angle_z: 10., breath: 1.,
+            hair: -1., hair_side: -1., hair_back: -1.,
+            ..Pose::default()
+        },
+        Pose {
+            angle_x: -30., angle_y: 30., angle_z: -30.,
+            eye_l: 0., eye_r: 0., mouth: 1., mouth_form: -1.,
+            body_angle_x: -10., body_angle_y: 10., body_angle_z: -10., breath: 0.,
+            hair: 1., hair_side: 1., hair_back: 1.,
+            ..Pose::default()
+        },
     ];
 
     let mut flipped_mask = vec![false; triangle_count];
@@ -921,5 +1798,147 @@ mod tests {
         let back = deform(pt, "hair_back", &l, &pose);
         assert!(front2.x > front.x);
         assert!(side.x > back.x);
+    }
+    #[test]
+    fn large_curved_torso_mesh_is_dense_and_hole_free() {
+        // Large C-shaped off-shoulder silhouette (720x520) matching wide sleeve/collar geometry.
+        let w = 720usize;
+        let h = 520usize;
+        let mut mask = vec![0u8; w * h];
+        for y in 40..500 {
+            for x in 40..680 {
+                // Carve U-shaped neck cutout in upper-center
+                let in_neck_bay = y < 220 && (x as f64 - 360.0).abs() < 85.0;
+                // Curved shoulder outer contour
+                let dx = (x as f64 - 360.0) / 315.0;
+                let top_curve = 65.0 + 110.0 * dx * dx;
+                if !in_neck_bay && (y as f64) >= top_curve {
+                    mask[y * w + x] = 255;
+                }
+            }
+        }
+        let mesh = mesh_for(&mask, w, h, 14);
+        let l = Landmarks {
+            eye_l: Point { x: 400., y: 120. },
+            eye_r: Point { x: 320., y: 120. },
+            mouth: Point { x: 360., y: 165. },
+            chin: Point { x: 360., y: 195. },
+            crown: Point { x: 360., y: 40. },
+        };
+        let report = check_mesh_quality(&mesh, &mask, w, h, "clothes", &l);
+        assert!(report.triangle_count >= 120, "expected >=120 tris, got {}", report.triangle_count);
+        assert_eq!(report.hole_crossings, 0);
+        assert_eq!(report.flipped_at_extremes, 0);
+    }
+    #[test]
+    fn new_body_eye_brow_mouth_hair_params_deform_correctly() {
+        let l = lm();
+        let eye_pt = Point { x: 38., y: 24. };
+        let gazed = deform(eye_pt, "eyeL_iris", &l, &Pose { eye_ball_x: 1., eye_ball_y: 1., ..Pose::default() });
+        assert!(gazed.x > eye_pt.x && gazed.y < eye_pt.y);
+
+        let brow_pt = Point { x: 38., y: 18. };
+        let brow_up = deform(brow_pt, "browL", &l, &Pose { brow_l_y: 1., ..Pose::default() });
+        assert!(brow_up.y < brow_pt.y);
+
+        let shoulder = Point { x: 48., y: 52. };
+        assert_eq!(deform(shoulder, "clothes", &l, &Pose::default()).x, shoulder.x);
+        let breathed = deform(shoulder, "clothes", &l, &Pose { breath: 1., ..Pose::default() });
+        assert!(breathed.y < shoulder.y);
+
+        let hair_side = Point { x: 30., y: 30. };
+        let moved_side = deform(hair_side, "hair_side_L", &l, &Pose { hair_side: 1., ..Pose::default() });
+        let unmoved_front = deform(hair_side, "hair_front", &l, &Pose { hair_side: 1., ..Pose::default() });
+        assert!(moved_side.x > hair_side.x);
+        assert!((unmoved_front.x - hair_side.x).abs() < 1e-9);
+
+        // Glasses stay anchored to head rotation without eye blink collapse; hairpins sway softly with hair.
+        let glasses_pt = Point { x: 38., y: 24. };
+        let glasses_blink = deform(glasses_pt, "acc_glasses", &l, &Pose { eye_l: 0., hair: 1., ..Pose::default() });
+        assert!((glasses_blink.y - glasses_pt.y).abs() < 1e-9);
+        assert!((glasses_blink.x - glasses_pt.x).abs() < 1e-9);
+        let pin_pt = Point { x: 40., y: 26. };
+        let pin_sway = deform(pin_pt, "acc_hairpin", &l, &Pose { hair: 1., ..Pose::default() });
+        assert!(pin_sway.x > pin_pt.x);
+        let collar_breathed = deform(shoulder, "clothes_collar", &l, &Pose { breath: 1., ..Pose::default() });
+        assert!((collar_breathed.y - breathed.y).abs() < 1e-9);
+    }
+    #[test]
+    fn closed_eyelid_keeps_smooth_brow_to_lid_curve_without_cheek_droop() {
+        let l = lm();
+        let closed = Pose {
+            eye_l: 0.,
+            ..Pose::default()
+        };
+        let top_corner = Point { x: 43., y: 20. };
+        let mid_lid = Point { x: 38., y: 22.5 };
+        let low_corner = Point { x: 43., y: 25. };
+        let d_top = deform(top_corner, "eyeL_upper", &l, &closed);
+        let d_mid = deform(mid_lid, "eyeL_upper", &l, &closed);
+        let d_low = deform(low_corner, "eyeL_upper", &l, &closed);
+        let close_y = l.eye_l.y + 16.0 * 0.04;
+        assert!(d_top.y >= top_corner.y && d_top.y <= close_y + 1e-6);
+        assert!(d_mid.y >= mid_lid.y && d_mid.y <= close_y + 1e-6);
+        assert!((d_low.y - low_corner.y).abs() < 1e-6, "below close_y outer corner must not droop onto cheek: {d_low:?}");
+        assert!(d_mid.y >= d_top.y);
+    }
+    #[test]
+    fn art_mesh_builds_role_aware_radial_iris_arch_eyelid_and_thin_ribbon_without_orphans() {
+        let l = lm();
+        let w = 64usize;
+        let h = 64usize;
+        // 1. Circular iris -> expects center pupil vertex & zero orphan vertices.
+        let mut iris_mask = vec![0u8; w * h];
+        for y in 16..33 {
+            for x in 30..47 {
+                let dx = x as f64 - 38.0;
+                let dy = y as f64 - 24.0;
+                if dx * dx + dy * dy <= 49.0 {
+                    iris_mask[y * w + x] = 255;
+                }
+            }
+        }
+        let iris_mesh = art_mesh_for_part(&iris_mask, w, h, 14, "eyeL_iris", &l);
+        assert!(!iris_mesh.triangles.is_empty());
+        assert_eq!(iris_mesh.uv.len(), iris_mesh.vertices.len());
+        let mut used = vec![false; iris_mesh.vertices.len()];
+        for &idx in &iris_mesh.triangles {
+            used[idx] = true;
+        }
+        assert!(used.into_iter().all(|b| b), "iris ArtMesh must contain zero orphan vertices");
+        assert!(
+            iris_mesh.vertices.iter().any(|v| (v.x - 38.5).abs() < 1.2 && (v.y - 24.5).abs() < 1.2),
+            "iris ArtMesh should place pupil center vertex"
+        );
+
+        // 2. Thin curved hairline accessory / brow -> must never drop to 0 triangles.
+        let mut thin_pin = vec![0u8; w * h];
+        for x in 18..42 {
+            let y = 14 + ((x as isize - 30).abs() / 6) as usize;
+            thin_pin[y * w + x] = 255;
+            thin_pin[(y + 1) * w + x] = 255;
+        }
+        let pin_mesh = art_mesh_for_part(&thin_pin, w, h, 14, "acc_hairpin", &l);
+        let pin_report = check_mesh_quality(&pin_mesh, &thin_pin, w, h, "acc_hairpin", &l);
+        assert!(pin_report.triangle_count >= 6, "thin hairpin collapsed to {} tris", pin_report.triangle_count);
+        assert_eq!(pin_report.hole_crossings, 0);
+        assert_eq!(pin_report.flipped_at_extremes, 0);
+
+        // 3. Curved eyelid -> smooth contour + arch strips with 0 extreme-pose flips.
+        let mut lid_mask = vec![0u8; w * h];
+        for x in 28..49 {
+            let dx = (x as f64 - 38.0) / 10.0;
+            let yc = 20.0 + 3.0 * dx * dx;
+            for y in 0..h {
+                if (y as f64 - yc).abs() <= 2.2 {
+                    lid_mask[y * w + x] = 255;
+                }
+            }
+        }
+        let lid_mesh = art_mesh_for_part(&lid_mask, w, h, 14, "eyeL_upper", &l);
+        let lid_report = check_mesh_quality(&lid_mesh, &lid_mask, w, h, "eyeL_upper", &l);
+        assert!(lid_report.triangle_count >= 12);
+        assert_eq!(lid_report.hole_crossings, 0);
+        assert_eq!(lid_report.flipped_at_extremes, 0);
     }
 }
