@@ -29,6 +29,7 @@ import {
   effectiveMask,
   expandFillSeparated,
   meshForPart,
+  recommendedFillRadius,
   type MeshQualityReport,
 } from "./engine";
 import { REST, PARAM_DEFS } from "./types";
@@ -400,9 +401,16 @@ function fillBrowserFallbackParts(
     }
   }
   const fillConfigs: Record<string, { radius: number; support?: Uint8Array }> = {
-    face: { radius: Math.max(18, Math.round(eyeDist * 0.45)), support: faceSupport },
-    eyeL_white: { radius: Math.max(8, Math.round(eyeDist * 0.22)) },
-    eyeR_white: { radius: Math.max(8, Math.round(eyeDist * 0.22)) },
+    face: {
+      radius: recommendedFillRadius({ id: "face", role: "face" }, landmarks, width, height),
+      support: faceSupport,
+    },
+    eyeL_white: {
+      radius: recommendedFillRadius({ id: "eyeL_white", role: "eye" }, landmarks, width, height),
+    },
+    eyeR_white: {
+      radius: recommendedFillRadius({ id: "eyeR_white", role: "eye" }, landmarks, width, height),
+    },
     mouth_inner: { radius: Math.max(4, Math.round(eyeDist * 0.08)) },
   };
   return parts.map((part) => {

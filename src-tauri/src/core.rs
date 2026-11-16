@@ -1229,6 +1229,91 @@ fn apply_body_sway(p: DVec2, body_pivot: DVec2, hh: f64, pose: &Pose, scale: f64
     body_pivot + rot * (shifted - body_pivot)
 }
 
+/// Resolution- and motion-proportional underlap margins (`fillMask`) derived from `HeadFrame`
+/// and `deform_with_shapes` worst-case relative displacements across opposing head/body/hair poses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartOverlapMargins {
+    pub neck_collar_x: usize,
+    pub neck_collar_y: usize,
+    pub neck_chin_y: usize,
+    pub face_scalp_margin: usize,
+    pub eye_gaze_x: usize,
+    pub eye_gaze_y: usize,
+    pub hair_side_front_seam: usize,
+    pub hair_hat_root: usize,
+    pub hair_back_underlap: usize,
+    pub clothes_hair_underlap: usize,
+}
+
+/// Computes per-seam hidden-area (`fillMask`) underlap budgets proportional to `HeadFrame.hh`,
+/// `HeadFrame.eye_dist`, and `deform_with_shapes` / `hair_sway_profile` / `apply_body_sway` maxima.
+pub fn part_overlap_margins(lm: &Landmarks, w: usize, h: usize) -> PartOverlapMargins {
+    let hf = HeadFrame::from_landmarks(lm, w, h);
+    let hh = hf.hh.max(12.0);
+    let eye_dist = hf.eye_dist.max(8.0);
+    let head_dx_max = 30.0 * hh * 0.0025;
+    let head_dy_max = 30.0 * hh * 0.0018;
+    let body_dx_max = (10.0 * 0.0022 * 1.15 + (10.0 * 0.45_f64).to_radians()) * hh;
+    let body_dy_max = (10.0 * 0.0014 + 0.015) * 1.15 * hh;
+    let head_tilt_sin = (30.0_f64).to_radians().sin();
+    let neck_rot_sin = (30.0 * 0.78 * 0.5_f64).to_radians().sin();
+
+    let neck_collar_x = ((0.55 * head_dx_max + 0.35 * hh * neck_rot_sin + 0.55 * body_dx_max + 4.0)
+        .max(eye_dist * 0.22))
+    .ceil() as usize;
+    let neck_collar_y = ((head_dy_max + 0.55 * body_dy_max + eye_dist * 0.27 * head_tilt_sin + 4.0)
+        .max(eye_dist * 0.18))
+    .ceil() as usize;
+    let neck_chin_y = ((head_dy_max + eye_dist * 0.28 * head_tilt_sin + hh * 0.04 + 4.0)
+        .max(eye_dist * 0.18))
+    .ceil() as usize;
+    let face_scalp_margin = ((0.08 * hh + 4.0).max(eye_dist * 0.14)).ceil() as usize;
+    let eye_gaze_x = ((eye_dist * 0.065) + 3.0).ceil() as usize;
+    let eye_gaze_y = ((eye_dist * 0.055) + 3.0).ceil() as usize;
+    let hair_side_front_seam = ((0.082 * hh + 4.0).max(eye_dist * 0.15)).ceil() as usize;
+    let hair_hat_root = ((0.068 * hh + 4.0).max(eye_dist * 0.13)).ceil() as usize;
+    let hair_back_underlap = ((head_dx_max + hh * 0.04 * 0.85 * 1.5 * 1.8 + hh * 0.06 + 4.0)
+        .max(eye_dist * 0.30))
+    .ceil() as usize;
+    let clothes_hair_underlap = ((1.5 * hh * 0.04 * 1.22 * 1.8 + 4.0).max(eye_dist * 0.22))
+        .ceil() as usize;
+
+    PartOverlapMargins {
+        neck_collar_x,
+        neck_collar_y,
+        neck_chin_y,
+        face_scalp_margin,
+        eye_gaze_x,
+        eye_gaze_y,
+        hair_side_front_seam,
+        hair_hat_root,
+        hair_back_underlap,
+        clothes_hair_underlap,
+    }
+}
+
+/// Returns the motion-proportional manual/fallback occlusion fill radius for a given part ID.
+pub fn recommended_fill_radius(part_id: &str, lm: &Landmarks, w: usize, h: usize) -> usize {
+    let m = part_overlap_margins(lm, w, h);
+    let hf = HeadFrame::from_landmarks(lm, w, h);
+    if part_id.starts_with("hair_back") {
+        m.hair_back_underlap
+    } else if part_id.starts_with("hair") {
+        m.hair_side_front_seam.max(m.hair_hat_root)
+    } else if part_id == "neck" {
+        m.neck_collar_x.max(m.neck_collar_y).max(m.neck_chin_y)
+    } else if part_id == "face" {
+        m.face_scalp_margin
+    } else if part_id == "body" || part_id.starts_with("clothes") || part_id.starts_with("hands") {
+        m.clothes_hair_underlap
+    } else if part_id.starts_with("eye") && (part_id.ends_with("_white") || part_id.ends_with("_iris")) {
+        m.eye_gaze_x.max(m.eye_gaze_y)
+    } else {
+        ((hf.eye_dist.max(8.0) * 0.08).ceil() as usize).max(6)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegionDeformParams {
@@ -1564,7 +1649,7 @@ pub fn fill_occlusion(
             frontier.push(i);
         }
     }
-    for _ in 0..radius.min(128) {
+    for _ in 0..radius.min(256) {
         let mut next = Vec::new();
         for i in frontier {
             for j in neighbors(i, w, h) {
@@ -1943,6 +2028,64 @@ mod tests {
         let back = deform(pt, "hair_back", &l, &pose);
         assert!(front2.x > front.x);
         assert!(side.x > back.x);
+    }
+    #[test]
+    fn part_overlap_margins_scale_with_resolution_and_cover_opposing_motion() {
+        let scale_lm = |s: f64| Landmarks {
+            eye_l: Point { x: 38.0 * s, y: 24.0 * s },
+            eye_r: Point { x: 22.0 * s, y: 24.0 * s },
+            mouth: Point { x: 30.0 * s, y: 33.0 * s },
+            chin: Point { x: 30.0 * s, y: 40.0 * s },
+            crown: Point { x: 30.0 * s, y: 4.0 * s },
+        };
+        let m_1024 = part_overlap_margins(&scale_lm(16.0), 1024, 1024);
+        let m_2048 = part_overlap_margins(&scale_lm(32.0), 2048, 2048);
+        assert!(m_1024.neck_collar_x > 14 && m_1024.hair_side_front_seam > 14);
+        assert!(m_2048.neck_collar_x > m_1024.neck_collar_x);
+        assert!(m_2048.hair_back_underlap > m_1024.hair_back_underlap);
+
+        let lm_1024 = scale_lm(16.0);
+        // Verify opposing head-body displacement at mid-collar stays within neck_collar_x/y.
+        let collar_pt = Point { x: lm_1024.chin.x, y: lm_1024.chin.y + 120.0 };
+        let opposing = Pose {
+            angle_x: -30.0,
+            angle_y: -30.0,
+            angle_z: -20.0,
+            body_angle_x: 10.0,
+            body_angle_y: 10.0,
+            body_angle_z: 10.0,
+            breath: 1.0,
+            ..Pose::default()
+        };
+        let neck_p = deform(collar_pt, "neck", &lm_1024, &opposing);
+        let clothes_p = deform(collar_pt, "clothes", &lm_1024, &opposing);
+        assert!(
+            (neck_p.x - clothes_p.x).abs() <= m_1024.neck_collar_x as f64,
+            "neck_p.x={} clothes_p.x={} margin={}",
+            neck_p.x,
+            clothes_p.x,
+            m_1024.neck_collar_x
+        );
+        assert!(
+            (neck_p.y - clothes_p.y).abs() <= m_1024.neck_collar_y as f64,
+            "neck_p.y={} clothes_p.y={} margin={}",
+            neck_p.y,
+            clothes_p.y,
+            m_1024.neck_collar_y
+        );
+
+        // Verify opposing hair_side vs hair_front sway at temple/cheek stays within hair_side_front_seam.
+        let cheek_hair_pt = Point { x: lm_1024.eye_r.x - 100.0, y: lm_1024.chin.y };
+        let sway_pose = Pose { hair: 1.0, hair_side: -1.0, ..Pose::default() };
+        let front_p = deform(cheek_hair_pt, "hair_front", &lm_1024, &sway_pose);
+        let side_p = deform(cheek_hair_pt, "hair_side_R", &lm_1024, &sway_pose);
+        assert!(
+            (front_p.x - side_p.x).abs() <= m_1024.hair_side_front_seam as f64,
+            "front_p.x={} side_p.x={} seam={}",
+            front_p.x,
+            side_p.x,
+            m_1024.hair_side_front_seam
+        );
     }
     #[test]
     fn large_curved_torso_mesh_is_dense_and_hole_free() {

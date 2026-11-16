@@ -14,6 +14,8 @@ import {
   meshFor,
   meshForPart,
   paint,
+  partOverlapMargins,
+  recommendedFillRadius,
   separate,
 } from "../src/engine";
 import {
@@ -1751,5 +1753,49 @@ describe("preserved part merging on regeneration", () => {
       .getContext("2d")
       .getImageData(0, 0, p.width, p.height).data;
     expect(soloData[(22 * p.width + 10) * 4 + 3]).toBeGreaterThan(200);
+  });
+
+  it("scales partOverlapMargins and recommendedFillRadius proportionally across resolutions and covers opposing motion", () => {
+    const scaleLm = (s: number): Landmarks => ({
+      eyeL: { x: 38 * s, y: 24 * s },
+      eyeR: { x: 22 * s, y: 24 * s },
+      mouth: { x: 30 * s, y: 33 * s },
+      chin: { x: 30 * s, y: 40 * s },
+      crown: { x: 30 * s, y: 4 * s },
+    });
+    const m512 = partOverlapMargins(scaleLm(8), 512, 512);
+    const m1024 = partOverlapMargins(scaleLm(16), 1024, 1024);
+    const m2048 = partOverlapMargins(scaleLm(32), 2048, 2048);
+
+    expect(m1024.neckCollarX).toBeGreaterThan(m512.neckCollarX);
+    expect(m2048.neckCollarX).toBeGreaterThan(m1024.neckCollarX);
+    expect(m1024.hairSideFrontSeam).toBeGreaterThan(14);
+    expect(m2048.hairBackUnderlap).toBeGreaterThan(m1024.hairBackUnderlap);
+
+    expect(recommendedFillRadius({ id: "neck" }, scaleLm(16), 1024, 1024)).toBeGreaterThan(14);
+    expect(recommendedFillRadius({ id: "hair_back_2" }, scaleLm(32), 2048, 2048)).toBeGreaterThan(128);
+
+    const lm1024 = scaleLm(16);
+    const collarPt = { x: lm1024.chin.x, y: lm1024.chin.y + 120 };
+    const opposing = {
+      ...REST,
+      ParamAngleX: -30,
+      ParamAngleY: -30,
+      ParamAngleZ: -20,
+      ParamBodyAngleX: 10,
+      ParamBodyAngleY: 10,
+      ParamBodyAngleZ: 10,
+      ParamBreath: 1,
+    };
+    const neckP = deform(collarPt, { id: "neck" }, lm1024, opposing);
+    const clothesP = deform(collarPt, { id: "clothes" }, lm1024, opposing);
+    expect(Math.abs(neckP.x - clothesP.x)).toBeLessThanOrEqual(m1024.neckCollarX);
+    expect(Math.abs(neckP.y - clothesP.y)).toBeLessThanOrEqual(m1024.neckCollarY);
+
+    const cheekHairPt = { x: lm1024.eyeR.x - 100, y: lm1024.chin.y };
+    const swayPose = { ...REST, ParamHairFront: 1, ParamHairSide: -1 };
+    const frontP = deform(cheekHairPt, { id: "hair_front" }, lm1024, swayPose);
+    const sideP = deform(cheekHairPt, { id: "hair_side_R" }, lm1024, swayPose);
+    expect(Math.abs(frontP.x - sideP.x)).toBeLessThanOrEqual(m1024.hairSideFrontSeam);
   });
 });

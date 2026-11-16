@@ -1350,6 +1350,115 @@ function applyBodySway(
   };
 }
 
+export interface PartOverlapMargins {
+  neckCollarX: number;
+  neckCollarY: number;
+  neckChinY: number;
+  faceScalpMargin: number;
+  eyeGazeX: number;
+  eyeGazeY: number;
+  hairSideFrontSeam: number;
+  hairHatRoot: number;
+  hairBackUnderlap: number;
+  clothesHairUnderlap: number;
+}
+
+/**
+ * Computes resolution- and motion-proportional underlap budgets matching Rust
+ * `core::part_overlap_margins` from `HeadFrame` and `deform` maxima.
+ */
+export function partOverlapMargins(
+  lm: Landmarks,
+  w: number,
+  h: number,
+): PartOverlapMargins {
+  const hf = buildHeadFrame(lm, w, h);
+  const hh = Math.max(12, hf.hh);
+  const eyeDist = Math.max(8, hf.eyeDist);
+  const headDxMax = 30 * hh * 0.0025;
+  const headDyMax = 30 * hh * 0.0018;
+  const bodyDxMax = (10 * 0.0022 * 1.15 + (10 * 0.45 * Math.PI) / 180) * hh;
+  const bodyDyMax = (10 * 0.0014 + 0.015) * 1.15 * hh;
+  const headTiltSin = Math.sin((30 * Math.PI) / 180);
+  const neckRotSin = Math.sin((30 * 0.78 * 0.5 * Math.PI) / 180);
+
+  return {
+    neckCollarX: Math.ceil(
+      Math.max(
+        eyeDist * 0.22,
+        0.55 * headDxMax + 0.35 * hh * neckRotSin + 0.55 * bodyDxMax + 4,
+      ),
+    ),
+    neckCollarY: Math.ceil(
+      Math.max(
+        eyeDist * 0.18,
+        headDyMax + 0.55 * bodyDyMax + eyeDist * 0.27 * headTiltSin + 4,
+      ),
+    ),
+    neckChinY: Math.ceil(
+      Math.max(
+        eyeDist * 0.18,
+        headDyMax + eyeDist * 0.28 * headTiltSin + hh * 0.04 + 4,
+      ),
+    ),
+    faceScalpMargin: Math.ceil(Math.max(eyeDist * 0.14, 0.08 * hh + 4)),
+    eyeGazeX: Math.ceil(eyeDist * 0.065 + 3),
+    eyeGazeY: Math.ceil(eyeDist * 0.055 + 3),
+    hairSideFrontSeam: Math.ceil(Math.max(eyeDist * 0.15, 0.082 * hh + 4)),
+    hairHatRoot: Math.ceil(Math.max(eyeDist * 0.13, 0.068 * hh + 4)),
+    hairBackUnderlap: Math.ceil(
+      Math.max(
+        eyeDist * 0.3,
+        headDxMax + hh * 0.04 * 0.85 * 1.5 * 1.8 + hh * 0.06 + 4,
+      ),
+    ),
+    clothesHairUnderlap: Math.ceil(
+      Math.max(eyeDist * 0.22, 1.5 * hh * 0.04 * 1.22 * 1.8 + 4),
+    ),
+  };
+}
+
+/** Returns the motion-proportional manual/fallback occlusion fill radius for a part. */
+export function recommendedFillRadius(
+  part: Pick<Part, "id" | "role">,
+  lm: Landmarks,
+  w: number,
+  h: number,
+): number {
+  const m = partOverlapMargins(lm, w, h);
+  const hf = buildHeadFrame(lm, w, h);
+  const role = inferPartRole(part.id, part.role);
+  if (role === "hair_back" || part.id.startsWith("hair_back")) {
+    return m.hairBackUnderlap;
+  }
+  if (isHairPart(part)) {
+    return Math.max(m.hairSideFrontSeam, m.hairHatRoot);
+  }
+  if (part.id === "neck" || role === "neck") {
+    return Math.max(m.neckCollarX, m.neckCollarY, m.neckChinY);
+  }
+  if (part.id === "face" || role === "face") {
+    return m.faceScalpMargin;
+  }
+  if (
+    part.id === "body" ||
+    role === "body" ||
+    role === "clothes" ||
+    role === "hands" ||
+    part.id.startsWith("clothes") ||
+    part.id.startsWith("hands")
+  ) {
+    return m.clothesHairUnderlap;
+  }
+  if (
+    part.id.startsWith("eye") &&
+    (part.id.endsWith("_white") || part.id.endsWith("_iris"))
+  ) {
+    return Math.max(m.eyeGazeX, m.eyeGazeY);
+  }
+  return Math.max(6, Math.ceil(Math.max(8, hf.eyeDist) * 0.08));
+}
+
 export interface RegionDeformParams {
   width: number;
   roundnessDelta: number;
@@ -1722,7 +1831,7 @@ export function expandFillSeparated(
       )
         frontier.push(i);
     }
-  const maxR = Math.min(128, Math.max(0, radius));
+  const maxR = Math.min(256, Math.max(0, radius));
   for (let r = 0; r < maxR; r++) {
     const next: number[] = [];
     for (const i of frontier)

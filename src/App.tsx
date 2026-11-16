@@ -71,6 +71,7 @@ import {
   cleanSubtractedSiblingMask,
   faceBoxLandmarks,
   paint,
+  recommendedFillRadius,
 } from "./engine";
 import { loadImage, pixels, pixelsCanvas, readImage } from "./images";
 import {
@@ -1335,7 +1336,10 @@ export default function App() {
         );
     }
   };
-  const defaultFillRadius = (t: Part): number => {
+  const defaultFillRadius = (t: Part, p = projectRef.current): number => {
+    if (p) {
+      return recommendedFillRadius(t, p.landmarks, p.width, p.height);
+    }
     if (t.id === "face" || t.id === "neck" || t.id.startsWith("hair_back")) {
       return 36;
     }
@@ -1447,7 +1451,7 @@ export default function App() {
       });
       setFillOverlay(true);
       notify(
-        `${updates.size}개 주요 파츠(얼굴·목·뒷머리)의 가림 영역을 36px 침식 보완했습니다.`,
+        `${updates.size}개 주요 파츠(얼굴·목·뒷머리)의 가림 영역을 모션 비례 반경으로 침식 보완했습니다.`,
       );
     });
   };
@@ -3162,7 +3166,7 @@ export default function App() {
                         onClick={fillCriticalOcclusions}
                         style={{ marginTop: 4 }}
                       >
-                        얼굴·목·뒷머리 가림 일괄 보완 (36px)
+                        얼굴·목·뒷머리 가림 일괄 보완 (모션 비례)
                       </button>
                       {part.fillMask && (
                         <div className="analysis-banner status-model-missing">
