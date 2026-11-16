@@ -1,6 +1,32 @@
 # 일반형/SD형 실루엣 설계·구현 점검
 
-2026-11-15 · 현재 작업 디렉터리 기준. 소스 수정 없이 코드와 실행 결과를 검토했다.
+## 2026-11-16 아키텍처 재점검 (`v0.2.0-3` 반영 및 다음 설계 기준)
+
+아래 2026-11-15 초기 점검 이후 `v0.2.0-3`까지 역방향 `smoothstep` 오류 수정, `HeadFrame` 로컬 축 변형(`core.rs`/`engine.ts`/`shapes.ts`), `build_color_field` 내측 조화 보간, `RigProfile.clippingTargets` 클리핑, 4단계 하이브리드 실루엣 적층(`base_silhouette` → `features_overlay` → `clothes_overlay` → `hair_overlay`), `mergeStageParts` 비겹침 병합이 반영됐다.
+
+이번 재정립에 따라 실루엣·텍스처 설계 원칙과 우선순위를 **`소체 피팅 → 숨은 영역 확장 → 원본과 자연스러운 합성 → 모션 시 겹침 검증`**으로 고정한다. 현재 소스 정밀 점검 결과, 다음 5가지 구조적 간극이 [validation.md](validation.md)에 기록된 잔여 결함의 직접 원인임을 확인했다.
+
+1. **고정/과소 겹침 여유분 (`T8`)**:
+   - `templates.rs:5436-5462`의 `neck` 옷깃 뒤 보강 밴드가 `clothes_dil3`(`3px`)에 묶여 있고, `templates.rs:5394-5432`의 손/외투(`outfit_subs`) 뒤 `clothes` 채움도 `sub_dil3`(`3px`) 기준이다.
+   - `templates.rs:5714-5753`의 `hair_side`/`hair_front`/`hair_back` 이음새 언더랩 `seam_r`이 `(eye_dist * 0.055).clamp(8.0, 14.0)`로 상한이 제한되어, `core.rs:1206-1213,1444-1455`의 머리카락 최대 흔들림 변위(`hair_side` `1.22x`) 대비 고해상도 원화에서 틈이 열릴 수 있다.
+2. **경계 AA 후광 및 `face` 구멍 잔상 (`T9`)**:
+   - `templates.rs:5966-5970,6039-6041,6449-6451`에서 `m_vis[i] > 0` 픽셀을 그대로 복사한 뒤 `pad_texture_rgb`(`L6524`)가 외곽 2px로 연장해 배경 흰색·칼라·머리카락이 섞인 1~2px 경계 후광이 남는다.
+   - `templates.rs:5894-5900`의 `face` 텍스처 생성에서 `!is_hole_feature` 체크가 `explicit_face_override` 조건 안에 있어, 기본 `auto` 모드에서는 눈·입 경계 잔상이 `face`에 남아 모션 시 이중 선화 위험을 만든다.
+   - 수동 `fill_occlusion`(`core.rs:1498-1637` / `engine.ts:1614-1790`)은 4-이웃 단순 평균 확산만 사용하여 명암 그라데이션 유지가 약하다.
+3. **눈 감김 클리핑 및 밀폐 (`T10`)**:
+   - `src/rig/render.ts:448-455`에서 `eye*_iris → eye*_white` 클리핑이 `moving || scleraHasFill` 조건일 때만 켜지며, `core.rs:1382`의 `eye*_white` 세로 최소 스케일(`0.08`)과 `eye*_upper` 감김/슬픔(∩→∪) 곡률 사이 미세 틈·안경 교차 점선이 남는다.
+4. **추정 영역(`fillMask`) 직접 보정 도구 부재 (`T11`)**:
+   - `Viewport.tsx:319-344`는 `fillMask` 오버레이 표시만 지원하며, `App.tsx:1275-1315` 브러시는 `mask`만 편집한다. 원화 `mask`를 해치지 않고 `fillMask`와 숨은 텍스처를 직접 리터치하는 모드와 전 파츠 대상 복잡 패턴 추정 경고가 필요하다.
+5. **5대 모션·이음새 자동 검증 부재 (`T12`)**:
+   - `core.rs:1661-1799`의 `check_mesh_quality`는 단일 파츠 삼각형만 검사하며, 멀티레이어 움직임 상태의 5대 검증(기본 포즈, 얼굴/목 반대 이동 틈, 눈 감김 누출, 머리카락 이동 공백, 이중 선화/흰 테두리)을 검사하지 않는다.
+
+구체적인 구현 순서는 [development-tasks.md](development-tasks.md) T8–T12를 따른다.
+
+---
+
+## 2026-11-15 초기 점검 기록 (역사적 기준)
+
+2026-11-15 · 당시 작업 디렉터리 기준. 소스 수정 없이 코드와 실행 결과를 검토했다.
 
 ## 판단
 

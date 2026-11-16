@@ -1,17 +1,18 @@
 # flat2rig 구현 작업 지시서
 
-작성일: 2026-11-15. 제품 범위의 기준은 [product-plan.md](product-plan.md)다. 아래 작업은 시간표가 아니라 의존성에 따른 실행 순서다.
+작성일: 2026-11-15 · 개정일: 2026-11-16 (`v0.2.0-3` 기반 반영 및 T8–T12 숨은 영역 확장·겹침·모션 검증 태스크 추가). 제품 범위의 기준은 [product-plan.md](product-plan.md)다. 아래 작업은 시간표가 아니라 의존성에 따른 실행 순서다.
 
 ## 개발자에게 전달할 지시
 
-> 목표를 Cubism 후처리 자료 생성기에서 앱 안에서 표정과 기본 움직임을 완성하는 캐릭터 편집·재생기로 전환한다. 기존 Rust + Tauri v2, ort, delaunator, glam, React/Canvas 기반을 유지한다. 일반형/SD형 피팅과 원화 보존을 바탕으로 눈·입 모양, 표정 저장, 제한된 핸들 조정, 공통 재생기, 프로젝트 저장·재열기를 구현한다. PSD 인계는 고급 출력으로 유지한다. 문서만 작성하거나 UI 카드만 추가한 상태로 완료하지 말고, 실제 이미지에서 모양 차이·클리핑·조합·재열기를 증명한다. 현재 미커밋 변경과 이전 수정 사항을 확인하고 중복 구현하거나 되돌리지 않는다.
+> 목표를 단순 정지 원화 보존에서 **원본의 시각적 정체성을 유지하면서 보이지 않는 숨은 영역까지 완성해 자연스럽게 움직이는 캐릭터 편집·재생기**로 정렬한다. 기존 Rust + Tauri v2, ort, delaunator, glam, React/Canvas·WebGL 기반과 `Part.mask` / `Part.fillMask` / `Part.texture` / `Part.compositeOrder` / `RigProfile.clippingTargets` 구조를 유지·확장한다.
+> 개발 우선순위는 **`소체 피팅 → 숨은 영역 확장 → 원본과 자연스러운 합성 → 모션 시 겹침 검증`**이다. XYZ 모션 각도를 줄여 결함을 숨기지 않고, 독립 메쉬와 텍스처가 움직이는 상태에서 5대 모션·이음새 기준(기본 포즈 자연스러움, 얼굴·목 반대 이동 공백, 눈 감김 누출, 머리카락 이동 배경 노출, 경계 이중 선화/흰 테두리)을 통과시켜야 한다. PSD 인계는 고급 출력으로 유지한다.
 
 ## 공통 작업 규칙
 
 - `AGENTS.md`, `DESIGN.md`를 따른다. CodeGraph가 있으면 코드 위치·호출 관계를 먼저 확인한다.
-- 현재 구현과 신규 요구를 구분한다. 이전 검토 문서의 오류가 이미 수정됐으면 재구현하지 말고 회귀 검증한다.
+- 현재 구현(`v0.2.0-3`: T0–T6 및 4단계 실루엣 적층 완료)과 신규 요구(T8–T12 및 T7 잔여 검증)를 구분한다. 이미 구현된 경로를 중복 구현하거나 되돌리지 않는다.
 - 각 작업은 실행 가능한 상태로 마친다. 전체를 재작성하거나 먼저 렌더러/추론 라이브러리를 교체하지 않는다.
-- 수동·승인 파츠, 가변 머리카락 ID, 원화와 가림 보완 분리, 캐릭터 기준 L/R을 유지한다.
+- 수동·승인 파츠, 가변 머리카락 ID, 가시 영역(`mask`)과 숨은 영역(`fillMask`) 분리, 캐릭터 기준 L/R을 유지한다.
 - ONNX 변경 시 `onnx-model-pipeline`, PSD/인계 변경 시 `cubism-psd-handoff` 스킬을 적용한다. 이번 목표 때문에 모델 재학습이나 SDK 도입을 선행 조건으로 만들지 않는다.
 - 기존 작업 파일을 한꺼번에 스테이징하지 않는다. 구현 담당자는 자신이 바꾼 범위와 검증 자료를 명시한다.
 
@@ -113,35 +114,102 @@
 
 완료: Cubism 없이 이미지 입력·보정·모양 선택·표정 저장·재열기·재생·PNG 출력까지 완료한다. 브라우저 대체 분석 결과만으로 네이티브 분석을 검증했다고 보고하지 않는다.
 
-## T7. 회귀 검사와 사용자 확인
+## T0–T6 완료 상태 (`v0.2.0-3` 기반)
+
+- **T0–T6 기반 구현 완료**: `RigProfile` / `ShapePreset` / `ExpressionPreset` / `PlaybackSettings` / `.flat2rig` schema v3, 공통 평가기(`src/rig/evaluate.ts`)·렌더러(`src/rig/render.ts`, `src/rig/glRenderer.ts`), 눈 4종·입 7종 대체 모양(`src/rig/shapes.ts`), 표정 8종·커스텀 저장, 4단계 하이브리드 실루엣 적층(`1 소체 → 2 이목구비 → 3 의상 → 4 머리카락`, `templates.rs`, `src/io.ts`) 및 `준비 → 표정 → 조정 → 재생` UI(`src/App.tsx`)가 반영되어 있습니다.
+
+## T7. 회귀 검사와 사용자 확인 (`부분 완료 · 미검증 항목 유지`)
 
 선행: T0~T6.
 
 - `npm test`, `npm run build`, `cargo test --manifest-path src-tauri/Cargo.toml --lib`를 실행한다. 네이티브 기능 변경 시 `npm run test:native`의 범위와 실제 통과 항목을 확인한다. 모델 검사의 조기 반환은 추론 검증 통과로 세지 않는다.
 - 프리셋 데이터 검증·v1/v2 마이그레이션·v3 왕복·참조 누락·수동 수정 보존·결정적 포즈 평가·Rust/TS 동등성·부위별 입력 충돌을 검증한다.
-- 실제 원화 6장 이상에서 기본/각 눈·입/표정/작은 고개 조합을 같은 크기와 시점으로 기록한다. 정지 기본 상태 검사와 움직임 검사는 별개다.
+- 실제 원화 6장 이상에서 기본/각 눈·입/표정/작은 고개 조합을 같은 크기와 시점으로 기록한다. 정지 기본 상태 검사와 움직임 검사는 별개다. (현재 3종: `Himikan`, `Rritteang`, `Sutteang` 확보)
 - Windows에서 장시간 반복 재생 후 메모리 증가·리소스 누수·물리 시간차 급증을 확인한다. 성능 목표는 작업 캔버스 긴 변 1,024px, 캐릭터 1개, 60초 재생에서 프레임 시간 p95≤33ms다. 대상 CPU/GPU·파츠 수·해상도를 기록한다. 2,048px는 별도 측정하고 실패 시 화면 미리보기 해상도를 낮추는 선택을 제공한다.
 - 신규 사용자 3명의 15분 내 완료 목표를 측정한다. 자동 결과만의 성공과 보정 후 성공, 막힌 단계·소요 시간을 분리한다.
 
-완료: 검사 결과, 비교 이미지, 수동 확인 범위, 남은 제한을 함께 제출한다. 실제 실행하지 못한 항목은 `미검증`으로 남긴다. 새 제품 MVP의 통과 조건에 실제 Cubism 가져오기를 포함하지 않지만 기존 PSD 지원을 검증 없이 확대하지 않는다.
+완료: 검사 결과, 비교 이미지, 수동 확인 범위, 남은 제한을 함께 제출한다. 실제 실행하지 못한 항목(추가 독립 원화 3장 확보, 신규 사용자 3인 테스트, 클린 Windows `.msi` 설치/자동 업데이트, 실제 Cubism Editor `.psd` 가져오기, `2048px` 60초 측정)은 `미검증`으로 남긴다. 새 제품 MVP의 통과 조건에 실제 Cubism 가져오기를 포함하지 않지만 기존 PSD 지원을 검증 없이 확대하지 않는다.
 
-## 권장 변경 단위
+---
+
+## T8. 부위별 모션 비례 겹침 여유분(`fillMask`) 확장
+
+선행: `v0.2.0-3` (T0–T6). 주요 파일: `src-tauri/src/analysis/templates.rs`, `src-tauri/src/core.rs`, `src/engine.ts`.
+
+작업:
+
+- 고정 `2~4px` 또는 `seam_r = clamp(8..14)` / `clothes_dil3 = 3px` 상한에 묶인 숨은 영역 언더랩을 **원화 해상도(`HeadFrame.hh`, `eye_dist`)와 `core.rs`/`engine.ts`의 부위별 최대 변위**에 비례하도록 재계산한다.
+- 부위별 확장 기준:
+  - **얼굴·앞머리**: 이마와 양옆 두피 `fillMask`가 앞머리/모자 아래까지 연속 연결되도록 확장.
+  - **턱·목**: `neck`의 `fillMask`가 `clothes` 옷깃 뒤 3px를 넘어 고개·몸통 반대 이동 최대 변위(`angle_x/y/z` + `body_angle` + `breath`) 이상 아래·양옆으로 연결되도록 확장하고, 턱 아래 상단도 고개 숙임·들림에 맞춰 여유분을 둔다.
+  - **눈·눈꺼풀**: `eye*_white`·`eye*_iris`의 가려진 상단·측면 영역을 눈썹/눈꺼풀 아래까지 확장.
+  - **옆머리·뒷머리·얼굴**: `hair_side_L/R`과 `hair_front`의 모자/핀 뒤 뿌리 영역, `hair_side`↔`hair_front` 및 `hair_back`↔`neck`/`clothes`/`body` 언더랩을 `hair_sway_profile` 최대 흔들림 변위 이상으로 확장.
+  - **의상·목**: `clothes`의 손(`clothes_hands`)·외투·머리카락 뒤 영역을 단순 `3px` 테두리가 아니라 가려진 연결 몸통·칼라까지 채움.
+
+완료: `1024px+` 원화에서 고개·목 반대 방향 이동 및 머리카락 최대 흔들림 포즈를 취해도 목-옷깃, 얼굴-목, 앞머리-옆머리, 옆머리-뒷머리 사이에 빈 배경/구멍이 노출되지 않는다.
+
+## T9. 경계 후광 제거 · 내측 시드 국소 색상 필드 · 이중 선화 차단
+
+선행: T8. 주요 파일: `src-tauri/src/analysis/templates.rs`, `src-tauri/src/core.rs`, `src/engine.ts`.
+
+작업:
+
+- `m_vis`의 최외곽 경계(배경 흰색·이웃 파츠 선화·옷깃 색이 반투명하게 섞인 `1~2px` 림)가 `orig_rgb` 그대로 복사되고 `pad_texture_rgb`로 바깥에 번지는 문제를 막기 위해, 경계 혼입 픽셀을 침식 내측 시드 기반 `build_color_field` 색상으로 디컨태미네이션한 뒤 2px 패딩을 수행한다.
+- `face` 텍스처 합성(`templates.rs:5874-5902`)에서 기본 `auto` 모드일 때도 눈·눈썹·입 경계 잔상(`is_hole_feature`)이 `face` 텍스처에 남지 않도록 내측 피부 색 필드로 덮어 모션 시 이중 선화를 차단한다.
+- 단일 평균색이 아니라 명암·음영 변화가 있는 영역(이마·턱 밑 목 그림자·머리카락 명암·의상 주름)은 내측 시드 기반 국소 색상 필드(`build_color_field` 및 수동 `fill_occlusion` / `expandFillSeparated` 개선)로 연장한다.
+
+완료: 기본 포즈와 회전·표정 포즈에서 턱/손/옷깃/눈꺼풀 경계의 반투명 흰 테두리, 목 상단 밝은 얼룩, 얼굴 아래 눈·입 잔여 선화가 제거된다.
+
+## T10. 눈·입 실루엣 클리핑 밀폐 및 변형 정합
+
+선행: T9. 주요 파일: `src/rig/render.ts`, `src/rig/glRenderer.ts`, `src-tauri/src/core.rs`, `src/engine.ts`, `src/rig/shapes.ts`.
+
+작업:
+
+- `renderCharacterFrame`(`src/rig/render.ts`)에서 `eye*_iris → eye*_white` 및 `face_detail → face` 클리핑이 재생 중(`moving`)뿐 아니라 정지 표정/시선 미리보기에서도 누락 없이 활성화되도록 조건을 정리한다.
+- `eye=0` 감은 눈·`미소`·`슬픔`(∩→∪ 곡률)·좌우 윙크에서 `eye*_white` 수축(`core.rs:1382` `0.08` 하한 등)과 `eye*_upper` 윗눈꺼풀 덮임 밴드·알파가 빈틈없이 맞물리도록 Rust/TS 변형 수식을 동기화한다.
+- 안경(`acc_glasses`) 교차 부위의 감은 눈 테두리 점선·단절 현상이 나타나지 않도록 윗눈꺼풀 경계와 안경 마스크 경계 처리를 정합한다.
+
+완료: 모든 표정(`closed`/`smiling`/`sad`/좌우 윙크) + 시선(`eyeBallX/Y`) 극값 조합에서 홍채·흰자 누출과 눈꺼풀 외곽 이음새/점선이 0건이다.
+
+## T11. 추정 숨은 영역(`fillMask` · 숨은 텍스처) 관리 및 수동 보정
+
+선행: T9. 주요 파일: `src/App.tsx`, `src/Viewport.tsx`, `src/types.ts`, `src/io.ts`.
+
+작업:
+
+- `Part.mask` / `Part.fillMask` / `Part.texture` / `Part.compositeOrder` 계약을 유지한 채, 정지 원화(`mask`)를 훼손하지 않고 **숨은 영역(`fillMask`) 마스크만 추가·지우기** 할 수 있는 편집 대상 전환(`가시 영역` / `숨은 영역`)과 숨은 텍스처 스무딩·샘플 리터치 브러시를 제공한다.
+- 샘플링만으로 복원하기 어려운 복잡 무늬·선화가 가려진 부위(의상 패턴·칼라·리본·안경 등 포함)를 추정 영역 경고로 구분 표시하고, 수동 보정 이력(undo/redo, `approved`/`manual` 보존) 및 `.flat2rig` schema v3 저장·재열기에 그대로 유지한다.
+
+완료: 가시 `mask` 비겹침 합=원본 전경 알파 불변을 유지한 상태에서 `fillMask`와 숨은 텍스처를 수동 보정·취소/다시 실행·저장/재열기할 수 있다.
+
+## T12. 5대 모션·이음새 자동 검증 게이트 및 회귀 검증
+
+선행: T8–T11. 주요 파일: `src-tauri/src/core.rs`, `src-tauri/src/bin/flat2rig-cli.rs`, `tests/pipeline.test.ts`, `docs/validation.md`.
+
+작업:
+
+- 단일 파츠 메쉬 검사(`check_mesh_quality`)에 더해, 멀티레이어 합성 결과에서 **각 파츠의 독립 메쉬와 텍스처가 움직이는 상태**로 아래 5가지 기준을 자동 판별하는 검증 루틴을 CLI(`stats.json`)와 테스트에 추가한다.
+  1. **기본 포즈 자연스러움**: 원본과 동일한 기본 포즈에서 색상·실루엣이 자연스러운가? (가시 색차 및 경계 후광 지표)
+  2. **얼굴·목 반대 이동**: 얼굴(`angle_x/y/z`)과 목/몸통을 반대 방향으로 움직여도 턱-목-옷깃 사이에 빈 틈(투명 픽셀 노출)이 없는가?
+  3. **눈 감김 누출**: `eye=0` 감은 눈·미소·슬픔·윙크 및 시선 극값에서 `eye*_white` / `eye*_iris` 픽셀이 눈꺼풀 밖으로 새지 않는가?
+  4. **머리카락 이동 공백**: `hair` / `hair_side` / `hair_back` 최대 흔들림 시 얼굴/피부/배경의 의도치 않은 빈 공간이 노출되지 않는가?
+  5. **이중 선화·흰 테두리**: 파츠 겹침 경계에 이중 선화 잔상이나 반투명 밝은 테두리가 나타나지 않는가?
+- 모션 각도를 줄여 통과 처리하지 않으며, 실제 보유 원화(`Himikan`, `Rritteang`, `Sutteang`) 및 T7 추가 확보 원화에서 WebView2 E2E·투명 PNG·장시간 재생까지 재검증해 `docs/validation.md`를 갱신한다.
+
+완료: 5대 모션·이음새 검증이 CLI/테스트에서 자동 리포트되고, 실제 원화에서 각도 축소 없이 5개 항목 통과 또는 미통과 원인이 명시된다.
+
+## 권장 변경 단위 (후속 Phase 2)
 
 | 순서 | 변경 단위 | 핵심 검수 |
 | --- | --- | --- |
-| 1 | `fix: verify rest composition and preserved edits` | 현재 수정 확인, 원화/수동 수정 회귀 |
-| 2 | `feat: persist rig profiles and expression data` | v3, 하위 버전, 자산 검증 |
-| 3 | `refactor: share pose evaluation and character rendering` | 기존 결과 유지, 결정적 평가 |
-| 4 | `feat: add editable eye shape presets` | 클리핑, 감은 눈, 좌우 |
-| 5 | `feat: add editable mouth shape presets` | A/I/U/E/O 실제 형상 차이 |
-| 6 | `feat: compose and save character expressions` | 조합·우선순위·복귀·왕복 |
-| 7 | `feat: complete local character editing and playback` | 기본 UI, 재생, PNG |
-| 8 | `test: validate native character workflow` | 실제 원화·Windows·사용성 |
-
-T0가 이미 통과하면 1번의 불필요한 수정은 생략하고 검증 자료만 남긴다. 현재 작업을 무시하고 커밋 번호만 맞추지 않는다.
+| 1 | `docs: align product plan, tasks, and invariants to hidden-area expansion` | 계획·규칙·아키텍처 문서 일관성 |
+| 2 | `feat(T8): scale per-part overlap fillMask margins by HeadFrame motion` | 목·머리카락·의상 반대/최대 변위 공백 0 |
+| 3 | `feat(T9): decontaminate AA rim halos and enforce hole-free face skin` | 경계 흰 테두리·목 얼룩·이중 선화 제거 |
+| 4 | `feat(T10): seal eye clipping and closed-lid curves across expressions` | 감은 눈·슬픔·시선 극값 홍채/흰자 누출 0 |
+| 5 | `feat(T11): add direct hidden-area (fillMask) manual retouch workflow` | 원화 `mask` 불변 + `fillMask`/텍스처 보정 왕복 |
+| 6 | `test(T12): automate 5-point motion and seam verification gate` | 5대 검증 CLI/단위/WebView2 E2E 결과 기록 |
 
 ## 이번 지시의 종료 기준
 
-개발자는 다음을 보고한다: 구현한 작업 ID, 변경 파일, 실행/확인 방법, 테스트 결과, 원화 비교 자료, 수동·승인 파츠 보존 결과, 저장/재열기 결과, 남은 제한. 제품 화면에 프리셋 카드가 생긴 것만으로 완료 보고하지 않는다.
-
-기준 점검: 문서 작성 중 기존 `npm test` 27개, `cargo test --manifest-path src-tauri/Cargo.toml --lib` 26개, `npm run build` 통과. 모델·자료가 없으면 조기 반환하는 검사가 있으므로 전체 추론 정합성 통과를 뜻하지 않는다. 이 기록은 신규 기능 통과 보고가 아니다.
+개발자는 다음을 보고한다: 구현한 작업 ID(T8–T12), 변경 파일, 실행/확인 방법, 테스트 결과, 5대 모션·이음새 검증 수치, 수동·승인 `mask`/`fillMask` 보존 결과, 저장/재열기 결과, 남은 제한. 모션 각도를 축소하거나 미검증 항목을 통과 처리하지 않는다.
