@@ -1,0 +1,1439 @@
+//! T13a — seam contracts (`SeamGraph`), the shared pose envelope, `deform`-sampled per-seam
+//! underlaps, and the seam coverage check.
+//!
+//! Why this exists: T8 computed hidden-area (`fillMask`) underlaps by copying `deform`
+//! coefficients into closed-form formulas (`core::part_overlap_margins`). Any `deform` change
+//! silently desynchronized the margins. Here the required underlap of each seam is *measured*:
+//! every visible boundary point between an upper and a lower layer is pushed through the real
+//! `deform(upper)` and `deform(lower)` for every pose of the shared envelope, and the depth by
+//! which the lower layer must continue under the upper layer is read off the masks. No `deform`
+//! coefficient appears in this module.
+//!
+//! - Seam data is derived (never stored in the project file) and must be recomputed whenever the
+//!   visible masks change, including user-approved edits.
+//! - The pose envelope lives in `src/rig/pose-envelope.json`, embedded here with `include_str!`
+//!   and imported by TS (`src/rig/poseEnvelope.ts`), so Rust and TS read the same table. Its
+//!   ranges must equal `PARAM_DEFS` (no shrinking); the TS test enforces that.
+//! - `core::part_overlap_margins` remains as the fallback when a seam is missing (landmarks only).
+//! - `coupling` is a placeholder filled by T13b (coupled seam deformation).
+
+use crate::core::{deform, effective_part_mask, HeadFrame, Landmarks, PartRole, Point, Pose};
+use glam::DVec2;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
+
+/// Shared deterministic pose envelope (Rust embeds the same file TS imports).
+pub const POSE_ENVELOPE_JSON: &str = include_str!("../../../src/rig/pose-envelope.json");
+
+/// Multiplicative safety factor on the measured exposure depth. Not a `deform` coefficient: it
+/// absorbs mesh-triangle interpolation vs. point deformation, boundary midpoint rounding, and the
+/// first-order lower-layer inverse used when sampling.
+pub const SEAM_SAFETY_SCALE: f64 = 1.25;
+/// Additive safety pad (px) so even motionless seams keep an anti-aliasing underlap.
+pub const SEAM_SAFETY_PAD_PX: f64 = 2.0;
+/// Boundary samples per seam used when computing requirements inside template synthesis.
+pub const DEFAULT_MAX_SAMPLES_PER_SEAM: usize = 384;
+/// Relative motion below this (px) cannot expose a pixel and is skipped.
+const MIN_RELATIVE_MOTION_PX: f64 = 0.5;
+/// Maximum number of violation records kept in a coverage report (counts are always complete).
+pub const MAX_REPORTED_VIOLATIONS: usize = 64;
+
+// ---------------------------------------------------------------------------------------------
+// Pose envelope
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopePose {
+    pub name: String,
+    pub group: String,
+    pub pose: Pose,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoseEnvelope {
+    pub version: u32,
+    /// Parameter ranges (`PARAM_DEFS` min/max) keyed by the camelCase `Pose` field name.
+    pub ranges: BTreeMap<String, (f64, f64)>,
+    pub poses: Vec<EnvelopePose>,
+}
+
+#[derive(Deserialize)]
+struct RawEnvelope {
+    version: u32,
+    ranges: BTreeMap<String, [f64; 2]>,
+    poses: Vec<RawEnvelopePose>,
+}
+
+#[derive(Deserialize)]
+struct RawEnvelopePose {
+    name: String,
+    group: String,
+    params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// camelCase field names of `Pose` (the same keys TS `Parameters` uses).
+pub fn pose_field_names() -> Vec<String> {
+    match serde_json::to_value(Pose::default()) {
+        Ok(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Parses and validates an envelope document: every key must be a `Pose` field, every `Pose`
+/// field must have a range, every value must lie inside its range, and names must be unique.
+pub fn parse_pose_envelope(json: &str) -> Result<PoseEnvelope, String> {
+    let raw: RawEnvelope =
+        serde_json::from_str(json).map_err(|e| format!("pose envelope JSON: {e}"))?;
+    let fields = pose_field_names();
+    let known = |k: &str| fields.iter().any(|f| f == k);
+    for k in raw.ranges.keys() {
+        if !known(k) {
+            return Err(format!("pose envelope: unknown range key `{k}`"));
+        }
+    }
+    for f in &fields {
+        if !raw.ranges.contains_key(f) {
+            return Err(format!("pose envelope: range missing for Pose field `{f}`"));
+        }
+    }
+    let mut names = HashSet::new();
+    let mut poses = Vec::with_capacity(raw.poses.len());
+    for p in raw.poses {
+        if !names.insert(p.name.clone()) {
+            return Err(format!("pose envelope: duplicate pose name `{}`", p.name));
+        }
+        for (k, v) in &p.params {
+            if !known(k) {
+                return Err(format!(
+                    "pose envelope: pose `{}` has unknown key `{k}`",
+                    p.name
+                ));
+            }
+            let x = v
+                .as_f64()
+                .ok_or_else(|| format!("pose envelope: `{}`.{k} is not a number", p.name))?;
+            let [lo, hi] = raw.ranges[k];
+            if x < lo || x > hi {
+                return Err(format!(
+                    "pose envelope: `{}`.{k}={x} outside PARAM_DEFS range [{lo}, {hi}]",
+                    p.name
+                ));
+            }
+        }
+        let pose: Pose = serde_json::from_value(serde_json::Value::Object(p.params))
+            .map_err(|e| format!("pose envelope: `{}`: {e}", p.name))?;
+        poses.push(EnvelopePose {
+            name: p.name,
+            group: p.group,
+            pose,
+        });
+    }
+    Ok(PoseEnvelope {
+        version: raw.version,
+        ranges: raw
+            .ranges
+            .into_iter()
+            .map(|(k, [a, b])| (k, (a, b)))
+            .collect(),
+        poses,
+    })
+}
+
+/// The embedded shared envelope (parsed once).
+pub fn pose_envelope() -> &'static PoseEnvelope {
+    static ENV: OnceLock<PoseEnvelope> = OnceLock::new();
+    ENV.get_or_init(|| {
+        parse_pose_envelope(POSE_ENVELOPE_JSON)
+            .expect("embedded src/rig/pose-envelope.json must be valid")
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Seam graph
+// ---------------------------------------------------------------------------------------------
+
+/// T13b placeholder: coupled deformation weights across a seam. Always `None` in T13a.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeamCoupling {
+    pub upper_follow: f64,
+    pub lower_follow: f64,
+}
+
+/// One stacked layer pair with a shared visible boundary. `upper` draws above `lower`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeamContract {
+    pub upper: usize,
+    pub lower: usize,
+    pub upper_id: String,
+    pub lower_id: String,
+    pub upper_role: PartRole,
+    pub lower_role: PartRole,
+    /// Visible boundary polylines in canvas pixels (midpoints between 4-adjacent pixels owned by
+    /// `upper` and `lower`; pixel `(x, y)` is centred at integer coordinates like the template code).
+    pub boundary: Vec<Vec<Point>>,
+    pub coupling: Option<SeamCoupling>,
+}
+
+impl SeamContract {
+    pub fn boundary_len(&self) -> usize {
+        self.boundary.iter().map(Vec::len).sum()
+    }
+
+    /// Evenly strided boundary points (all points when `max_points` is 0 or large enough).
+    pub fn boundary_samples(&self, max_points: usize) -> Vec<Point> {
+        let total = self.boundary_len();
+        let stride = if max_points == 0 || total <= max_points {
+            1
+        } else {
+            total.div_ceil(max_points)
+        };
+        self.boundary
+            .iter()
+            .flatten()
+            .step_by(stride.max(1))
+            .copied()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeamGraph {
+    pub seams: Vec<SeamContract>,
+}
+
+impl SeamGraph {
+    pub fn find(&self, upper_id: &str, lower_id: &str) -> Option<&SeamContract> {
+        self.seams
+            .iter()
+            .find(|s| s.upper_id == upper_id && s.lower_id == lower_id)
+    }
+}
+
+/// Topmost visible owner per pixel (`-1` when no layer is visible). Layers are bottom-to-top.
+pub fn visible_owner(visible_masks: &[Vec<u8>], n: usize) -> Vec<i32> {
+    let mut owner = vec![-1i32; n];
+    for (p, m) in visible_masks.iter().enumerate() {
+        for (i, &a) in m.iter().enumerate().take(n) {
+            if a > 0 {
+                owner[i] = p as i32;
+            }
+        }
+    }
+    owner
+}
+
+/// Extracts every stacked pair with a shared visible boundary from bottom-to-top layers.
+/// Roles are supplied by the caller (explicit role or `core::infer_part_role`), so variable hair
+/// layers (`hair_front_2`, `hair_side_L_3`, ...) and accessories participate like any other layer.
+pub fn extract_seam_graph(
+    layer_ids: &[String],
+    roles: &[PartRole],
+    visible_masks: &[Vec<u8>],
+    w: usize,
+    h: usize,
+) -> SeamGraph {
+    let n = w * h;
+    let owner = visible_owner(visible_masks, n);
+    let mut pts: BTreeMap<(usize, usize), Vec<(i64, i64)>> = BTreeMap::new();
+    let mut push = |a: i32, b: i32, key: (i64, i64)| {
+        let (u, l) = if a > b { (a, b) } else { (b, a) };
+        pts.entry((u as usize, l as usize)).or_default().push(key);
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let a = owner[i];
+            if a < 0 {
+                continue;
+            }
+            if x + 1 < w {
+                let b = owner[i + 1];
+                if b >= 0 && b != a {
+                    push(a, b, (2 * x as i64 + 1, 2 * y as i64));
+                }
+            }
+            if y + 1 < h {
+                let b = owner[i + w];
+                if b >= 0 && b != a {
+                    push(a, b, (2 * x as i64, 2 * y as i64 + 1));
+                }
+            }
+        }
+    }
+    let seams = pts
+        .into_iter()
+        .map(|((u, l), keys)| SeamContract {
+            upper: u,
+            lower: l,
+            upper_id: layer_ids[u].clone(),
+            lower_id: layer_ids[l].clone(),
+            upper_role: roles[u],
+            lower_role: roles[l],
+            boundary: chain_polylines(keys),
+            coupling: None,
+        })
+        .collect();
+    SeamGraph { seams }
+}
+
+/// Links half-pixel boundary midpoints (doubled integer coords) into ordered polylines.
+fn chain_polylines(keys: Vec<(i64, i64)>) -> Vec<Vec<Point>> {
+    let index: HashMap<(i64, i64), usize> = keys.iter().enumerate().map(|(i, &k)| (k, i)).collect();
+    let mut offsets: Vec<(i64, i64)> = Vec::new();
+    for dy in -2i64..=2 {
+        for dx in -2i64..=2 {
+            if (dx, dy) != (0, 0) {
+                offsets.push((dx, dy));
+            }
+        }
+    }
+    offsets.sort_by_key(|&(dx, dy)| (dx * dx + dy * dy, dy, dx));
+    let mut visited = vec![false; keys.len()];
+    let walk = |start: usize, visited: &mut Vec<bool>| -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut cur = start;
+        loop {
+            let (cx, cy) = keys[cur];
+            let next = offsets.iter().find_map(|&(dx, dy)| {
+                index
+                    .get(&(cx + dx, cy + dy))
+                    .copied()
+                    .filter(|&j| !visited[j])
+            });
+            match next {
+                Some(j) => {
+                    visited[j] = true;
+                    out.push(j);
+                    cur = j;
+                }
+                None => break,
+            }
+        }
+        out
+    };
+    let mut lines = Vec::new();
+    for s in 0..keys.len() {
+        if visited[s] {
+            continue;
+        }
+        visited[s] = true;
+        let fwd = walk(s, &mut visited);
+        let bwd = walk(s, &mut visited);
+        let to_pt = |j: usize| Point {
+            x: keys[j].0 as f64 * 0.5,
+            y: keys[j].1 as f64 * 0.5,
+        };
+        let mut line: Vec<Point> = bwd.iter().rev().map(|&j| to_pt(j)).collect();
+        line.push(to_pt(s));
+        line.extend(fwd.iter().map(|&j| to_pt(j)));
+        lines.push(line);
+    }
+    lines
+}
+
+// ---------------------------------------------------------------------------------------------
+// Numeric requirements
+// ---------------------------------------------------------------------------------------------
+
+#[inline]
+fn dv(p: Point) -> DVec2 {
+    DVec2::new(p.x, p.y)
+}
+
+#[inline]
+fn pixel(p: DVec2, w: usize, h: usize) -> Option<usize> {
+    let x = p.x.round();
+    let y = p.y.round();
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= w as f64 || y >= h as f64 {
+        None
+    } else {
+        Some(y as usize * w + x as usize)
+    }
+}
+
+/// Chamfer (1, √2) distance from each pixel to the nearest `mask > 0` pixel (0 inside).
+fn outside_distance(mask: &[u8], w: usize, h: usize) -> Vec<f32> {
+    let inf = f32::MAX / 4.0;
+    let d1 = 1.0f32;
+    let d2 = std::f32::consts::SQRT_2;
+    let mut d: Vec<f32> = mask
+        .iter()
+        .map(|&a| if a > 0 { 0.0 } else { inf })
+        .collect();
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let mut v = d[i];
+            if x > 0 {
+                v = v.min(d[i - 1] + d1);
+            }
+            if y > 0 {
+                v = v.min(d[i - w] + d1);
+                if x > 0 {
+                    v = v.min(d[i - w - 1] + d2);
+                }
+                if x + 1 < w {
+                    v = v.min(d[i - w + 1] + d2);
+                }
+            }
+            d[i] = v;
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            let mut v = d[i];
+            if x + 1 < w {
+                v = v.min(d[i + 1] + d1);
+            }
+            if y + 1 < h {
+                v = v.min(d[i + w] + d1);
+                if x + 1 < w {
+                    v = v.min(d[i + w + 1] + d2);
+                }
+                if x > 0 {
+                    v = v.min(d[i + w - 1] + d2);
+                }
+            }
+            d[i] = v;
+        }
+    }
+    d
+}
+
+/// Measured underlap requirement for one seam over the pose envelope.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeamRequirement {
+    pub upper: usize,
+    pub lower: usize,
+    pub upper_id: String,
+    pub lower_id: String,
+    pub upper_role: PartRole,
+    pub lower_role: PartRole,
+    pub boundary_points: usize,
+    pub sampled_points: usize,
+    pub poses: usize,
+    /// max |deform(upper)(b) − deform(lower)(b)| over sampled boundary points × poses.
+    pub max_relative_displacement_px: f64,
+    /// max distance (outside the lower visible mask) over every supported sample of the exposed
+    /// band `b → x_l` (`x_l` = rest point of `lower` that lands on the moved upper boundary;
+    /// see `walk_exposed_band`). A sample is supported when it is foreground and owned at rest
+    /// by `lower` or a layer above it; the same band and predicate drive the coverage check.
+    pub max_exposure_depth_px: f64,
+    /// `ceil(max_exposure_depth_px · SEAM_SAFETY_SCALE + SEAM_SAFETY_PAD_PX)`.
+    pub required_underlap_px: usize,
+    pub worst_pose: Option<String>,
+    pub worst_point: Option<Point>,
+    /// Moving boundary-point × pose pairs whose whole exposed band has no supported sample
+    /// (background or layers below `lower` only).
+    pub unsupported_samples: usize,
+}
+
+/// Requirements for every seam using the real `core::deform`.
+#[allow(clippy::too_many_arguments)]
+pub fn seam_requirements(
+    graph: &SeamGraph,
+    visible_masks: &[Vec<u8>],
+    fg_alpha: &[u8],
+    lm: &Landmarks,
+    w: usize,
+    h: usize,
+    poses: &[EnvelopePose],
+    max_samples_per_seam: usize,
+) -> Vec<SeamRequirement> {
+    seam_requirements_with(
+        graph,
+        visible_masks,
+        fg_alpha,
+        w,
+        h,
+        poses,
+        max_samples_per_seam,
+        |p, id, pose| deform(p, id, lm, pose),
+    )
+}
+
+/// Requirements for every seam with an injected deformation `deform_fn(point, layer_id, pose)`.
+/// The function is the only source of motion; nothing about `deform` is restated here.
+#[allow(clippy::too_many_arguments)]
+pub fn seam_requirements_with<D>(
+    graph: &SeamGraph,
+    visible_masks: &[Vec<u8>],
+    fg_alpha: &[u8],
+    w: usize,
+    h: usize,
+    poses: &[EnvelopePose],
+    max_samples_per_seam: usize,
+    deform_fn: D,
+) -> Vec<SeamRequirement>
+where
+    D: Fn(Point, &str, &Pose) -> Point,
+{
+    let n = w * h;
+    let owner = visible_owner(visible_masks, n);
+    let mut dist_cache: HashMap<usize, Vec<f32>> = HashMap::new();
+    let mut out = Vec::with_capacity(graph.seams.len());
+    for seam in &graph.seams {
+        let dist = dist_cache
+            .entry(seam.lower)
+            .or_insert_with(|| outside_distance(&visible_masks[seam.lower], w, h));
+        let samples = seam.boundary_samples(max_samples_per_seam);
+        let mut max_rel = 0.0f64;
+        let mut max_depth = 0.0f64;
+        let mut worst: Option<(String, Point)> = None;
+        let mut unsupported = 0usize;
+        let lower = seam.lower as i32;
+        for pe in poses {
+            let f_lower =
+                |x: DVec2| dv(deform_fn(Point::from(x), seam.lower_id.as_str(), &pe.pose));
+            for &b in &samples {
+                let bv = dv(b);
+                let yu = dv(deform_fn(b, seam.upper_id.as_str(), &pe.pose));
+                let rl = (yu - f_lower(bv)).length();
+                if rl > max_rel {
+                    max_rel = rl;
+                }
+                let walk = walk_exposed_band(
+                    bv,
+                    yu,
+                    &f_lower,
+                    fg_alpha,
+                    &owner,
+                    seam.lower,
+                    w,
+                    h,
+                    |_, _, k| {
+                        let depth = if owner[k] == lower {
+                            0.0
+                        } else {
+                            dist[k] as f64
+                        };
+                        if depth > max_depth {
+                            max_depth = depth;
+                            worst = Some((pe.name.clone(), b));
+                        }
+                        true
+                    },
+                );
+                if matches!(walk, BandWalk::Walked { supported: 0 }) {
+                    unsupported += 1;
+                }
+            }
+        }
+        let required = (max_depth * SEAM_SAFETY_SCALE + SEAM_SAFETY_PAD_PX).ceil() as usize;
+        out.push(SeamRequirement {
+            upper: seam.upper,
+            lower: seam.lower,
+            upper_id: seam.upper_id.clone(),
+            lower_id: seam.lower_id.clone(),
+            upper_role: seam.upper_role,
+            lower_role: seam.lower_role,
+            boundary_points: seam.boundary_len(),
+            sampled_points: samples.len(),
+            poses: poses.len(),
+            max_relative_displacement_px: max_rel,
+            max_exposure_depth_px: max_depth,
+            required_underlap_px: required,
+            worst_pose: worst.as_ref().map(|(n, _)| n.clone()),
+            worst_point: worst.map(|(_, p)| p),
+            unsupported_samples: unsupported,
+        });
+    }
+    out
+}
+
+/// Max relative displacement between two layers at the given points over the poses, plus the
+/// pose that produced it. Used by the Rust/TS parity fixture.
+pub fn max_relative_displacement<D>(
+    points: &[Point],
+    upper_id: &str,
+    lower_id: &str,
+    poses: &[EnvelopePose],
+    deform_fn: D,
+) -> (f64, Option<String>)
+where
+    D: Fn(Point, &str, &Pose) -> Point,
+{
+    let mut best = (0.0f64, None);
+    for pe in poses {
+        for &b in points {
+            let r = dv(deform_fn(b, upper_id, &pe.pose)) - dv(deform_fn(b, lower_id, &pe.pose));
+            let rl = r.length();
+            if rl > best.0 + 1e-12 {
+                best = (rl, Some(pe.name.clone()));
+            }
+        }
+    }
+    best
+}
+
+/// Seam requirements indexed for the hidden-area generator. Queries return `None` when no seam
+/// matches, in which case the caller uses the `core::part_overlap_margins` fallback.
+#[derive(Debug, Clone, Default)]
+pub struct SeamMarginTable {
+    pub requirements: Vec<SeamRequirement>,
+}
+
+impl SeamMarginTable {
+    pub fn new(requirements: Vec<SeamRequirement>) -> Self {
+        Self { requirements }
+    }
+
+    /// Largest required underlap over seams where `lower` is the lower layer and the upper layer
+    /// passes `accept_upper(upper_index, upper_role)`.
+    pub fn need<F: Fn(usize, PartRole) -> bool>(
+        &self,
+        lower: usize,
+        accept_upper: F,
+    ) -> Option<usize> {
+        self.requirements
+            .iter()
+            .filter(|r| r.lower == lower && accept_upper(r.upper, r.upper_role))
+            .map(|r| r.required_underlap_px)
+            .max()
+    }
+}
+
+/// Attribute probe: does this layer's `deform` respond to the global hair-sway parameter?
+/// True for hair strands, hats, and hair-mounted accessories; read from `deform` itself rather
+/// than from ID prefixes, so it tracks whatever `deform` actually does.
+pub fn follows_hair_sway(id: &str, lm: &Landmarks) -> bool {
+    let hf = HeadFrame::from_landmarks(lm, 0, 0);
+    let probe = Point {
+        x: lm.crown.x,
+        y: lm.crown.y + hf.hh * 0.9,
+    };
+    let rest = Pose::default();
+    let sway = Pose {
+        hair: 1.0,
+        ..Pose::default()
+    };
+    let a = deform(probe, id, lm, &sway);
+    let b = deform(probe, id, lm, &rest);
+    (a.x - b.x).abs() + (a.y - b.y).abs() > 1e-6
+}
+
+// ---------------------------------------------------------------------------------------------
+// Coverage check
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageViolation {
+    pub upper_id: String,
+    pub lower_id: String,
+    pub pose: String,
+    pub boundary_point: Point,
+    /// Rest-space point in the band swept by the moving upper boundary that `lower` misses.
+    pub rest_sample: Point,
+    /// Where that point lands after posing `lower`.
+    pub posed_sample: Point,
+    /// Distance from the boundary point to `rest_sample`.
+    pub depth_px: f64,
+    /// True when no layer at all covers `posed_sample` after posing (background shows).
+    pub hole: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeamCoverageSummary {
+    pub upper_id: String,
+    pub lower_id: String,
+    pub checks: usize,
+    pub moving_checks: usize,
+    pub lower_misses: usize,
+    pub holes: usize,
+    pub max_miss_depth_px: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeamCoverageReport {
+    pub poses: usize,
+    /// Boundary point × pose pairs checked.
+    pub checks: usize,
+    /// Pairs where the deformed lower effective mask (`mask ∪ fillMask`) fails to cover the band
+    /// uncovered by the moving upper boundary (strict seam-contract violation).
+    pub lower_misses: usize,
+    /// Subset of `lower_misses` where no other layer covers the spot either (background exposed).
+    pub holes: usize,
+    pub seams: Vec<SeamCoverageSummary>,
+    /// First `MAX_REPORTED_VIOLATIONS` violations (holes first, then other misses).
+    pub violations: Vec<CoverageViolation>,
+}
+
+/// Outcome of walking one boundary point's exposed band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BandWalk {
+    /// Relative motion below `MIN_RELATIVE_MOTION_PX` (or a zero-length band): nothing exposed.
+    Static,
+    /// The band was walked; `supported` counts samples handed to the visitor.
+    Walked { supported: usize },
+}
+
+/// Single definition of the band a moving upper boundary uncovers, shared by
+/// `seam_requirements_with` and `check_seam_coverage_with` so the two cannot drift apart.
+///
+/// For boundary point `b` the upper boundary lands at `yu = deform(upper)(b)`. The lower layer's
+/// rest point that lands there is `x_l = deform(lower)⁻¹(yu)` (fixed-point inverse, falling back
+/// to the first-order `b + r` when it does not converge). Every rest-space sample on `b → x_l`
+/// (1px steps from 0.5px, plus the end point) is exposed at that pose. Samples that are inside
+/// the canvas, foreground, and owned at rest by `lower` or a layer above it are *supported*
+/// (`lower` may legally fill them) and are passed to `visit(t, s, k)`; returning `false` stops.
+#[allow(clippy::too_many_arguments)]
+fn walk_exposed_band<FL, V>(
+    b: DVec2,
+    yu: DVec2,
+    f_lower: &FL,
+    fg_alpha: &[u8],
+    owner: &[i32],
+    lower: usize,
+    w: usize,
+    h: usize,
+    mut visit: V,
+) -> BandWalk
+where
+    FL: Fn(DVec2) -> DVec2,
+    V: FnMut(f64, DVec2, usize) -> bool,
+{
+    let r = yu - f_lower(b);
+    if r.length() < MIN_RELATIVE_MOTION_PX {
+        return BandWalk::Static;
+    }
+    let (mut x_l, err) = invert(f_lower, yu, b + r);
+    if err > 1.0 {
+        x_l = b + r;
+    }
+    let span = (x_l - b).length();
+    if span < 1e-9 {
+        return BandWalk::Static;
+    }
+    let dir = (x_l - b) / span;
+    let mut supported = 0usize;
+    let mut t = 0.5f64.min(span);
+    loop {
+        let s = b + dir * t;
+        if let Some(k) = pixel(s, w, h) {
+            if fg_alpha[k] > 0 && owner[k] >= lower as i32 {
+                supported += 1;
+                if !visit(t, s, k) {
+                    break;
+                }
+            }
+        }
+        if t >= span {
+            break;
+        }
+        t = (t + 1.0).min(span);
+    }
+    BandWalk::Walked { supported }
+}
+
+/// Fixed-point inverse of a near-identity map: finds `x` with `f(x) ≈ target`.
+fn invert<F: Fn(DVec2) -> DVec2>(f: &F, target: DVec2, guess: DVec2) -> (DVec2, f64) {
+    let mut x = guess;
+    let mut best = (x, f64::INFINITY);
+    for _ in 0..10 {
+        let res = target - f(x);
+        let e = res.length();
+        if e < best.1 {
+            best = (x, e);
+        }
+        if e < 0.05 {
+            break;
+        }
+        x += res;
+    }
+    best
+}
+
+/// Checks, for every seam boundary point × envelope pose, that the band uncovered by the moving
+/// upper boundary is covered by the deformed lower effective mask (`mask ∪ fillMask`).
+#[allow(clippy::too_many_arguments)]
+pub fn check_seam_coverage(
+    graph: &SeamGraph,
+    layer_ids: &[String],
+    visible_masks: &[Vec<u8>],
+    fill_masks: &[Vec<u8>],
+    fg_alpha: &[u8],
+    lm: &Landmarks,
+    w: usize,
+    h: usize,
+    poses: &[EnvelopePose],
+    stride: usize,
+) -> SeamCoverageReport {
+    check_seam_coverage_with(
+        graph,
+        layer_ids,
+        visible_masks,
+        fill_masks,
+        fg_alpha,
+        w,
+        h,
+        poses,
+        stride,
+        |p, id, pose| deform(p, id, lm, pose),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn check_seam_coverage_with<D>(
+    graph: &SeamGraph,
+    layer_ids: &[String],
+    visible_masks: &[Vec<u8>],
+    fill_masks: &[Vec<u8>],
+    fg_alpha: &[u8],
+    w: usize,
+    h: usize,
+    poses: &[EnvelopePose],
+    stride: usize,
+    deform_fn: D,
+) -> SeamCoverageReport
+where
+    D: Fn(Point, &str, &Pose) -> Point,
+{
+    let n = w * h;
+    let owner = visible_owner(visible_masks, n);
+    let eff: Vec<Vec<u8>> = visible_masks
+        .iter()
+        .enumerate()
+        .map(|(p, vm)| effective_part_mask(vm, fill_masks.get(p).map(|f| f.as_slice())))
+        .collect();
+    let d = |p: DVec2, id: &str, pose: &Pose| dv(deform_fn(Point::from(p), id, pose));
+    let covered_by_any = |posed: DVec2, pose: &Pose| -> bool {
+        layer_ids.iter().enumerate().any(|(p, id)| {
+            let f = |x: DVec2| d(x, id.as_str(), pose);
+            let guess = posed - (f(posed) - posed);
+            let (x, err) = invert(&f, posed, guess);
+            err <= 1.0 && pixel(x, w, h).is_some_and(|k| eff[p][k] > 0)
+        })
+    };
+    let mut report = SeamCoverageReport {
+        poses: poses.len(),
+        ..Default::default()
+    };
+    let mut holes_v: Vec<CoverageViolation> = Vec::new();
+    let mut misses_v: Vec<CoverageViolation> = Vec::new();
+    for seam in &graph.seams {
+        let lower = seam.lower;
+        let mut sum = SeamCoverageSummary {
+            upper_id: seam.upper_id.clone(),
+            lower_id: seam.lower_id.clone(),
+            ..Default::default()
+        };
+        let pts: Vec<Point> = seam
+            .boundary
+            .iter()
+            .flatten()
+            .step_by(stride.max(1))
+            .copied()
+            .collect();
+        for pe in poses {
+            let f_lower = |x: DVec2| d(x, seam.lower_id.as_str(), &pe.pose);
+            for &bp in &pts {
+                sum.checks += 1;
+                let b = dv(bp);
+                let yu = d(b, seam.upper_id.as_str(), &pe.pose);
+                let walk =
+                    walk_exposed_band(b, yu, &f_lower, fg_alpha, &owner, lower, w, h, |t, s, k| {
+                        if eff[lower][k] > 0 {
+                            return true;
+                        }
+                        let posed = f_lower(s);
+                        let hole = !covered_by_any(posed, &pe.pose);
+                        sum.lower_misses += 1;
+                        sum.max_miss_depth_px = sum.max_miss_depth_px.max(t);
+                        if hole {
+                            sum.holes += 1;
+                        }
+                        let v = CoverageViolation {
+                            upper_id: seam.upper_id.clone(),
+                            lower_id: seam.lower_id.clone(),
+                            pose: pe.name.clone(),
+                            boundary_point: bp,
+                            rest_sample: Point::from(s),
+                            posed_sample: Point::from(posed),
+                            depth_px: t,
+                            hole,
+                        };
+                        if hole {
+                            if holes_v.len() < MAX_REPORTED_VIOLATIONS {
+                                holes_v.push(v);
+                            }
+                        } else if misses_v.len() < MAX_REPORTED_VIOLATIONS {
+                            misses_v.push(v);
+                        }
+                        false
+                    });
+                if walk != BandWalk::Static {
+                    sum.moving_checks += 1;
+                }
+            }
+        }
+        report.checks += sum.checks;
+        report.lower_misses += sum.lower_misses;
+        report.holes += sum.holes;
+        report.seams.push(sum);
+    }
+    holes_v.extend(misses_v);
+    holes_v.truncate(MAX_REPORTED_VIOLATIONS);
+    report.violations = holes_v;
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::infer_part_role;
+
+    fn roles(ids: &[String]) -> Vec<PartRole> {
+        ids.iter().map(|id| infer_part_role(id, None)).collect()
+    }
+
+    fn lm_1024() -> Landmarks {
+        Landmarks {
+            eye_r: Point { x: 400.0, y: 360.0 },
+            eye_l: Point { x: 624.0, y: 360.0 },
+            mouth: Point { x: 512.0, y: 492.0 },
+            chin: Point { x: 512.0, y: 560.0 },
+            crown: Point { x: 512.0, y: 120.0 },
+        }
+    }
+
+    #[test]
+    fn embedded_pose_envelope_covers_full_param_ranges_and_combinations() {
+        let env = pose_envelope();
+        assert_eq!(env.version, 1);
+        assert_eq!(
+            env.poses.len(),
+            94,
+            "envelope size changed: update docs/tests"
+        );
+        assert_eq!(env.poses[0].name, "rest");
+        let fields = pose_field_names();
+        assert_eq!(env.ranges.len(), fields.len());
+        // Every range extreme must be reached by an `axis` pose (never shrink PARAM_DEFS).
+        for (key, &(lo, hi)) in &env.ranges {
+            for target in [lo, hi] {
+                let hit = env.poses.iter().any(|p| {
+                    let v = serde_json::to_value(&p.pose).unwrap();
+                    (v[key].as_f64().unwrap() - target).abs() < 1e-12
+                });
+                assert!(hit, "{key}={target} not in envelope");
+            }
+        }
+        let groups: HashSet<&str> = env.poses.iter().map(|p| p.group.as_str()).collect();
+        for g in [
+            "axis",
+            "headBodyOpposite",
+            "headBodySame",
+            "hairPhase",
+            "headHairBody",
+        ] {
+            assert!(groups.contains(g), "missing group {g}");
+        }
+        // Head and body truly opposite on every axis in at least one pose.
+        assert!(env
+            .poses
+            .iter()
+            .any(|p| p.pose.angle_x * p.pose.body_angle_x < 0.0
+                && p.pose.angle_y * p.pose.body_angle_y < 0.0
+                && p.pose.angle_z * p.pose.body_angle_z < 0.0));
+        // Hair phase difference: side and back swing against front.
+        assert!(env
+            .poses
+            .iter()
+            .any(|p| p.pose.hair * p.pose.hair_side < 0.0));
+        assert!(env
+            .poses
+            .iter()
+            .any(|p| p.pose.hair_side * p.pose.hair_back < 0.0));
+        // Deterministic: a second parse yields the same table.
+        let again = parse_pose_envelope(POSE_ENVELOPE_JSON).unwrap();
+        let a: Vec<_> = env
+            .poses
+            .iter()
+            .map(|p| serde_json::to_string(p).unwrap())
+            .collect();
+        let b: Vec<_> = again
+            .poses
+            .iter()
+            .map(|p| serde_json::to_string(p).unwrap())
+            .collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn envelope_parser_rejects_unknown_keys_and_out_of_range_values() {
+        let base: serde_json::Value = serde_json::from_str(POSE_ENVELOPE_JSON).unwrap();
+        let mut typo = base.clone();
+        typo["poses"][1]["params"] = serde_json::json!({ "angelX": 30 });
+        assert!(parse_pose_envelope(&typo.to_string()).is_err());
+        let mut over = base.clone();
+        over["poses"][1]["params"] = serde_json::json!({ "angleX": 45 });
+        assert!(parse_pose_envelope(&over.to_string()).is_err());
+        let mut shrunk = base;
+        shrunk["ranges"].as_object_mut().unwrap().remove("angleZ");
+        assert!(parse_pose_envelope(&shrunk.to_string()).is_err());
+    }
+
+    /// Two-layer canvas: `lower` owns x < split, `upper` owns x >= split (both visible, fg everywhere
+    /// in the band rows).
+    fn split_canvas(w: usize, h: usize, split: usize) -> (Vec<String>, Vec<Vec<u8>>, Vec<u8>) {
+        let n = w * h;
+        let mut lower = vec![0u8; n];
+        let mut upper = vec![0u8; n];
+        let mut fg = vec![0u8; n];
+        for y in 8..h - 8 {
+            for x in 8..w - 8 {
+                let i = y * w + x;
+                fg[i] = 255;
+                if x < split {
+                    lower[i] = 255;
+                } else {
+                    upper[i] = 255;
+                }
+            }
+        }
+        (
+            vec!["neck".into(), "clothes".into()],
+            vec![lower, upper],
+            fg,
+        )
+    }
+
+    fn rest_and_moved() -> Vec<EnvelopePose> {
+        vec![
+            EnvelopePose {
+                name: "rest".into(),
+                group: "rest".into(),
+                pose: Pose::default(),
+            },
+            EnvelopePose {
+                name: "moved".into(),
+                group: "test".into(),
+                pose: Pose {
+                    hair: 1.0,
+                    ..Pose::default()
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn requirement_tracks_injected_deform_and_scales_with_its_coefficients() {
+        let (w, h, split) = (96usize, 64usize, 40usize);
+        let (ids, masks, fg) = split_canvas(w, h, split);
+        let graph = extract_seam_graph(&ids, &roles(&ids), &masks, w, h);
+        assert_eq!(graph.seams.len(), 1);
+        let seam = &graph.seams[0];
+        assert_eq!(
+            (seam.upper_id.as_str(), seam.lower_id.as_str()),
+            ("clothes", "neck")
+        );
+        assert_eq!(
+            (seam.upper_role, seam.lower_role),
+            (PartRole::Clothes, PartRole::Neck)
+        );
+        assert!(seam.coupling.is_none());
+        let poses = rest_and_moved();
+        // Upper layer slides right by `k · 10px` when `hair = 1`: exposure depth must be ≈ k·10.
+        let run = |k: f64| {
+            seam_requirements_with(&graph, &masks, &fg, w, h, &poses, 0, |p, id, pose| {
+                if id == "clothes" {
+                    Point {
+                        x: p.x + k * 10.0 * pose.hair,
+                        y: p.y,
+                    }
+                } else {
+                    p
+                }
+            })
+            .remove(0)
+        };
+        let r1 = run(1.0);
+        let r2 = run(2.0);
+        assert!((r1.max_relative_displacement_px - 10.0).abs() < 1e-9);
+        assert!((r2.max_relative_displacement_px - 20.0).abs() < 1e-9);
+        assert!((r1.max_exposure_depth_px - 10.0).abs() <= 1.0, "{r1:?}");
+        assert!((r2.max_exposure_depth_px - 20.0).abs() <= 1.0, "{r2:?}");
+        assert_eq!(
+            r1.required_underlap_px,
+            (r1.max_exposure_depth_px * SEAM_SAFETY_SCALE + SEAM_SAFETY_PAD_PX).ceil() as usize
+        );
+        assert!(r2.required_underlap_px > r1.required_underlap_px);
+        assert_eq!(r1.worst_pose.as_deref(), Some("moved"));
+        // Upper slides *into* the lower layer: nothing is exposed, only the pad remains.
+        let into = seam_requirements_with(&graph, &masks, &fg, w, h, &poses, 0, |p, id, pose| {
+            if id == "clothes" {
+                Point {
+                    x: p.x - 10.0 * pose.hair,
+                    y: p.y,
+                }
+            } else {
+                p
+            }
+        })
+        .remove(0);
+        assert_eq!(into.max_exposure_depth_px, 0.0);
+        assert_eq!(
+            into.required_underlap_px,
+            SEAM_SAFETY_PAD_PX.ceil() as usize
+        );
+    }
+
+    #[test]
+    fn requirement_rescales_when_real_deform_coefficients_change() {
+        // Scaling the real `core::deform` displacement field by k must scale the measured relative
+        // displacement by exactly k: the margin is recomputed from `deform`, never hand-copied.
+        let lm = lm_1024();
+        let points: Vec<Point> = (0..9)
+            .map(|i| Point {
+                x: 470.0 + i as f64 * 10.0,
+                y: 640.0,
+            })
+            .collect();
+        let env = &pose_envelope().poses;
+        let lmr = &lm;
+        let base = |p: Point, id: &str, pose: &Pose| deform(p, id, lmr, pose);
+        let (m1, pose1) = max_relative_displacement(&points, "clothes", "neck", env, base);
+        let scaled = |k: f64| {
+            move |p: Point, id: &str, pose: &Pose| {
+                let q = deform(p, id, lmr, pose);
+                Point {
+                    x: p.x + k * (q.x - p.x),
+                    y: p.y + k * (q.y - p.y),
+                }
+            }
+        };
+        let (m2, pose2) = max_relative_displacement(&points, "clothes", "neck", env, scaled(2.0));
+        let (mh, _) = max_relative_displacement(&points, "clothes", "neck", env, scaled(0.5));
+        assert!(m1 > 1.0);
+        assert!((m2 - 2.0 * m1).abs() < 1e-6, "m1={m1} m2={m2}");
+        assert!((mh - 0.5 * m1).abs() < 1e-6, "m1={m1} mh={mh}");
+        assert_eq!(pose1, pose2);
+    }
+
+    #[test]
+    fn thin_upper_strip_moving_past_its_width_still_requires_underlap_over_the_strip() {
+        // lower `neck` x∈[8,40), thin upper `clothes` strip x∈[40,44), background beyond. The strip
+        // slides right by 12px (3× its width): the end point `b + r` lands on background, but the
+        // whole strip area it vacates must be supplied by `neck`.
+        let (w, h, split, strip) = (96usize, 32usize, 40usize, 4usize);
+        let n = w * h;
+        let mut lower = vec![0u8; n];
+        let mut upper = vec![0u8; n];
+        let mut fg = vec![0u8; n];
+        for y in 4..h - 4 {
+            for x in 8..split + strip {
+                let i = y * w + x;
+                fg[i] = 255;
+                if x < split {
+                    lower[i] = 255;
+                } else {
+                    upper[i] = 255;
+                }
+            }
+        }
+        let ids: Vec<String> = vec!["neck".into(), "clothes".into()];
+        let masks = vec![lower, upper];
+        let graph = extract_seam_graph(&ids, &roles(&ids), &masks, w, h);
+        let poses = rest_and_moved();
+        let shift = |p: Point, id: &str, pose: &Pose| {
+            if id == "clothes" {
+                Point {
+                    x: p.x + 12.0 * pose.hair,
+                    y: p.y,
+                }
+            } else {
+                p
+            }
+        };
+        let req = seam_requirements_with(&graph, &masks, &fg, w, h, &poses, 0, shift).remove(0);
+        assert!(
+            req.max_exposure_depth_px >= strip as f64 - 0.5,
+            "strip area skipped: {req:?}"
+        );
+        assert!(req.required_underlap_px >= strip, "{req:?}");
+        assert_eq!(
+            req.unsupported_samples, 0,
+            "band had supported samples: {req:?}"
+        );
+        // The coverage check walks the same band: without fill it reports misses, with the
+        // required underlap it reports none.
+        let empty = vec![vec![0u8; n]; 2];
+        let bad =
+            check_seam_coverage_with(&graph, &ids, &masks, &empty, &fg, w, h, &poses, 1, shift);
+        assert!(bad.lower_misses > 0);
+        let mut fill = vec![vec![0u8; n]; 2];
+        for y in 0..h {
+            for x in split..(split + req.required_underlap_px).min(w) {
+                let i = y * w + x;
+                if fg[i] > 0 {
+                    fill[0][i] = 255;
+                }
+            }
+        }
+        let ok = check_seam_coverage_with(&graph, &ids, &masks, &fill, &fg, w, h, &poses, 1, shift);
+        assert_eq!(ok.lower_misses, 0, "{:?}", ok.violations.first());
+
+        // A band that is entirely background (upper moves away over empty canvas only) is the
+        // only case counted as unsupported.
+        let mut fg_none = fg.clone();
+        for y in 0..h {
+            for x in split..w {
+                fg_none[y * w + x] = 0;
+            }
+        }
+        let none =
+            seam_requirements_with(&graph, &masks, &fg_none, w, h, &poses, 0, shift).remove(0);
+        assert!(none.unsupported_samples > 0);
+        assert_eq!(none.max_exposure_depth_px, 0.0);
+    }
+
+    #[test]
+    fn coverage_check_passes_with_required_fill_and_reports_locations_without_it() {
+        let (w, h, split) = (96usize, 64usize, 40usize);
+        let (ids, masks, fg) = split_canvas(w, h, split);
+        let graph = extract_seam_graph(&ids, &roles(&ids), &masks, w, h);
+        let poses = rest_and_moved();
+        let shift = |p: Point, id: &str, pose: &Pose| {
+            if id == "clothes" {
+                Point {
+                    x: p.x + 10.0 * pose.hair,
+                    y: p.y,
+                }
+            } else {
+                p
+            }
+        };
+        let req = seam_requirements_with(&graph, &masks, &fg, w, h, &poses, 0, shift).remove(0);
+        // Fill the lower layer under the upper one by the required underlap.
+        let mut fill_ok = vec![vec![0u8; w * h]; 2];
+        for y in 0..h {
+            for x in split..(split + req.required_underlap_px).min(w) {
+                let i = y * w + x;
+                if fg[i] > 0 {
+                    fill_ok[0][i] = 255;
+                }
+            }
+        }
+        let ok =
+            check_seam_coverage_with(&graph, &ids, &masks, &fill_ok, &fg, w, h, &poses, 1, shift);
+        assert!(ok.checks > 0);
+        assert_eq!(ok.lower_misses, 0, "{:?}", ok.violations.first());
+        assert_eq!(ok.holes, 0);
+
+        let empty = vec![vec![0u8; w * h]; 2];
+        let bad =
+            check_seam_coverage_with(&graph, &ids, &masks, &empty, &fg, w, h, &poses, 1, shift);
+        assert!(bad.lower_misses > 0);
+        assert_eq!(
+            bad.holes, bad.lower_misses,
+            "nothing else is underneath: every miss is a hole"
+        );
+        let v = &bad.violations[0];
+        assert_eq!(
+            (v.upper_id.as_str(), v.lower_id.as_str(), v.pose.as_str()),
+            ("clothes", "neck", "moved")
+        );
+        assert!(v.hole && v.rest_sample.x >= split as f64 - 0.5);
+        assert_eq!(bad.seams[0].lower_misses, bad.lower_misses);
+
+        // A third layer below the upper that covers the exposed band turns holes into misses only.
+        let mut ids3 = ids.clone();
+        ids3.insert(0, "hair_back_3".into());
+        let mut masks3 = vec![vec![0u8; w * h]];
+        masks3.extend(masks.iter().cloned());
+        let mut fill3 = vec![fg.clone()];
+        fill3.extend(empty.iter().cloned());
+        let graph3 = extract_seam_graph(&ids3, &roles(&ids3), &masks3, w, h);
+        let shift3 = |p: Point, id: &str, pose: &Pose| shift(p, id, pose);
+        let r3 = check_seam_coverage_with(
+            &graph3, &ids3, &masks3, &fill3, &fg, w, h, &poses, 1, shift3,
+        );
+        assert!(r3.lower_misses > 0);
+        assert_eq!(r3.holes, 0);
+    }
+
+    #[test]
+    fn seam_graph_uses_roles_for_variable_hair_and_accessories_with_continuous_polylines() {
+        let (w, h) = (64usize, 64usize);
+        let n = w * h;
+        let ids: Vec<String> = [
+            "hair_back_3",
+            "face",
+            "hair_side_L_2",
+            "hair_front_2",
+            "acc_ribbon",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut masks = vec![vec![0u8; n]; ids.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let (xf, yf) = (x as f64, y as f64);
+                let layer = if (xf - 32.0).hypot(yf - 10.0) < 6.0 {
+                    4
+                } else if yf < 20.0 && (8.0..56.0).contains(&xf) {
+                    3
+                } else if (44.0..56.0).contains(&xf) && (20.0..60.0).contains(&yf) {
+                    2
+                } else if (xf - 32.0).hypot(yf - 34.0) < 16.0 {
+                    1
+                } else if (4.0..60.0).contains(&xf) && (4.0..62.0).contains(&yf) {
+                    0
+                } else {
+                    continue;
+                };
+                masks[layer][i] = 255;
+            }
+        }
+        let graph = extract_seam_graph(&ids, &roles(&ids), &masks, w, h);
+        let pairs: Vec<(PartRole, PartRole)> = graph
+            .seams
+            .iter()
+            .map(|s| (s.upper_role, s.lower_role))
+            .collect();
+        for want in [
+            (PartRole::Face, PartRole::HairBack),
+            (PartRole::HairSideL, PartRole::Face),
+            (PartRole::HairFront, PartRole::Face),
+            (PartRole::Accessory, PartRole::HairFront),
+        ] {
+            assert!(pairs.contains(&want), "missing seam {want:?} in {pairs:?}");
+        }
+        let side = graph.find("hair_side_L_2", "face").unwrap();
+        assert!(side.boundary_len() > 10);
+        for line in &side.boundary {
+            for pair in line.windows(2) {
+                let d = (pair[0].x - pair[1].x).hypot(pair[0].y - pair[1].y);
+                assert!(d <= 1.0 + 1e-9, "polyline jump {d} in {line:?}");
+            }
+        }
+        // Every pair of layers sharing a visible edge yields exactly one seam with upper above lower.
+        for s in &graph.seams {
+            assert!(s.upper > s.lower);
+        }
+    }
+
+    #[test]
+    fn hair_sway_probe_reads_deform_behaviour() {
+        let lm = lm_1024();
+        assert!(follows_hair_sway("hat", &lm));
+        assert!(follows_hair_sway("acc_ribbon_2", &lm));
+        assert!(follows_hair_sway("hair_front_2", &lm));
+        assert!(!follows_hair_sway("acc_glasses", &lm));
+        assert!(!follows_hair_sway("face", &lm));
+    }
+
+    /// Shared Rust/TS fixture: the envelope as each side interprets it plus the max relative
+    /// displacement of fixed boundary points across the envelope using each side's `deform`.
+    /// Regenerate with `FLAT2RIG_BLESS=1 cargo test seam_envelope_parity`.
+    #[test]
+    fn seam_envelope_parity_fixture_matches_rust_deform() {
+        let lm = lm_1024();
+        let env = &pose_envelope().poses;
+        type Case = (&'static str, &'static str, Vec<(f64, f64)>);
+        let cases: Vec<Case> = vec![
+            (
+                "face",
+                "neck",
+                vec![(470.0, 560.5), (512.0, 562.5), (556.0, 548.5)],
+            ),
+            (
+                "clothes",
+                "neck",
+                vec![(470.0, 639.5), (512.0, 639.5), (558.5, 650.0)],
+            ),
+            (
+                "hair_front",
+                "face",
+                vec![(420.0, 280.5), (512.0, 325.5), (600.0, 290.5)],
+            ),
+            ("hair_side_R", "face", vec![(380.5, 360.0), (380.5, 520.0)]),
+            (
+                "hair_side_L_2",
+                "clothes",
+                vec![(650.5, 700.0), (700.0, 760.5)],
+            ),
+            ("body", "hair_back", vec![(300.5, 700.0), (724.5, 720.0)]),
+            (
+                "clothes",
+                "hair_back_3",
+                vec![(301.5, 760.0), (723.5, 780.0)],
+            ),
+            (
+                "eyeL_upper",
+                "eyeL_white",
+                vec![(610.0, 344.5), (640.0, 348.5)],
+            ),
+            ("eyeR_lower", "eyeR_iris", vec![(400.0, 378.5)]),
+            ("browL", "face", vec![(624.0, 300.5)]),
+            (
+                "mouth_upper",
+                "mouth_inner",
+                vec![(512.0, 489.5), (526.0, 491.5)],
+            ),
+            ("hat", "hair_front", vec![(512.0, 150.5)]),
+            ("acc_ribbon", "hair_back", vec![(700.0, 300.5)]),
+            ("clothes_hands", "clothes", vec![(560.0, 860.5)]),
+        ];
+        let mut out_cases = Vec::new();
+        for (upper, lower, pts) in &cases {
+            let points: Vec<Point> = pts.iter().map(|&(x, y)| Point { x, y }).collect();
+            let (m, pose) = max_relative_displacement(&points, upper, lower, env, |p, id, pose| {
+                deform(p, id, &lm, pose)
+            });
+            out_cases.push(serde_json::json!({
+                "upper": upper,
+                "lower": lower,
+                "points": pts.iter().map(|&(x, y)| serde_json::json!([x, y])).collect::<Vec<_>>(),
+                "maxRelativeDisplacementPx": m,
+                "worstPose": pose,
+            }));
+        }
+        let doc = serde_json::json!({
+            "description": "T13a Rust/TS parity: envelope poses as parsed by Rust (Pose::default() merged) and max relative seam displacement over the envelope using core::deform. TS asserts the same values with engine.ts deform.",
+            "landmarks": lm,
+            "envelope": env.iter().map(|p| serde_json::json!({ "name": p.name, "pose": p.pose })).collect::<Vec<_>>(),
+            "cases": out_cases,
+        });
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/seam-envelope-parity.json");
+        if std::env::var("FLAT2RIG_BLESS").is_ok() {
+            std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("parity fixture present"))
+                .unwrap();
+        assert_eq!(
+            fixture["envelope"], doc["envelope"],
+            "envelope interpretation drifted"
+        );
+        let fc = fixture["cases"].as_array().unwrap();
+        assert_eq!(fc.len(), out_cases.len());
+        for (a, b) in fc.iter().zip(&out_cases) {
+            assert_eq!(a["upper"], b["upper"]);
+            assert_eq!(a["lower"], b["lower"]);
+            let (x, y) = (
+                a["maxRelativeDisplacementPx"].as_f64().unwrap(),
+                b["maxRelativeDisplacementPx"].as_f64().unwrap(),
+            );
+            assert!(
+                (x - y).abs() < 1e-9,
+                "{} / {}: fixture {x} vs rust {y}",
+                a["upper"],
+                a["lower"]
+            );
+        }
+    }
+}

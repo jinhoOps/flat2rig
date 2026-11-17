@@ -1372,7 +1372,7 @@ pub fn infer_part_role(id: &str, explicit_role: Option<PartRole>) -> PartRole {
 
 /// Within the `eye` role, the white/iris sublayers are the ones occluded by lids/brows and need
 /// gaze-travel underlap; lids/lashes are occluders and use the generic radius.
-fn is_eye_occluded_sublayer(id: &str) -> bool {
+pub(crate) fn is_eye_occluded_sublayer(id: &str) -> bool {
     id.ends_with("_white") || id.ends_with("_iris")
 }
 

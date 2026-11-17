@@ -14,6 +14,7 @@ import {
   meshFor,
   meshForPart,
   paint,
+  maxSeamRelativeDisplacement,
   partOverlapMargins,
   recommendedFillRadius,
   separate,
@@ -48,6 +49,8 @@ import {
   type Project,
 } from "../src/types";
 import fillRadiusParity from "./fixtures/fill-radius-parity.json";
+import seamEnvelopeParity from "./fixtures/seam-envelope-parity.json";
+import { POSE_ENVELOPE, POSE_ENVELOPE_RANGES } from "../src/rig/poseEnvelope";
 import {
   createCustomExpression,
   createUndoHistory,
@@ -1830,5 +1833,75 @@ describe("preserved part merging on regeneration", () => {
     for (const id of ["hair_front_2", "hair_side_L_2", "hair_side_R_3", "hair_back_3"]) {
       expect(ids).toContain(id);
     }
+  });
+
+  it("T13a pose envelope keeps every PARAM_DEFS extreme and head/body/hair phase combinations", () => {
+    // Ranges are PARAM_DEFS exactly (never shrunk) and cover every parameter.
+    expect(Object.keys(POSE_ENVELOPE_RANGES).sort()).toEqual(Object.keys(REST).sort());
+    for (const def of PARAM_DEFS) {
+      expect(POSE_ENVELOPE_RANGES[def.key as keyof typeof REST], def.key).toEqual([def.min, def.max]);
+      for (const extreme of [def.min, def.max]) {
+        expect(
+          POSE_ENVELOPE.some((p) => p.params[def.key as keyof typeof REST] === extreme),
+          `${def.key}=${extreme}`,
+        ).toBe(true);
+      }
+    }
+    expect(PARAM_DEFS.length).toBe(Object.keys(REST).length);
+    const names = new Set(POSE_ENVELOPE.map((p) => p.name));
+    expect(names.size).toBe(POSE_ENVELOPE.length);
+    expect(POSE_ENVELOPE.length).toBe(94);
+    for (const p of POSE_ENVELOPE) {
+      for (const def of PARAM_DEFS) {
+        const v = p.params[def.key as keyof typeof REST];
+        expect(v, `${p.name}.${def.key}`).toBeGreaterThanOrEqual(def.min);
+        expect(v, `${p.name}.${def.key}`).toBeLessThanOrEqual(def.max);
+      }
+    }
+    expect(
+      POSE_ENVELOPE.some(
+        (p) =>
+          p.params.angleX * p.params.bodyAngleX < 0 &&
+          p.params.angleY * p.params.bodyAngleY < 0 &&
+          p.params.angleZ * p.params.bodyAngleZ < 0,
+      ),
+    ).toBe(true);
+    expect(POSE_ENVELOPE.some((p) => p.params.hair * p.params.hairSide < 0)).toBe(true);
+    expect(POSE_ENVELOPE.some((p) => p.params.hairSide * p.params.hairBack < 0)).toBe(true);
+  });
+
+  it("T13a envelope and seam relative displacement match Rust (shared parity fixture)", () => {
+    const fixture = seamEnvelopeParity as unknown as {
+      landmarks: Landmarks;
+      envelope: { name: string; pose: Record<string, number> }[];
+      cases: {
+        upper: string;
+        lower: string;
+        points: [number, number][];
+        maxRelativeDisplacementPx: number;
+        worstPose: string | null;
+      }[];
+    };
+    // Rust parses the same JSON over Pose::default(); TS merges over REST. Both must agree.
+    expect(fixture.envelope.map((e) => e.name)).toEqual(POSE_ENVELOPE.map((p) => p.name));
+    fixture.envelope.forEach((e, i) => {
+      expect(POSE_ENVELOPE[i].params, e.name).toEqual(e.pose);
+    });
+    expect(fixture.cases.length).toBeGreaterThan(10);
+    for (const c of fixture.cases) {
+      const got = maxSeamRelativeDisplacement(
+        c.points.map(([x, y]) => ({ x, y })),
+        { id: c.upper },
+        { id: c.lower },
+        fixture.landmarks,
+      );
+      expect(Math.abs(got.maxPx - c.maxRelativeDisplacementPx), `${c.upper}/${c.lower}`).toBeLessThan(1e-6);
+    }
+    // Scaling the deform displacement field scales the measured requirement (no copied constants).
+    const c0 = fixture.cases.find((c) => c.upper === "clothes" && c.lower === "neck")!;
+    const pts = c0.points.map(([x, y]) => ({ x, y }));
+    const base = maxSeamRelativeDisplacement(pts, { id: "clothes" }, { id: "neck" }, fixture.landmarks);
+    expect(base.maxPx).toBeGreaterThan(1);
+    expect(base.worstPose).toBe(c0.worstPose);
   });
 });

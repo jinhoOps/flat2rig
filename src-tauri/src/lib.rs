@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod core;
 pub mod inference;
+pub mod rig;
 pub mod updater;
 use analysis::{
     detector::{detect_faces, FaceCandidate, DEFAULT_FACE_SCORE_THRESHOLD},

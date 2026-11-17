@@ -140,7 +140,7 @@
 | 순서 | ID | 작업 | 상태 | 이 순서인 이유 |
 | --- | --- | --- | --- | --- |
 | 1 | T8 | 부위별 모션 비례 겹침 여유분 | 1차 구현(`79610ec`), Windows 미검증 | 틈 방지의 최소 조건 |
-| 2 | T13 | 이음새 계약(`SeamGraph`)·노출 맵(`ExposureMap`)·결합 변형 | 계획 | T8 상수 복제를 대체하고, 이후 모든 작업의 기준 영역(노출 밴드)을 제공 |
+| 2 | T13 | 이음새 계약(`SeamGraph`)·노출 맵(`ExposureMap`)·결합 변형 | T13a 구현(이음새 계약·포즈 포락선·수치 여유분·커버리지 검사, 테스트 통과, Windows 원화 모션 미검증) · T13b 계획(노출 맵·결합 변형·출력) | T8 상수 복제를 대체하고, 이후 모든 작업의 기준 영역(노출 밴드)을 제공 |
 | 3 | T14 | 원본감 평가 하네스(정답 PSD·자기 지도 홀드아웃) | 계획 | 합성기를 바꾸기 전에 현 기준선을 측정해야 개선을 판정할 수 있음 |
 | 4 | T9 | 경계 후광 제거·`fillKind` 분류·`flat/cel` 팔레트 필드 | 계획 | 넓어진 T8 밴드가 오염된 시드로 칠해지는 문제를 먼저 해소 |
 | 5 | T10 | 눈·입 클리핑 밀폐 | 계획 | T9 텍스처 위에서 클리핑 정합 |
@@ -155,7 +155,7 @@
 
 상태: `79610ec`에서 `core::part_overlap_margins` / `engine.ts` `partOverlapMargins` / `recommended_fill_radius`와 `templates.rs` 적용부가 반영되었다. Windows 원화 모션 검증 기록은 없다(`미검증`). 2026-11-18 검수에서 아래 재검수 항목을 확인했고, 구조적 해결은 T13에서 한다.
 
-- **상수 복제**: `deform` 계수를 폐형식으로 옮겨 적어 같은 상수가 Rust `deform`·Rust 여유분·TS 여유분 세 곳에 있다. `deform`을 수정하면 여유분이 조용히 어긋난다.
+- **상수 복제**: `deform` 계수를 폐형식으로 옮겨 적어 같은 상수가 Rust `deform`·Rust 여유분·TS 여유분 세 곳에 있다. `deform`을 수정하면 여유분이 조용히 어긋난다. → T13a에서 템플릿 숨은 영역 생성은 `deform` 수치 샘플링 여유분으로 바뀌었고, 폐형식은 이음새가 없을 때의 폴백(`part_overlap_margins`/`partOverlapMargins`, 수동 보정 반경)으로만 남는다. 폴백 자체의 상수 복제는 그대로다.
 - **검증 표본 부족**: 테스트가 목-옷깃 1점, 옆머리-앞머리 1점, 단일 포즈만 확인한다. 이음새 전체 경계와 포즈 포락선의 최댓값을 보장하지 않는다.
 - **역할 기반 위반** (`2a` 구현됨 · 테스트 통과, Windows 원화 모션 `미검증`): Rust `recommended_fill_radius`는 ID 접두사로, TS `recommendedFillRadius`는 `role`과 ID 접두사를 섞어 분기했다. 이제 양쪽 모두 `role`(명시 역할 우선, 없으면 Rust `core::infer_part_role` / TS `inferPartRole` 한 곳의 ID→역할 폴백)으로만 분기한다. `hair_back` → `hair_back_underlap`, `hair_front`·`hair_side_L/R` → `max(hair_side_front_seam, hair_hat_root)`, `neck` → `max(neck_collar_x, neck_collar_y, neck_chin_y)`, `face`(`face_detail` 포함) → `face_scalp_margin`, `body`·`clothes`·`hands` → `clothes_hair_underlap`, `eye` 중 `_white`/`_iris` → `max(eye_gaze_x, eye_gaze_y)`, 그 외 → `max(6, ceil(max(8, eye_dist)·0.08))`. 공유 표 `tests/fixtures/fill-radius-parity.json`(해상도 4종 × 가변 머리카락 `hair_front_2`·`hair_side_L_2`·`hair_side_R_3`·`hair_back_3` 등 52파츠, 역할 추론 표 포함)을 `cargo test`와 `tests/pipeline.test.ts`가 함께 읽어 같은 반경을 단언한다. 여유분 값은 바꾸지 않았다(역할과 ID가 일치하는 항목은 2a 이전 TS 값과 동일). 변경된 동작은 명시 역할이 ID 접두사와 충돌할 때 역할이 이긴다는 점뿐이며, 이전 Rust에서 `face_detail`이 일반 반경으로 떨어지던 TS 불일치도 해소됐다. 남은 제한: 눈 흰자/홍채 구분은 `eye` 역할 안의 ID 접미사에 의존하고, `templates.rs` `apply_motion_proportional_underlaps`의 ID 기반 이음새 적용과 상수 복제는 T13 범위로 남는다.
 - **품질 트레이드오프**: 여유분이 넓어질수록 시드에서 먼 조화 보간 픽셀이 늘어나 노출 시 뭉개진 영역이 커진다. T9·T14 없이 여유분만 더 키우지 않는다.
@@ -177,6 +177,19 @@
 선행: T8. 주요 파일: `src-tauri/src/core.rs`, `src/engine.ts`, `src-tauri/src/analysis/templates.rs`, `src/types.ts`, `src/rig/evaluate.ts`. 신규 모듈 제안: `src-tauri/src/rig/seams.rs`(또는 `core.rs` 내 분리 모듈).
 
 목적: 여유분·숨은 영역 생성·노출 평가·T12 검사가 공유하는 **단일 이음새 기준**을 만든다. 손으로 옮긴 변형 상수를 없앤다.
+
+상태 (2026-11-18):
+
+- **T13a 구현 · `cargo test` 43/43, `npm test` 42/42, `tsc` 통과 · Windows 원화 모션 `미검증`** (아래 "작업"의 앞 세 항목과 완료 조건 (1)·(2)·(4) 일부).
+  - **이음새 계약**: `src-tauri/src/rig/seams.rs` `extract_seam_graph`가 상하 순서 레이어의 가시 마스크에서 4-인접 경계를 공유하는 모든 쌍을 `SeamContract { upper, lower, upperRole, lowerRole, boundary(폴리라인), coupling: None }`으로 추출한다. 역할은 `core::infer_part_role`이며 `hair_front_2`·`hair_side_L_2`·`hair_back_3`·액세서리가 고정 18개 표 밖에서도 들어온다. 프로젝트에 저장하지 않고 합성 때마다 다시 계산한다. `coupling`은 T13b 자리다.
+  - **포즈 포락선**: `src/rig/pose-envelope.json` 94포즈(휴지 1, 각 축 극값 38, 머리/몸 반대 14·같은 방향 8, 머리카락 위상 부호조합 8·120° 3상 6, 머리+몸+머리카락 결합 8, 시선/눈 5, 눈썹 4, 입 2). Rust는 `include_str!`로, TS는 `src/rig/poseEnvelope.ts`로 같은 파일을 읽는다. 범위가 `PARAM_DEFS`와 같고 모든 극값이 포함되는지(TS), 미지 키·범위 밖 값 거부(Rust), Rust `Pose::default()` 병합 결과와 TS `REST` 병합 결과의 동일성(공유 fixture `tests/fixtures/seam-envelope-parity.json`)을 테스트한다.
+  - **수치 여유분**: `seam_requirements`가 이음새 경계점 b마다 실제 `core::deform`으로 상위 경계가 놓이는 위치 `yu = deform(upper)(b)`에 하위 레이어가 보여 줄 휴지 좌표 `x_l = deform(lower)⁻¹(yu)`(고정점 역변환, 수렴 실패 시 `b + r`)를 구한 뒤 `b → x_l` 노출 띠를 1px 간격으로 걸으며, 지원되는 표본(전경이면서 휴지 소유자가 하위이거나 그보다 위)의 하위 가시 마스크 바깥 거리 최댓값을 깊이로 취해 `ceil(깊이 × 1.25 + 2px)`을 필요 언더랩으로 쓴다. 띠 전체에 지원 표본이 없을 때만 `unsupportedSamples`로 센다. 띠 정의와 지원 판정은 `walk_exposed_band` 헬퍼 하나를 요구량 계산과 커버리지 검사가 함께 쓴다(리뷰 수정: 처음 구현은 끝점 `b + r` 한 점만 보고 끝점이 배경이면 표본을 버려, 자기 폭보다 크게 물러나는 얇은 상위 띠 아래를 놓쳤다. 회귀 테스트 `thin_upper_strip_moving_past_its_width_still_requires_underlap_over_the_strip`). 안전 계수는 `deform` 계수가 아니다. `templates.rs` `apply_motion_proportional_underlaps`는 이 값을 상위 레이어별 반경으로 쓰고(이음새가 없는 쌍만 하위 최댓값, 하위에 이음새가 전혀 없으면 `part_overlap_margins` 폴백), 맨해튼 팽창에는 `×√2`를 적용한다. 고정 px 상한(48~144)은 머리 높이 1개 분량의 이상치 상한으로 바꿨다. 이 경로에 `deform` 계수 복제는 없다(`deform` 변위장을 k배 하면 상대 변위가 정확히 k배가 되는 테스트, 주입 변형 평행이동 t에 대해 깊이 ≈ t인 테스트).
+  - **역할 기반 적용**: `templates.rs` 적용부의 ID 분기(`idx_by_id("face")`, `starts_with("hair_side")` 등)를 역할로 바꿨다. 역할의 기준 레이어는 그 역할의 가장 아래 레이어(`face` 아래 `face_detail`)다. 머리 착용물은 `Hat` 또는 `deform`이 머리카락 흔들림에 반응하는 `Accessory`(ID가 아니라 `deform` 탐침)로 판정한다. 눈 상자 좌우는 레이어 중심 위치로 고른다.
+  - **동작 변경**: 얼굴 기준 레이어의 숨은 영역이 이제 눈·입 레이어 아래도 이음새 요구량만큼 채운다. 변경 전 1024px 합성 fixture에서 눈·얼굴 이음새 배경 노출 42건이 나왔고, 변경 후 0건이다. 의상 기준 레이어는 `hands`/`hands_*`(역할 `hands`) 아래도 채운다.
+  - **커버리지 검사**: `check_seam_coverage`가 경계점 × 포락선 포즈마다 상위 경계가 움직여 드러나는 띠(b에서 하위 변형의 역상까지)를 하위 유효 마스크(`mask ∪ fillMask`)가 덮는지 검사하고, 못 덮으면 다른 레이어(변형 역상)가 덮는지까지 확인해 `lowerMisses`(계약 위반)와 `holes`(배경 노출)를 위치·포즈와 함께 보고한다. 1024px 합성 fixture(가변 머리카락 포함 23개 레이어, 이음새 55개 · 경계점 4,688개 중 1/2 표본 2,355개 × 94포즈 = 221,370 검사): `holes` 0, `lowerMisses` 3,742(모두 다른 레이어가 덮음; 대부분 어깨 밖으로 늘어진 옆머리 아래를 `clothes`가 덮지 않는 경우). 수치표는 [validation.md](validation.md) T13a 절.
+  - TS는 숨은 영역 고급 합성을 하지 않으므로 이음새 그래프를 두지 않는다. 대신 포락선 표와 `maxSeamRelativeDisplacement`(같은 의미)를 두고, Rust/TS `deform`의 포락선 전체 상대 변위가 14개 역할 쌍에서 `1e-6` 안으로 같음을 fixture로 확인한다. `partOverlapMargins`/`part_overlap_margins`·`recommendedFillRadius`/`recommended_fill_radius`는 랜드마크만 있을 때의 폴백(수동 보정 반경)으로 남는다.
+  - **T13b(`ExposureMap`)에서 노출 기준으로 처리할 미해결 항목**: 커버리지 `lowerMisses` 중 앞머리가 눈썹·윗눈꺼풀 위에서 움직이는 경우(`hair_front`/`browR` 63건, `hair_front`/`browL` 81건, `hair_front`/`eyeR_upper` 26건, `hair_front`/`eyeL_upper` 29건, `hair_front_2`/`eyeR_upper` 44건)는 배경 구멍은 아니지만, 눈썹·눈꺼풀에 숨은 영역이 없어 그 자리에 얼굴 피부가 보이는 상태다. 이 이음새들의 측정 요구량(눈썹 31–32px, 윗눈꺼풀 54–58px)은 계산되지만 `templates.rs`에 `Brow`/눈꺼풀을 하위로 받는 확장 블록이 없어 **쓰이지 않는다**. 피부가 보이는 것이 허용 가능한지, 눈썹·눈꺼풀 숨은 영역을 만들지는 노출 빈도·깊이를 기준으로 T13b에서 판단한다.
+  - 남은 제한: (a) 깊이는 경계점마다 하위 역변환 1개 띠로 측정하며 ArtMesh 삼각형 보간을 렌더링해 검사하지 않는다. (b) 포락선에 사용자 눈·입 모양 조정(`ShapeDeformInput`)은 넣지 않았다. (c) `deform` 자체의 ID 분기와 눈 흰자/홍채 구분(ID 접미사)은 그대로다. (d) 실제 원화 3종·Windows 앱 모션 검증 없음(`미검증`). (e) 노출 맵·결합 변형·CLI/오버레이 출력은 T13b.
 
 작업:
 

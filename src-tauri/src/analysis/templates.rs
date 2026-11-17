@@ -7,6 +7,7 @@
 
 use crate::analysis::landmarks::Landmark28Point;
 use crate::core::{HeadFrame, Landmarks};
+use crate::rig::seams;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use glam::DVec2;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
@@ -319,10 +320,18 @@ fn erode_mask(src: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
 
 /// Dilates boolean mask outward up to `radius` pixels (Manhattan/4-connected BFS).
 fn dilate_mask(src: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
-    let n = w * h;
     if radius == 0 {
         return src.to_vec();
     }
+    dilation_distance(src, w, h, radius)
+        .into_iter()
+        .map(|d| d != u16::MAX && d as usize <= radius)
+        .collect()
+}
+
+/// 4-connected BFS distance from `src` pixels, explored up to `radius` (`u16::MAX` beyond it).
+fn dilation_distance(src: &[bool], w: usize, h: usize, radius: usize) -> Vec<u16> {
+    let n = w * h;
     let mut dist = vec![u16::MAX; n];
     let mut q = VecDeque::new();
     for i in 0..n {
@@ -353,7 +362,7 @@ fn dilate_mask(src: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
             }
         }
     }
-    (0..n).map(|i| dist[i] as usize <= radius).collect()
+    dist
 }
 
 /// Builds a fast multi-grid harmonic color field from clean interior seed pixels.
@@ -5706,13 +5715,15 @@ pub fn synthesize_template_bank_for_stage(
         }
     }
 
-    // Expand per-part hidden underlaps proportional to HeadFrame resolution and max opposing deform motion.
+    // Expand per-part hidden underlaps by the seam requirements measured from `deform` over the shared
+    // pose envelope (T13a); `margins` (`core::part_overlap_margins`) is only the no-seam fallback.
     apply_motion_proportional_underlaps(
         &final_layer_ids,
         &final_visible_masks,
         &mut final_tpl_masks,
         &ev,
         frame,
+        landmarks,
         margins,
         center_clothes_top_v,
         (er_u, er_v, er_rx, er_ry),
@@ -6452,9 +6463,12 @@ pub fn synthesize_template_bank_for_stage(
     }
 }
 
-/// Expands per-part hidden occlusion underlaps (`final_tpl_masks`) proportional to `HeadFrame`
-/// resolution and worst-case opposing motion in `core::deform_with_shapes`, while preserving strict
-/// rest-pose foreground (`fg_alpha > 0`) and bottom-to-top Z-order visibility (`q > p`).
+/// Expands per-part hidden occlusion underlaps (`final_tpl_masks`) by the per-seam requirement
+/// measured from the real `core::deform` over the shared pose envelope (`rig::seams`, T13a).
+/// `core::part_overlap_margins` (`fallback`) is used only where a part has no matching seam.
+/// Layers are addressed by role (`core::infer_part_role`), not by ID, so variable hair strands
+/// (`hair_front_2`, `hair_side_L_3`, ...), hats, and accessories participate. Strict rest-pose
+/// foreground (`fg_alpha > 0`) and bottom-to-top Z-order visibility (`q > p`) are preserved.
 #[allow(clippy::too_many_arguments)]
 fn apply_motion_proportional_underlaps(
     final_layer_ids: &[String],
@@ -6462,7 +6476,8 @@ fn apply_motion_proportional_underlaps(
     final_tpl_masks: &mut [Vec<u8>],
     ev: &AnalyzedEvidence,
     frame: HeadFrame,
-    margins: crate::core::PartOverlapMargins,
+    landmarks: &Landmarks,
+    fallback: crate::core::PartOverlapMargins,
     center_clothes_top_v: f64,
     eye_r_box: (f64, f64, f64, f64),
     eye_l_box: (f64, f64, f64, f64),
@@ -6471,6 +6486,7 @@ fn apply_motion_proportional_underlaps(
     h: usize,
     stage: &str,
 ) {
+    use crate::core::PartRole as R;
     if stage == "base_silhouette" {
         return;
     }
@@ -6481,6 +6497,50 @@ fn apply_motion_proportional_underlaps(
     let shoulder_hw = (ev.metrics.shoulder_width_ratio * eye_dist).clamp(eye_dist * 1.18, eye_dist * 2.55);
     let face_rx_max = eye_dist * if ev.is_sd { 1.48 } else { 1.28 };
 
+    let roles: Vec<R> = final_layer_ids
+        .iter()
+        .map(|id| crate::core::infer_part_role(id, None))
+        .collect();
+    let seam_graph = seams::extract_seam_graph(final_layer_ids, &roles, final_visible_masks, w, h);
+    let table = seams::SeamMarginTable::new(seams::seam_requirements(
+        &seam_graph,
+        final_visible_masks,
+        &ev.fg_alpha,
+        landmarks,
+        w,
+        h,
+        &seams::pose_envelope().poses,
+        seams::DEFAULT_MAX_SAMPLES_PER_SEAM,
+    ));
+    // Requirements are Euclidean; `dilate_mask` is 4-connected (Manhattan), so a Euclidean reach
+    // `r` needs Manhattan radius `r·√2` along diagonals. One head height is only a sanity bound
+    // against degenerate seams, not a motion limit.
+    let radius_cap = hh.ceil() as usize;
+    let dil = |euclid: usize| (((euclid as f64) * std::f64::consts::SQRT_2).ceil() as usize).min(radius_cap);
+    // Head-mounted wear = hats + accessories whose `deform` follows hair sway (probe, not ID).
+    let head_wear: Vec<bool> = (0..final_len)
+        .map(|q| match roles[q] {
+            R::Hat => true,
+            R::Accessory => seams::follows_hair_sway(&final_layer_ids[q], landmarks),
+            _ => false,
+        })
+        .collect();
+    // Per-upper reach (Euclidean px) of a lower layer's fill: the measured requirement of the seam
+    // it shares with that upper, else `default` (the lower's max over accepted uppers, or fallback).
+    let reach_for = |lower: usize, default: usize| -> Vec<usize> {
+        (0..final_len)
+            .map(|q| table.need(lower, |qq, _| qq == q).unwrap_or(default))
+            .collect()
+    };
+    let max_dil = |lower: usize, reach: &[usize]| -> usize {
+        ((lower + 1)..final_len).map(|q| dil(reach[q])).max().unwrap_or(0)
+    };
+    let within = |dist: &[u16], i: usize, reach_px: usize| dist[i] != u16::MAX && dist[i] as usize <= dil(reach_px);
+    let is_hair = |r: R| matches!(r, R::HairFront | R::HairSideL | R::HairSideR | R::HairBack);
+    let is_front_or_side = |r: R| matches!(r, R::HairFront | R::HairSideL | R::HairSideR);
+    // The base layer of a role is its bottom-most layer (e.g. `face` under `face_detail`).
+    let base_of = |role: R| roles.iter().position(|&r| r == role);
+
     let mut vis_owner = vec![None::<usize>; n];
     for (p, vm) in final_visible_masks.iter().enumerate() {
         for (i, &a) in vm.iter().enumerate() {
@@ -6489,38 +6549,30 @@ fn apply_motion_proportional_underlaps(
             }
         }
     }
-    let idx_by_id = |target: &str| final_layer_ids.iter().position(|id| id == target);
     let mask_bool = |m: &[u8]| m.iter().map(|&v| v > 0).collect::<Vec<bool>>();
-    let can_hair_underlap_q = |qid: &str, v: f64| -> bool {
-        if qid == "hat" || qid == "acc_hairpin" || qid == "acc_ribbon" || qid.starts_with("acc_ribbon") {
-            v >= frame.crown_v - hh * 0.08
-        } else {
-            false
-        }
-    };
+    let can_hair_underlap_q = |q: usize, v: f64| -> bool { head_wear[q] && v >= frame.crown_v - hh * 0.08 };
+    let face_base = base_of(R::Face);
 
-    // 1. Face: continuous forehead/temples/scalp up behind bangs, brows, side locks, and hat brim.
-    if let Some(fi) = idx_by_id("face") {
+    // 1. Face: continuous forehead/temples/scalp up behind bangs, brows, side locks, and hat brim,
+    // plus the skin under eye and mouth layers that blink/gaze/mouth motion uncovers (T13a seams).
+    if let Some(fi) = face_base {
+        let face_upper_ok = |q: usize, r: R| {
+            matches!(
+                r,
+                R::Hat | R::Accessory | R::HairFront | R::HairSideL | R::HairSideR | R::Brow | R::Hands | R::Eye | R::Mouth
+            ) || (r == R::Face && q != fi)
+        };
+        let face_r = table.need(fi, face_upper_ok).unwrap_or(fallback.face_scalp_margin);
+        let reach = reach_for(fi, face_r);
         let face_vis = mask_bool(&final_visible_masks[fi]);
-        let face_dil = dilate_mask(&face_vis, w, h, margins.face_scalp_margin.min(96));
+        let face_dist = dilation_distance(&face_vis, w, h, max_dil(fi, &reach));
         let eye_low_v = eye_r_box.1.max(eye_l_box.1) + hh * 0.14;
-        for (i, &dil) in face_dil.iter().enumerate() {
-            if !dil || ev.fg_alpha[i] == 0 {
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
                 continue;
             }
             let Some(q) = vis_owner[i] else { continue };
-            if q <= fi {
-                continue;
-            }
-            let qid = final_layer_ids[q].as_str();
-            if !(qid == "hat"
-                || qid.starts_with("acc_")
-                || qid.starts_with("hair_front")
-                || qid.starts_with("hair_side")
-                || qid.starts_with("brow")
-                || qid == "clothes_hands"
-                || qid == "face_detail")
-            {
+            if q <= fi || !face_upper_ok(q, roles[q]) || !within(&face_dist, i, reach[q]) {
                 continue;
             }
             let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
@@ -6528,16 +6580,25 @@ fn apply_motion_proportional_underlaps(
                 continue;
             }
             let fd = face_sdf(u, v, frame, ev);
-            if fd <= margins.face_scalp_margin as f64 * 0.65
-                || (v <= eye_low_v && u.abs() <= face_rx_max)
-            {
+            if fd <= reach[q] as f64 * 0.65 || (v <= eye_low_v && u.abs() <= face_rx_max) {
                 final_tpl_masks[fi][i] = final_tpl_masks[fi][i].max(ev.fg_alpha[i]);
             }
         }
     }
 
     // 2. Neck: extend behind chin (head look-up/tilt) and down/sideways deep behind collar & chest clothes.
-    if let Some(ni) = idx_by_id("neck") {
+    if let Some(ni) = base_of(R::Neck) {
+        let chin = table
+            .need(ni, |_, r| r == R::Face)
+            .unwrap_or(fallback.neck_chin_y);
+        let collar = table
+            .need(ni, |_, r| matches!(r, R::Clothes | R::Body | R::Hands))
+            .unwrap_or(fallback.neck_collar_x.max(fallback.neck_collar_y));
+        let neck_r = table
+            .need(ni, |_, _| true)
+            .unwrap_or(fallback.neck_collar_x.max(fallback.neck_collar_y).max(fallback.neck_chin_y))
+            .max(chin)
+            .max(collar);
         let cx = ev.torso_cx_u * 0.35;
         let base_neck_rx = eye_dist * if ev.is_sd { 0.19 } else { 0.27 };
         let mut obs_neck_rx = base_neck_rx;
@@ -6553,21 +6614,17 @@ fn apply_motion_proportional_underlaps(
         let neck_seed: Vec<bool> = (0..n)
             .map(|i| final_visible_masks[ni][i] > 0 || final_tpl_masks[ni][i] > 0)
             .collect();
-        let neck_r = margins
-            .neck_collar_x
-            .max(margins.neck_collar_y)
-            .max(margins.neck_chin_y)
-            .min(128);
-        let neck_dil = dilate_mask(&neck_seed, w, h, neck_r);
-        let neck_top = frame.chin_v - margins.neck_chin_y as f64;
+        let reach = reach_for(ni, neck_r);
+        let neck_dist = dilation_distance(&neck_seed, w, h, max_dil(ni, &reach));
+        let neck_top = frame.chin_v - chin as f64;
         let neck_bot = (frame.chin_v + hh * if ev.is_sd { 0.34 } else { 0.56 })
-            .max(center_clothes_top_v + margins.neck_collar_y as f64);
-        for (i, &dil) in neck_dil.iter().enumerate() {
-            if !dil || ev.fg_alpha[i] == 0 {
+            .max(center_clothes_top_v + collar as f64);
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
                 continue;
             }
             let Some(q) = vis_owner[i] else { continue };
-            if q <= ni {
+            if q <= ni || !within(&neck_dist, i, reach[q]) {
                 continue;
             }
             let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
@@ -6575,8 +6632,7 @@ fn apply_motion_proportional_underlaps(
                 continue;
             }
             let chin_taper = 0.72 + 0.28 * smoothstep(neck_top, frame.chin_v + hh * 0.08, v);
-            let flare = smoothstep(frame.chin_v + hh * 0.06, neck_bot, v)
-                * (margins.neck_collar_x as f64 * 0.65);
+            let flare = smoothstep(frame.chin_v + hh * 0.06, neck_bot, v) * (collar as f64 * 0.65);
             let max_rx = (obs_neck_rx * chin_taper + flare).clamp(eye_dist * 0.18, eye_dist * 0.75);
             if (u - cx).abs() <= max_rx {
                 final_tpl_masks[ni][i] = final_tpl_masks[ni][i].max(ev.fg_alpha[i]);
@@ -6585,13 +6641,16 @@ fn apply_motion_proportional_underlaps(
     }
 
     // 3. Clothes: bridge behind draping hair locks & sublayers horizontally and expand proportionally.
-    if let Some(ci) = idx_by_id("clothes") {
+    if let Some(ci) = base_of(R::Clothes) {
+        let cl_upper_ok = |_: usize, r: R| matches!(r, R::Clothes | R::Hands | R::Hat | R::Accessory) || is_hair(r);
+        let cl_r = table.need(ci, cl_upper_ok).unwrap_or(fallback.clothes_hair_underlap);
+        // Sub-garments and hands always occlude clothes; hair and wear only below the local collar.
+        let is_sub_garment = |q: usize| matches!(roles[q], R::Clothes | R::Hands);
+        let is_draping = |q: usize| is_hair(roles[q]) || matches!(roles[q], R::Hat | R::Accessory);
         let cl_seed: Vec<bool> = (0..n)
             .map(|i| final_visible_masks[ci][i] > 0 || final_tpl_masks[ci][i] > 0)
             .collect();
-        let bridge_max = (eye_dist * 0.90)
-            .round()
-            .max(margins.clothes_hair_underlap as f64 * 1.15) as usize;
+        let bridge_max = (eye_dist * 0.90).round().max(cl_r as f64 * 1.15) as usize;
         for y in 0..h {
             let row = y * w;
             let mut prev_x: Option<usize> = None;
@@ -6611,13 +6670,9 @@ fn apply_motion_proportional_underlaps(
                             if q <= ci {
                                 continue;
                             }
-                            let qid = final_layer_ids[q].as_str();
-                            if qid.starts_with("clothes_") {
+                            if is_sub_garment(q) {
                                 final_tpl_masks[ci][bi] = final_tpl_masks[ci][bi].max(ev.fg_alpha[bi]);
-                            } else if qid.starts_with("hair_")
-                                || qid == "hat"
-                                || qid.starts_with("acc_")
-                            {
+                            } else if is_draping(q) {
                                 let (u, v) = frame.to_local(DVec2::new(bx as f64, y as f64));
                                 let narrow_lock_gap = (x - lx) <= (eye_dist * 0.65).round() as usize;
                                 let local_top_v = sample_clothes_top_v(ev, frame, u).unwrap_or(center_clothes_top_v);
@@ -6634,19 +6689,19 @@ fn apply_motion_proportional_underlaps(
         let cl_seed2: Vec<bool> = (0..n)
             .map(|i| final_visible_masks[ci][i] > 0 || final_tpl_masks[ci][i] > 0)
             .collect();
-        let cl_dil = dilate_mask(&cl_seed2, w, h, margins.clothes_hair_underlap.min(128));
-        for (i, &dil) in cl_dil.iter().enumerate() {
-            if !dil || ev.fg_alpha[i] == 0 {
+        let reach = reach_for(ci, cl_r);
+        let cl_dist = dilation_distance(&cl_seed2, w, h, max_dil(ci, &reach));
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
                 continue;
             }
             let Some(q) = vis_owner[i] else { continue };
-            if q <= ci {
+            if q <= ci || !within(&cl_dist, i, reach[q]) {
                 continue;
             }
-            let qid = final_layer_ids[q].as_str();
-            if qid.starts_with("clothes_") {
+            if is_sub_garment(q) {
                 final_tpl_masks[ci][i] = final_tpl_masks[ci][i].max(ev.fg_alpha[i]);
-            } else if qid.starts_with("hair_") || qid.starts_with("acc_") || qid == "hat" {
+            } else if is_draping(q) {
                 let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
                 let local_top_v = sample_clothes_top_v(ev, frame, u).unwrap_or(center_clothes_top_v);
                 if v >= local_top_v
@@ -6660,7 +6715,7 @@ fn apply_motion_proportional_underlaps(
     }
 
     // 4. Body: back neck, clothes, and chest hair inside torso silhouette (strictly above hair_back).
-    if let Some(bi) = idx_by_id("body") {
+    if let Some(bi) = base_of(R::Body) {
         let body_top = frame.chin_v + hh * if ev.is_sd { 0.04 } else { 0.05 };
         for i in 0..n {
             if ev.fg_alpha[i] == 0 {
@@ -6670,17 +6725,16 @@ fn apply_motion_proportional_underlaps(
             if q <= bi {
                 continue;
             }
-            let qid = final_layer_ids[q].as_str();
             let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
             if v < body_top {
                 continue;
             }
             let du = (u - ev.torso_cx_u).abs();
-            if qid == "neck" || qid == "clothes" || qid.starts_with("clothes_") {
+            if matches!(roles[q], R::Neck | R::Clothes | R::Hands) {
                 if du <= shoulder_hw * 0.92 {
                     final_tpl_masks[bi][i] = final_tpl_masks[bi][i].max(ev.fg_alpha[i]);
                 }
-            } else if (qid.starts_with("hair_side") || qid.starts_with("hair_front"))
+            } else if is_front_or_side(roles[q])
                 && ((v >= center_clothes_top_v - hh * 0.02 && du <= shoulder_hw * 0.88)
                     || du <= eye_dist * 0.50)
                 && face_sdf(u, v, frame, ev) > 2.0
@@ -6690,118 +6744,119 @@ fn apply_motion_proportional_underlaps(
         }
     }
 
-    // 5. Eyes (`eye*_white` and `eye*_iris`): expand upward/laterally under lids, brows, and bangs for gaze & blink.
-    let gaze_r = margins.eye_gaze_x.max(margins.eye_gaze_y).min(48);
-    for (prefix, (cu, cv, rx, ry)) in [("eyeR", eye_r_box), ("eyeL", eye_l_box)] {
-        let w_id = format!("{prefix}_white");
-        let i_id = format!("{prefix}_iris");
-        if let Some(wi) = idx_by_id(&w_id) {
-            let w_vis = mask_bool(&final_visible_masks[wi]);
-            let w_dil = dilate_mask(&w_vis, w, h, gaze_r);
-            for (i, &dil) in w_dil.iter().enumerate() {
-                if !dil || ev.fg_alpha[i] == 0 {
-                    continue;
-                }
-                let Some(q) = vis_owner[i] else { continue };
-                if q <= wi {
-                    continue;
-                }
-                let qid = final_layer_ids[q].as_str();
-                if qid.starts_with("mouth") || qid == "face_detail" {
-                    continue;
-                }
-                let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
-                if (u - cu).abs() <= rx * 1.18 + margins.eye_gaze_x as f64
-                    && v >= cv - ry * 1.15 - margins.eye_gaze_y as f64
-                    && v <= cv + ry * 0.96 + margins.eye_gaze_y as f64 * 0.40
-                {
-                    final_tpl_masks[wi][i] = final_tpl_masks[wi][i].max(ev.fg_alpha[i]);
+    // 5. Eye whites & irises (occluded `eye` sublayers): expand upward/laterally under lids, brows,
+    // and bangs for gaze & blink. The eye box is chosen by the layer's own position, not its ID.
+    for p in 0..final_len {
+        if roles[p] != R::Eye || !crate::core::is_eye_occluded_sublayer(&final_layer_ids[p]) {
+            continue;
+        }
+        let is_iris = final_layer_ids[p].ends_with("_iris");
+        let (cu, cv, rx, ry) = {
+            let (mut su, mut cnt) = (0.0f64, 0usize);
+            for (i, (&a, &t)) in final_visible_masks[p].iter().zip(&final_tpl_masks[p]).enumerate() {
+                if a > 0 || t > 0 {
+                    su += frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64)).0;
+                    cnt += 1;
                 }
             }
-        }
-        if let Some(ii) = idx_by_id(&i_id) {
-            let i_vis = mask_bool(&final_visible_masks[ii]);
-            let i_dil = dilate_mask(&i_vis, w, h, gaze_r);
-            for (i, &dil) in i_dil.iter().enumerate() {
-                if !dil || ev.fg_alpha[i] == 0 {
-                    continue;
-                }
-                let Some(q) = vis_owner[i] else { continue };
-                if q <= ii {
-                    continue;
-                }
-                let qid = final_layer_ids[q].as_str();
-                if qid.starts_with("mouth") || qid == "face_detail" {
-                    continue;
-                }
-                let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
-                if (u - cu).abs() <= rx * 1.08 + margins.eye_gaze_x as f64
-                    && v >= cv - ry * 1.12 - margins.eye_gaze_y as f64
+            if cnt == 0 {
+                continue;
+            }
+            let mu = su / cnt as f64;
+            if (mu - eye_l_box.0).abs() < (mu - eye_r_box.0).abs() {
+                eye_l_box
+            } else {
+                eye_r_box
+            }
+        };
+        let gaze_r = table
+            .need(p, |_, r| !matches!(r, R::Mouth | R::Face))
+            .unwrap_or(fallback.eye_gaze_x.max(fallback.eye_gaze_y));
+        let reach = reach_for(p, gaze_r);
+        let e_vis = mask_bool(&final_visible_masks[p]);
+        let e_dist = dilation_distance(&e_vis, w, h, max_dil(p, &reach));
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
+                continue;
+            }
+            let Some(q) = vis_owner[i] else { continue };
+            if q <= p || matches!(roles[q], R::Mouth | R::Face) || !within(&e_dist, i, reach[q]) {
+                continue;
+            }
+            let gaze_px = reach[q] as f64;
+            let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
+            let inside = if is_iris {
+                (u - cu).abs() <= rx * 1.08 + gaze_px
+                    && v >= cv - ry * 1.12 - gaze_px
                     && v <= cv + ry * 0.90
-                {
-                    final_tpl_masks[ii][i] = final_tpl_masks[ii][i].max(ev.fg_alpha[i]);
-                }
+            } else {
+                (u - cu).abs() <= rx * 1.18 + gaze_px
+                    && v >= cv - ry * 1.15 - gaze_px
+                    && v <= cv + ry * 0.96 + gaze_px * 0.40
+            };
+            if inside {
+                final_tpl_masks[p][i] = final_tpl_masks[p][i].max(ev.fg_alpha[i]);
             }
         }
     }
 
-    // 6. Dynamic & canonical hair seam underlaps (`hair_front*`, `hair_side*`, `hair_back*`).
-    let front_indices: Vec<usize> = (0..final_len)
-        .filter(|&p| final_layer_ids[p].starts_with("hair_front"))
-        .collect();
-    let side_indices: Vec<usize> = (0..final_len)
-        .filter(|&p| final_layer_ids[p].starts_with("hair_side"))
-        .collect();
-    let back_indices: Vec<usize> = (0..final_len)
-        .filter(|&p| final_layer_ids[p].starts_with("hair_back"))
-        .collect();
-
-    let front_root_r = margins.hair_hat_root.max(margins.hair_side_front_seam).min(112);
-    for &fi in &front_indices {
+    // 6. Hair seam underlaps for every hair layer by role (`hair_front*`, `hair_side*`, `hair_back*`).
+    let front_root_fallback = fallback.hair_hat_root.max(fallback.hair_side_front_seam);
+    for fi in (0..final_len).filter(|&p| roles[p] == R::HairFront) {
+        let front_r = table
+            .need(fi, |q, r| r == R::HairFront || head_wear[q])
+            .unwrap_or(front_root_fallback);
+        let reach = reach_for(fi, front_r);
         let f_vis = mask_bool(&final_visible_masks[fi]);
-        let f_dil = dilate_mask(&f_vis, w, h, front_root_r);
-        for (i, &dil) in f_dil.iter().enumerate() {
-            if !dil || ev.fg_alpha[i] == 0 {
+        let f_dist = dilation_distance(&f_vis, w, h, max_dil(fi, &reach));
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
                 continue;
             }
             let Some(q) = vis_owner[i] else { continue };
-            if q <= fi {
+            if q <= fi || !within(&f_dist, i, reach[q]) {
                 continue;
             }
-            let qid = final_layer_ids[q].as_str();
             let (_, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
-            if qid.starts_with("hair_front") || can_hair_underlap_q(qid, v) {
+            if roles[q] == R::HairFront || can_hair_underlap_q(q, v) {
                 final_tpl_masks[fi][i] = final_tpl_masks[fi][i].max(ev.fg_alpha[i]);
             }
         }
     }
 
-    let side_seam_r = margins.hair_side_front_seam.max(margins.hair_hat_root).min(128);
-    for &si in &side_indices {
+    for si in (0..final_len).filter(|&p| matches!(roles[p], R::HairSideL | R::HairSideR)) {
+        let side_r = table
+            .need(si, |q, r| is_front_or_side(r) || head_wear[q])
+            .unwrap_or(front_root_fallback);
+        let reach = reach_for(si, side_r);
         let s_vis = mask_bool(&final_visible_masks[si]);
-        let s_dil = dilate_mask(&s_vis, w, h, side_seam_r);
-        for (i, &dil) in s_dil.iter().enumerate() {
-            if !dil || ev.fg_alpha[i] == 0 {
+        let s_dist = dilation_distance(&s_vis, w, h, max_dil(si, &reach));
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
                 continue;
             }
             let Some(q) = vis_owner[i] else { continue };
-            if q <= si {
+            if q <= si || !within(&s_dist, i, reach[q]) {
                 continue;
             }
-            let qid = final_layer_ids[q].as_str();
             let (_, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
-            if qid.starts_with("hair_front")
-                || qid.starts_with("hair_side")
-                || can_hair_underlap_q(qid, v)
-            {
+            if is_front_or_side(roles[q]) || can_hair_underlap_q(q, v) {
                 final_tpl_masks[si][i] = final_tpl_masks[si][i].max(ev.fg_alpha[i]);
             }
         }
     }
 
-    let back_r = margins.hair_back_underlap.min(144);
     let max_back_bridge_span = (shoulder_hw * 2.5 + eye_dist * 0.6).round() as usize;
-    for &bi in &back_indices {
+    let is_center_face = |q: usize, u: f64, v: f64| -> bool {
+        matches!(roles[q], R::Eye | R::Brow | R::Mouth)
+            || (roles[q] == R::Face
+                && (Some(q) != face_base || face_sdf(u, v, frame, ev) < -(eye_dist * 0.16)))
+    };
+    for bi in (0..final_len).filter(|&p| roles[p] == R::HairBack) {
+        let back_r = table.need(bi, |_, _| true).unwrap_or(fallback.hair_back_underlap);
+        let back_extend = table
+            .need(bi, |_, r| matches!(r, R::Neck | R::Body | R::Clothes | R::Hands))
+            .unwrap_or(fallback.neck_collar_y);
         let mut obs_back_max_v = frame.chin_v + hh * 0.12;
         for y in 0..h {
             let row = y * w;
@@ -6812,7 +6867,7 @@ fn apply_motion_proportional_underlaps(
             }
         }
         let seed_back_max_v = back_max_v.max(obs_back_max_v);
-        let effective_back_max_v = seed_back_max_v + margins.neck_collar_y as f64;
+        let effective_back_max_v = seed_back_max_v + back_extend as f64;
 
         for y in 0..h {
             let row = y * w;
@@ -6829,21 +6884,14 @@ fn apply_motion_proportional_underlaps(
                         if q <= bi {
                             continue;
                         }
-                        let qid = final_layer_ids[q].as_str();
                         let (u, v) = frame.to_local(DVec2::new(bx as f64, y as f64));
                         if v < frame.crown_v - hh * 0.04 || v > seed_back_max_v {
                             continue;
                         }
-                        let is_wear = qid == "hat" || qid.starts_with("acc_hairpin") || qid.starts_with("acc_ribbon");
-                        if is_wear && !can_hair_underlap_q(qid, v) {
+                        if head_wear[q] && !can_hair_underlap_q(q, v) {
                             continue;
                         }
-                        let is_center_face = qid == "face_detail"
-                            || qid.starts_with("eye")
-                            || qid.starts_with("brow")
-                            || qid.starts_with("mouth")
-                            || (qid == "face" && face_sdf(u, v, frame, ev) < -(eye_dist * 0.16));
-                        if !is_center_face {
+                        if !is_center_face(q, u, v) {
                             final_tpl_masks[bi][i] = final_tpl_masks[bi][i].max(ev.fg_alpha[i]);
                         }
                     }
@@ -6859,30 +6907,24 @@ fn apply_motion_proportional_underlaps(
                 v <= seed_back_max_v
             })
             .collect();
-        let hb_dil = dilate_mask(&hb_seed, w, h, back_r);
-        for (i, &dil) in hb_dil.iter().enumerate() {
-            if !dil || ev.fg_alpha[i] == 0 {
+        let reach = reach_for(bi, back_r);
+        let hb_dist = dilation_distance(&hb_seed, w, h, max_dil(bi, &reach));
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
                 continue;
             }
             let Some(q) = vis_owner[i] else { continue };
-            if q <= bi {
+            if q <= bi || !within(&hb_dist, i, reach[q]) {
                 continue;
             }
-            let qid = final_layer_ids[q].as_str();
             let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
             if v > effective_back_max_v {
                 continue;
             }
-            let is_wear = qid == "hat" || qid.starts_with("acc_hairpin") || qid.starts_with("acc_ribbon");
-            if is_wear && !can_hair_underlap_q(qid, v) {
+            if head_wear[q] && !can_hair_underlap_q(q, v) {
                 continue;
             }
-            let is_center_face = qid == "face_detail"
-                || qid.starts_with("eye")
-                || qid.starts_with("brow")
-                || qid.starts_with("mouth")
-                || (qid == "face" && face_sdf(u, v, frame, ev) < -(eye_dist * 0.16));
-            if !is_center_face {
+            if !is_center_face(q, u, v) {
                 final_tpl_masks[bi][i] = final_tpl_masks[bi][i].max(ev.fg_alpha[i]);
             }
         }
@@ -7646,6 +7688,233 @@ mod tests {
                         "fill_mask leaked to bg on {}",
                         out.part_ids[p]
                     );
+                }
+            }
+        }
+    }
+
+    /// 1024px synthetic character with variable hair layers (`hair_front_2`, `hair_side_L_2`).
+    type T13Fixture = (usize, usize, Vec<u8>, Landmarks, Vec<String>, Vec<Vec<u8>>);
+
+    fn t13_fixture_1024() -> T13Fixture {
+        let (w, h) = (1024usize, 1024usize);
+        let n = w * h;
+        let mut rgba = vec![0u8; n * 4];
+        let lm = Landmarks {
+            eye_r: Point { x: 400.0, y: 360.0 },
+            eye_l: Point { x: 624.0, y: 360.0 },
+            mouth: Point { x: 512.0, y: 492.0 },
+            chin: Point { x: 512.0, y: 560.0 },
+            crown: Point { x: 512.0, y: 120.0 },
+        };
+        let ids: Vec<String> = [
+            "hair_back",
+            "neck",
+            "clothes",
+            "face",
+            "hair_side_R",
+            "hair_side_L_2",
+            "hair_front",
+            "hair_front_2",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut masks = vec![vec![0u8; n]; ids.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let (xf, yf) = (x as f64, y as f64);
+                let in_head = ((xf - 512.0) / 180.0).hypot((yf - 340.0) / 220.0) <= 1.0;
+                let in_neck = (xf - 512.0).abs() <= 46.0 && (540.0..=660.0).contains(&yf);
+                let in_clothes = (xf - 512.0).abs() <= 210.0 && (640.0..=940.0).contains(&yf);
+                let in_front = ((xf - 512.0) / 200.0).hypot((yf - 210.0) / 115.0) <= 1.0;
+                let in_front2 = ((xf - 470.0) / 40.0).hypot((yf - 320.0) / 50.0) <= 1.0;
+                let in_side_r = (280.0..=380.0).contains(&xf) && (270.0..=720.0).contains(&yf);
+                let in_side_l = (644.0..=744.0).contains(&xf) && (270.0..=760.0).contains(&yf);
+                let in_back = ((xf - 512.0) / 260.0).hypot((yf - 520.0) / 340.0) <= 1.0;
+                let (layer, rgb) = if in_front2 {
+                    (7, [70u8, 62, 104])
+                } else if in_front {
+                    (6, [64, 58, 96])
+                } else if in_side_l {
+                    (5, [58, 52, 90])
+                } else if in_side_r {
+                    (4, [60, 54, 92])
+                } else if in_head {
+                    (3, [248, 224, 210])
+                } else if in_clothes {
+                    (2, [52, 92, 168])
+                } else if in_neck {
+                    (1, [240, 210, 194])
+                } else if in_back {
+                    (0, [52, 46, 82])
+                } else {
+                    continue;
+                };
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                masks[layer][i] = 255;
+            }
+        }
+        (w, h, rgba, lm, ids, masks)
+    }
+
+    /// T8 closed-form margin the pre-T13a code used for a seam (by lower/upper role), if any.
+    fn t8_margin_for(
+        m: &crate::core::PartOverlapMargins,
+        lower: crate::core::PartRole,
+        upper: crate::core::PartRole,
+        lower_id: &str,
+    ) -> Option<usize> {
+        use crate::core::PartRole as R;
+        match lower {
+            R::Face => Some(m.face_scalp_margin),
+            R::Neck if upper == R::Face => Some(m.neck_chin_y),
+            R::Neck => Some(m.neck_collar_x.max(m.neck_collar_y)),
+            R::Clothes => Some(m.clothes_hair_underlap),
+            R::Eye if crate::core::is_eye_occluded_sublayer(lower_id) => {
+                Some(m.eye_gaze_x.max(m.eye_gaze_y))
+            }
+            R::HairFront | R::HairSideL | R::HairSideR => {
+                Some(m.hair_hat_root.max(m.hair_side_front_seam))
+            }
+            R::HairBack => Some(m.hair_back_underlap),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn t13a_seam_requirements_drive_underlaps_and_coverage_is_reported_on_1024_artwork() {
+        let (w, h, rgba, lm, ids, masks) = t13_fixture_1024();
+        let n = w * h;
+        let out = synthesize_template_bank_for_stage(
+            &rgba,
+            w,
+            h,
+            &lm,
+            &[],
+            &ids,
+            &masks,
+            &vec!["model".into(); ids.len()],
+            &vec![0.92; ids.len()],
+            &TemplateStyleSelection::default(),
+            "full",
+        );
+        for want in ["hair_front_2", "hair_side_L_2", "hair_side_R", "hair_back", "neck", "clothes"] {
+            assert!(out.part_ids.iter().any(|id| id == want), "{want} dropped: {:?}", out.part_ids);
+        }
+        let fg: Vec<u8> = (0..n).map(|i| rgba[i * 4 + 3]).collect();
+        let roles: Vec<_> = out
+            .part_ids
+            .iter()
+            .map(|id| crate::core::infer_part_role(id, None))
+            .collect();
+        let graph = seams::extract_seam_graph(&out.part_ids, &roles, &out.masks, w, h);
+        let env = &seams::pose_envelope().poses;
+        let reqs = seams::seam_requirements(
+            &graph,
+            &out.masks,
+            &fg,
+            &lm,
+            w,
+            h,
+            env,
+            seams::DEFAULT_MAX_SAMPLES_PER_SEAM,
+        );
+        assert_eq!(reqs.len(), graph.seams.len());
+        // Variable hair layers form seams through their roles.
+        assert!(graph.seams.iter().any(|s| s.upper_id == "hair_side_L_2"));
+        assert!(graph
+            .seams
+            .iter()
+            .any(|s| s.upper_id == "hair_front_2" || s.lower_id == "hair_front_2"));
+        let m = crate::core::part_overlap_margins(&lm, w, h);
+        println!("T13A_TABLE parts={:?}", out.part_ids);
+        println!("T13A_TABLE | upper (role) | lower (role) | boundary px | max rel. disp px | max exposure depth px | numeric underlap px | T8 px | worst pose @ point |");
+        for r in &reqs {
+            let t8 = t8_margin_for(&m, r.lower_role, r.upper_role, &r.lower_id);
+            println!(
+                "T13A_TABLE | {} ({:?}) | {} ({:?}) | {} | {:.1} | {:.1} | {} | {} | {} @ {} |",
+                r.upper_id,
+                r.upper_role,
+                r.lower_id,
+                r.lower_role,
+                r.boundary_points,
+                r.max_relative_displacement_px,
+                r.max_exposure_depth_px,
+                r.required_underlap_px,
+                t8.map_or("-".to_string(), |v| v.to_string()),
+                r.worst_pose.as_deref().unwrap_or("-"),
+                r.worst_point
+                    .map_or("-".to_string(), |p| format!("({:.1},{:.1})", p.x, p.y)),
+            );
+            assert!(r.max_relative_displacement_px.is_finite());
+            assert_eq!(
+                r.required_underlap_px,
+                (r.max_exposure_depth_px * seams::SEAM_SAFETY_SCALE + seams::SEAM_SAFETY_PAD_PX).ceil()
+                    as usize
+            );
+        }
+
+        let report = seams::check_seam_coverage(
+            &graph,
+            &out.part_ids,
+            &out.masks,
+            &out.fill_masks,
+            &fg,
+            &lm,
+            w,
+            h,
+            env,
+            2,
+        );
+        println!(
+            "T13A_COVERAGE poses={} checks={} lower_misses={} holes={}",
+            report.poses, report.checks, report.lower_misses, report.holes
+        );
+        for s in report.seams.iter().filter(|s| s.lower_misses > 0) {
+            println!(
+                "T13A_COVERAGE seam {} / {}: checks={} moving={} lower_misses={} holes={} max_miss_depth={:.1}",
+                s.upper_id, s.lower_id, s.checks, s.moving_checks, s.lower_misses, s.holes, s.max_miss_depth_px
+            );
+        }
+        for v in report.violations.iter().take(16) {
+            println!(
+                "T13A_COVERAGE violation hole={} {} / {} pose={} b=({:.1},{:.1}) rest=({:.1},{:.1}) depth={:.1}",
+                v.hole,
+                v.upper_id,
+                v.lower_id,
+                v.pose,
+                v.boundary_point.x,
+                v.boundary_point.y,
+                v.rest_sample.x,
+                v.rest_sample.y,
+                v.depth_px
+            );
+        }
+        assert!(report.checks > 0);
+        assert_eq!(report.poses, env.len());
+        assert_eq!(
+            report.lower_misses,
+            report.seams.iter().map(|s| s.lower_misses).sum::<usize>()
+        );
+        assert_eq!(report.holes, report.seams.iter().map(|s| s.holes).sum::<usize>());
+        assert_eq!(report.violations.is_empty(), report.lower_misses == 0);
+        assert!(report.holes <= report.lower_misses);
+        // Seam-driven underlaps leave no background exposed anywhere on the envelope for this
+        // fixture. Lower misses that remain are covered by another layer (e.g. body / hair_back
+        // behind a hair lock that hangs past the shoulder) and are reported, not hidden.
+        assert_eq!(
+            report.holes,
+            0,
+            "background exposed: {:?}",
+            report.violations.iter().filter(|v| v.hole).take(8).collect::<Vec<_>>()
+        );
+        // Rest-pose hygiene is untouched by the seam-driven underlaps.
+        for (p, fill) in out.fill_masks.iter().enumerate() {
+            for (i, &a) in fg.iter().enumerate() {
+                if a == 0 {
+                    assert_eq!(fill[i], 0, "fill leaked to bg on {}", out.part_ids[p]);
                 }
             }
         }

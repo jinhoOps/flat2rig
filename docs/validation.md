@@ -151,3 +151,99 @@ Cubism Editor에서 PSD/CSV를 실제 가져오는 검증(`cubismEditorImport: "
 - `79610ec` `feat(rig): scale per-part fillMask overlap margins with resolution and motion (T8)`이 반영되었다. 커밋에 `part_overlap_margins_scale_with_resolution_and_cover_opposing_motion` Rust 테스트와 `tests/pipeline.test.ts` 추가분이 포함되어 있다.
 - 이번 검수는 문서·소스 검토만 했고 테스트·CLI·WebView2를 실행하지 않았다. T8의 완료 조건(`1024px+` 원화에서 반대 이동·최대 흔들림 시 공백 0)은 **`미검증`**이다.
 - 소스 검수에서 확인한 제한(구조 개선은 `T13`): 변형 상수의 3중 복제(`deform` / `part_overlap_margins` / `partOverlapMargins`), 테스트 표본이 2점·단일 포즈뿐, Rust `recommended_fill_radius`의 ID 접두사 분기와 TS `role` 분기 불일치. 근거는 [template-architecture-review.md](template-architecture-review.md) 2026-11-18 항목에 있다.
+
+## T13a 이음새 계약 · 포즈 포락선 · `deform` 수치 여유분 (2026-11-18, 리뷰 수정 반영)
+
+- 실행: `cd src-tauri && cargo test` (lib 43/43 통과), `npm test` (42/42 통과), `npx tsc --noEmit` (통과). Windows 앱·실제 원화(`Himikan`/`Sutteang`/`Rritteang`) 모션 검증은 하지 않았다(`미검증`).
+- 수치 출처: `analysis::templates::tests::t13a_seam_requirements_drive_underlaps_and_coverage_is_reported_on_1024_artwork` (`cargo test --lib t13a -- --nocapture`). 1024×1024 **합성** fixture(눈 간격 224px, 머리 높이 440px)이며 입력 레이어는 `hair_back`·`neck`·`clothes`·`face`·`hair_side_R`·`hair_side_L_2`·`hair_front`·`hair_front_2`, 템플릿 합성 후 23개 레이어·이음새 55개다.
+- 포즈 포락선: `src/rig/pose-envelope.json` 94포즈, `PARAM_DEFS` 범위 축소 없음.
+- 깊이 측정(v2): 경계점 b의 상위 경계가 놓이는 위치 `yu = deform(upper)(b)`에서 하위 레이어 역변환 `x_l = deform(lower)⁻¹(yu)`을 구하고 `b → x_l` 노출 띠를 1px 간격으로 걷는다. 지원 표본(전경 · 휴지 소유자가 하위이거나 그보다 위)의 하위 가시 마스크 바깥 거리 최댓값이 깊이다. 수치 여유분 = `ceil(깊이 × 1.25 + 2)`. 커버리지 검사도 같은 헬퍼(`walk_exposed_band`)로 같은 띠를 걷는다.
+- v1(리뷰 전)은 끝점 `b + r` 한 점만 보고 끝점이 배경·하위 아래면 표본을 버렸다. 아래 표의 "v1 → v2"는 같은 fixture에서 측정 방식만 바꾼 결과다. "T8 px" 열은 같은 하위 역할에 T8 코드가 쓰던 `part_overlap_margins` 값이다(↑ 커짐 · ↓ 작아짐 · 신규 = T8에 해당 값 없음). 얼굴 아래 눈·입 이음새의 T8 값(40)은 참고용이며 T8 코드는 얼굴을 눈·입 아래로 채우지 않았다.
+
+| upper (role) | lower (role) | boundary px | max rel. disp px | max exposure depth px (v1 → v2) | numeric underlap px (v1 → v2) | T8 px (vs v2) | worst pose @ point (v2) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| neck (Neck) | hair_back (HairBack) | 174 | 59.1 | 49.5 → 47.6 |  **64 → 62** | 104 ↓ | headHairBody:head--/hair+ @ (558.5,639.0) |
+| clothes (Clothes) | hair_back (HairBack) | 118 | 103.1 | 100.0 → 73.0 |  **127 → 94** | 104 ↓ | opp3:head+--/breath1 @ (616.0,639.5) |
+| clothes (Clothes) | neck (Neck) | 93 | 45.0 | 38.7 → 26.4 |  **51 → 36** | 79 ↓ | same3:head+--/breath1 @ (476.0,639.5) |
+| face (Face) | hair_back (HairBack) | 326 | 21.3 | 23.7 → 21.4 |  **32 → 29** | 104 ↓ | headHairBody:head++/hair- @ (465.0,552.5) |
+| face (Face) | neck (Neck) | 109 | 9.2 | 9.8 → 10.0 | 15 → 15 | 77 ↓ | opp3:head+--/breath1 @ (558.0,552.5) |
+| eyeR_white (Eye) | face (Face) | 18 | 14.7 | 11.3 → 11.3 | 17 → 17 | 40 ↓ | eyeR=0 @ (449.0,375.5) |
+| eyeR_iris (Eye) | face (Face) | 40 | 34.7 | 35.0 → 35.0 | 46 → 46 | 40 ↑ | eyesClosedSmile @ (398.0,393.5) |
+| eyeR_iris (Eye) | eyeR_white (Eye) | 57 | 11.5 | 13.5 → 13.5 | 19 → 19 | 18 ↑ | gaze:-- @ (420.5,337.0) |
+| eyeR_lower (Eye) | face (Face) | 96 | 31.1 | 32.0 → 32.0 | 42 → 42 | 40 ↑ | eyesClosedSmile @ (415.0,391.5) |
+| eyeR_lower (Eye) | eyeR_white (Eye) | 28 | 4.6 | 2.4 → 11.0 |  **6 → 16** | 18 ↓ | eyeR=0 @ (424.0,379.5) |
+| eyeR_lower (Eye) | eyeR_iris (Eye) | 22 | 11.5 | 13.5 → 13.5 | 19 → 19 | 18 ↑ | gaze:-+ @ (423.5,381.0) |
+| eyeR_upper (Eye) | face (Face) | 56 | 38.6 | 39.0 → 39.0 | 51 → 51 | 40 ↑ | eyeR=0 @ (401.0,315.5) |
+| eyeR_upper (Eye) | eyeR_white (Eye) | 14 | 10.7 | 11.0 → 11.0 | 16 → 16 | 18 ↓ | eyesClosedSmile @ (421.0,335.5) |
+| eyeR_upper (Eye) | eyeR_iris (Eye) | 43 | 12.0 | 13.5 → 13.5 | 19 → 19 | 18 ↑ | gaze:-- @ (420.5,335.0) |
+| eyeL_white (Eye) | face (Face) | 65 | 17.5 | 15.6 → 15.6 | 22 → 22 | 40 ↓ | eyeL=0 @ (580.5,341.0) |
+| eyeL_iris (Eye) | face (Face) | 40 | 34.7 | 35.0 → 35.0 | 46 → 46 | 40 ↑ | eyesClosedSmile @ (622.0,393.5) |
+| eyeL_iris (Eye) | eyeL_white (Eye) | 57 | 11.5 | 13.5 → 13.5 | 19 → 19 | 18 ↑ | gaze:++ @ (603.5,336.0) |
+| eyeL_lower (Eye) | face (Face) | 96 | 31.1 | 32.0 → 32.0 | 42 → 42 | 40 ↑ | eyesClosedSmile @ (609.0,391.5) |
+| eyeL_lower (Eye) | eyeL_white (Eye) | 28 | 4.6 | 2.0 → 11.0 |  **5 → 16** | 18 ↓ | eyeL=0 @ (600.0,379.5) |
+| eyeL_lower (Eye) | eyeL_iris (Eye) | 22 | 11.5 | 13.5 → 13.5 | 19 → 19 | 18 ↑ | gaze:++ @ (600.5,381.0) |
+| eyeL_upper (Eye) | face (Face) | 162 | 38.6 | 39.0 → 39.0 | 51 → 51 | 40 ↑ | eyeL=0 @ (625.0,315.5) |
+| eyeL_upper (Eye) | eyeL_white (Eye) | 28 | 10.7 | 11.0 → 11.0 | 16 → 16 | 18 ↓ | eyesClosedSmile @ (603.0,335.5) |
+| eyeL_upper (Eye) | eyeL_iris (Eye) | 43 | 12.0 | 13.5 → 13.5 | 19 → 19 | 18 ↑ | gaze:+- @ (603.5,335.0) |
+| browR (Brow) | face (Face) | 22 | 22.7 | 23.0 → 23.0 | 31 → 31 | 40 ↓ | brows:y+form+ @ (401.0,306.5) |
+| browL (Brow) | face (Face) | 22 | 22.7 | 23.4 → 23.4 | 32 → 32 | 40 ↓ | brows:y+form+ @ (623.5,307.0) |
+| mouth_inner (Mouth) | face (Face) | 86 | 21.9 | 3.0 → 3.0 | 6 → 6 | 40 ↓ | mouthForm=-1 @ (531.5,484.0) |
+| mouth_lower (Mouth) | face (Face) | 58 | 28.3 | 5.0 → 5.0 | 9 → 9 | 40 ↓ | mouthForm=1 @ (478.0,499.5) |
+| mouth_lower (Mouth) | mouth_inner (Mouth) | 39 | 7.9 | 0.0 → 0.0 | 2 → 2 | - 신규 | - @ - |
+| mouth_upper (Mouth) | face (Face) | 64 | 14.4 | 8.0 → 8.0 | 12 → 12 | 40 ↓ | mouthForm=-1 @ (471.0,484.5) |
+| mouth_upper (Mouth) | mouth_inner (Mouth) | 39 | 12.8 | 8.0 → 8.0 | 12 → 12 | - 신규 | mouth=1 @ (493.0,484.5) |
+| mouth_upper (Mouth) | mouth_lower (Mouth) | 85 | 25.1 | 0.0 → 9.0 |  **2 → 14** | - 신규 | mouth=1 @ (470.0,493.5) |
+| hair_side_R (HairSideR) | hair_back (HairBack) | 191 | 33.2 | 34.0 → 34.0 | 45 → 45 | 104 ↓ | hairSign:--+ @ (406.5,637.0) |
+| hair_side_R (HairSideR) | clothes (Clothes) | 186 | 170.9 | 160.8 → 155.4 |  **203 → 197** | 62 ↑ | headHairBody:head+-/hair- @ (312.0,720.5) |
+| hair_side_R (HairSideR) | face (Face) | 84 | 23.1 | 25.1 → 23.0 |  **34 → 31** | 40 ↓ | headHairBody:head++/hair- @ (380.5,463.0) |
+| hair_side_R (HairSideR) | eyeR_iris (Eye) | 53 | 30.5 | 18.9 → 17.0 |  **26 → 24** | 18 ↑ | headHairBody:head++/hair- @ (380.5,381.0) |
+| hair_side_L (HairSideL) | hair_back (HairBack) | 175 | 33.2 | 34.0 → 34.0 | 45 → 45 | 104 ↓ | hairSign:++- @ (617.5,637.0) |
+| hair_side_L (HairSideL) | clothes (Clothes) | 26 | 114.7 | 122.5 → 121.4 |  **156 → 154** | 62 ↑ | opp3:head+--/breath1 @ (643.0,639.5) |
+| hair_side_L_2 (HairSideL) | hair_back (HairBack) | 16 | 24.5 | 25.0 → 25.0 | 34 → 34 | 104 ↓ | hairSign:++- @ (643.5,485.0) |
+| hair_side_L_2 (HairSideL) | clothes (Clothes) | 200 | 186.6 | 134.9 → 124.9 |  **171 → 159** | 62 ↑ | opp3:head+--/breath1 @ (678.0,760.5) |
+| hair_side_L_2 (HairSideL) | face (Face) | 84 | 25.4 | 27.6 → 26.0 |  **37 → 35** | 40 ↓ | headHairBody:head++/hair+ @ (643.5,473.0) |
+| hair_side_L_2 (HairSideL) | eyeL_iris (Eye) | 53 | 30.5 | 30.2 → 30.2 | 40 → 40 | 18 ↑ | eyesClosedSmile @ (643.5,390.0) |
+| hair_side_L_2 (HairSideL) | hair_side_L (HairSideL) | 450 | 3.8 | 4.8 → 4.0 |  **9 → 7** | 41 ↓ | hairSign:+++ @ (643.5,596.0) |
+| hair_front (HairFront) | face (Face) | 190 | 9.3 | 10.7 → 9.4 |  **16 → 14** | 40 ↓ | headHairBody:head-+/hair- @ (510.0,324.5) |
+| hair_front (HairFront) | eyeR_iris (Eye) | 13 | 29.7 | 30.0 → 30.0 | 40 → 40 | 18 ↑ | eyeR=0 @ (380.0,334.5) |
+| hair_front (HairFront) | eyeR_upper (Eye) | 17 | 36.6 | 37.0 → 41.0 |  **49 → 54** | - 신규 | eyeR=0 @ (380.5,324.0) |
+| hair_front (HairFront) | eyeL_iris (Eye) | 13 | 29.7 | 30.0 → 30.0 | 40 → 40 | 18 ↑ | eyeL=0 @ (644.0,334.5) |
+| hair_front (HairFront) | eyeL_upper (Eye) | 17 | 36.6 | 37.4 → 41.4 |  **49 → 54** | - 신규 | eyeL=0 @ (643.5,324.0) |
+| hair_front (HairFront) | browR (Brow) | 42 | 22.8 | 23.2 → 23.2 | 32 → 32 | - 신규 | brows:y-form- @ (399.5,305.0) |
+| hair_front (HairFront) | browL (Brow) | 42 | 22.8 | 22.6 → 22.6 | 31 → 31 | - 신규 | brows:y-form- @ (625.0,304.5) |
+| hair_front (HairFront) | hair_side_R (HairSideR) | 161 | 10.3 | 10.0 → 10.0 | 15 → 15 | 41 ↓ | hairSign:-++ @ (372.5,347.0) |
+| hair_front (HairFront) | hair_side_L_2 (HairSideL) | 161 | 10.3 | 10.0 → 10.0 | 15 → 15 | 41 ↓ | hairSide=-1 @ (653.5,355.0) |
+| hair_front_2 (HairFront) | face (Face) | 108 | 12.2 | 12.7 → 11.4 |  **18 → 17** | 40 ↓ | headHairBody:head-+/hair- @ (508.0,335.5) |
+| hair_front_2 (HairFront) | eyeR_white (Eye) | 55 | 20.2 | 20.4 → 20.4 | 28 → 28 | 18 ↑ | eyeR=0 @ (432.5,338.0) |
+| hair_front_2 (HairFront) | eyeR_upper (Eye) | 20 | 34.7 | 35.0 → 44.4 |  **46 → 58** | - 신규 | eyeR=0 @ (430.5,324.0) |
+| hair_front_2 (HairFront) | hair_front (HairFront) | 181 | 0.9 | 1.4 → 1.4 | 4 → 4 | 41 ↓ | hair=-1 @ (510.0,319.5) |
+
+v1 → v2 변화의 원인:
+
+- **커진 곳**(띠 내부를 보게 되어): 아래 눈꺼풀 → 흰자 5–6 → 16, `mouth_upper` → `mouth_lower` 2 → 14, 앞머리 → 윗눈꺼풀 46–49 → 54–58. 끝점은 하위 안쪽이나 배경에 떨어지지만 띠 중간은 상위가 비운 영역이다.
+- **작아진 곳**(끝점 1차 근사 대신 하위 역변환을 써서): `clothes` → `hair_back` 127 → 94, `clothes` → `neck` 51 → 36, 옆머리 → 의상 2–12px 감소 등. 하위 레이어가 회전·비균일 변형을 받으면 `b + r`은 하위의 실제 휴지 점이 아니다. 예: `clothes`/`hair_back` (617.0,639.5), `same3:head+--/breath1`에서 `hair_back`은 고개와 함께 30° 돈다. `b + r` = (589.9,739.0)이지만 `deform(hair_back)`의 역상은 (543.5,705.0)(잔차 0.36px)이다. v1 최댓값 100.0px는 이 점의 `b + r`에서 나왔고, 역상 쪽 띠는 `hair_back` 가시 영역에 더 가깝다. v2 최댓값은 73.0px(다른 경계점 (616.0,639.5), `opp3:head+--/breath1`)다. `clothes`/`neck` (466.0,639.5)은 역상과 `b + r` 차이가 작고(잔차 0.01px), 최댓값이 다른 경계점·포즈((476.0,639.5) `same3:head+--/breath1`)로 옮겨 38.7 → 26.4px가 됐다. 감소는 표본을 버려서가 아니라 하위의 실제 휴지 점을 쓴 결과다. v2에서 띠 전체가 배경·하위 아래뿐인 경우만 `unsupportedSamples`로 센다.
+
+T8 대비 커진 곳과 이유:
+
+- **옆머리 → 의상**(`hair_side_*`/`clothes`, 154–197 vs 62): 가슴 위로 늘어진 머리카락은 머리 부품이라 고개 기울기 30°의 턱 피벗 회전과 흔들림을 모두 받고, 의상은 반대 방향 몸 회전을 받는다. 경계점 상대 변위가 최대 187px이다. T8 폐형식은 흔들림 항만 넣었다.
+- **눈꺼풀·홍채 → 얼굴**(42–51 vs 40), **앞머리/옆머리 → 홍채·흰자**(24–40 vs 18), **앞머리 → 윗눈꺼풀**(54–58, T8 해당 없음): 눈 감김 수축과 시선 이동, 머리카락 흔들림이 실제 `deform`에서 T8 근사보다 크다.
+
+T8 대비 작아진 곳과 근거(최악 포즈·경계점은 표의 마지막 열):
+
+- **얼굴 → 목**(15 vs 77): 목 위쪽 가중치가 턱에서 1이라 턱선 경계는 머리와 함께 움직이고, 남는 상대 변위는 Z 회전의 22%(목 회전 가중 0.78)뿐이다. 최대 상대 변위가 9.2px이다. T8은 머리 절대 변위와 `hh·0.04` 상수를 더했다.
+- **앞머리 → 얼굴**(14 vs 40), **앞머리 → 옆머리**(15 vs 41), **`hair_front_2` → `hair_front`**(4 vs 41), **옆머리끼리**(7 vs 41): 두 레이어가 같은 머리 변형을 받아 상대 변위가 흔들림 진폭 차이뿐이다(최대 상대 변위 0.9–10.3px).
+- **뒷머리 아래 이음새**(`face` 29, `hair_side_*` 34–45, `neck` 62, `clothes` 94 vs 104): `face`·`hair_side`·`neck` 위쪽은 `hair_back`과 같은 머리 변형을 받아 최대 상대 변위가 21–59px이다. 깊이는 그보다 작거나 비슷하다. T8 값은 머리 절대 변위·흔들림·`hh·0.06`을 모두 더한 상한이다. `clothes`/`hair_back`은 상대 변위가 103px이지만 위의 역변환 예처럼 `hair_back`이 함께 돌아 실제 노출 띠의 끝이 `hair_back` 가시 영역 쪽에 있다.
+- **눈 아래 눈꺼풀 → 흰자**(16 vs 18), **입 → 얼굴**(6–12 vs 40): 상위가 하위 쪽으로 덮어 들어가는 방향이 대부분이라 드러나는 깊이가 작다.
+
+커버리지 검사(`check_seam_coverage`, 경계점 1/2 표본 × 94포즈, v2):
+
+| 항목 | v1 | v2 |
+| --- | ---: | ---: |
+| 검사 수(경계점 × 포즈) | 221,370 | 221,370 |
+| 배경 노출(`holes`) | 0 | 0 |
+| 하위 레이어 계약 위반(`lowerMisses`, 다른 레이어가 덮음) | 3,748 | 3,742 |
+
+- `lowerMisses`는 모두 다른 레이어의 변형된 유효 마스크가 덮는다(`holes` 0). 덮는 레이어는 개별 기록하지 않았고 괄호는 위치상 추정이다. 주요 위치: `hair_side_R`/`clothes` 1,577 · `hair_side_L_2`/`clothes` 1,347 · `hair_side_L`/`clothes` 299(어깨 밖으로 늘어진 옆머리 아래, `clothes` 실루엣 밖 → `body`/`hair_back` 추정), `mouth_upper`/`mouth_lower` 129(`mouth_inner` 추정), `hair_front`/눈썹 63·81 · `hair_front*`/윗눈꺼풀 26·29·44(`face`), `clothes`/`neck` 13(옷깃 바깥 x≈444/577, `neck` 블록의 폭 제한 밖 → `body` 추정).
+- **미해결(T13b)**: 앞머리 아래 눈썹·윗눈꺼풀 `lowerMisses`는 구멍은 아니지만, 그 자리에 눈썹·눈꺼풀 대신 얼굴 피부가 보이는 상태다. 측정 요구량(31–58px)은 있으나 `Brow`/눈꺼풀을 하위로 받는 확장 블록이 없어 쓰이지 않는다. [development-tasks.md](development-tasks.md) T13 절 참조.
+- 얼굴 기준 레이어가 눈·입 아래를 채우기 전(v1 초기)에는 같은 fixture에서 `holes` 42건(눈 아래 테두리, 깊이 1.5–13.5px)이 나왔다.
+- 제한: 경계점마다 하위 역변환 띠 하나로 검사하며 ArtMesh 삼각형 보간으로 렌더링해 비교하지 않는다. 합성 fixture 결과이므로 5대 기준 ②·④의 원화 검증을 대신하지 않는다. 노출 영역 원본감(⑥)은 측정하지 않았다(T14).

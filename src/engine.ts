@@ -10,6 +10,7 @@ import {
   type Part,
   type Point,
 } from "./types";
+import { POSE_ENVELOPE, type EnvelopePose } from "./rig/poseEnvelope";
 
 export const clamp = (v: number, a: number, b: number) =>
   Math.max(a, Math.min(b, v));
@@ -1364,8 +1365,11 @@ export interface PartOverlapMargins {
 }
 
 /**
- * Computes resolution- and motion-proportional underlap budgets matching Rust
- * `core::part_overlap_margins` from `HeadFrame` and `deform` maxima.
+ * FALLBACK ONLY (T13a): closed-form underlap budgets matching Rust `core::part_overlap_margins`,
+ * used when only landmarks are known and no seam exists (e.g. the manual fill radius before parts
+ * are stacked). Template hidden-area generation uses per-seam requirements measured from the real
+ * `deform` over the shared pose envelope (`src-tauri/src/rig/seams.rs`, `POSE_ENVELOPE`). Do not
+ * extend this formula; extend the envelope or the seam contract instead.
  */
 export function partOverlapMargins(
   lm: Landmarks,
@@ -1726,6 +1730,36 @@ export function deform(
     bodyFollow,
   );
 }
+
+/**
+ * T13a: maximum relative displacement `|deform(upper)(b) − deform(lower)(b)|` of seam boundary
+ * points over the shared pose envelope, using this file's `deform` only (no copied coefficients).
+ * Mirrors Rust `rig::seams::max_relative_displacement`; parity is asserted against
+ * `tests/fixtures/seam-envelope-parity.json`.
+ */
+export function maxSeamRelativeDisplacement(
+  points: readonly Point[],
+  upper: Pick<Part, "id" | "role">,
+  lower: Pick<Part, "id" | "role">,
+  lm: Landmarks,
+  poses: readonly EnvelopePose[] = POSE_ENVELOPE,
+): { maxPx: number; worstPose: string | null } {
+  let maxPx = 0;
+  let worstPose: string | null = null;
+  for (const pose of poses) {
+    for (const b of points) {
+      const u = deform(b, upper, lm, pose.params);
+      const l = deform(b, lower, lm, pose.params);
+      const r = Math.hypot(u.x - l.x, u.y - l.y);
+      if (r > maxPx + 1e-12) {
+        maxPx = r;
+        worstPose = pose.name;
+      }
+    }
+  }
+  return { maxPx, worstPose };
+}
+
 /** Local neighbor pixel expansion keeping `visibleMask` separated from `fillMask`.
  * Erodes 2px inward before sampling colors so outermost lineart/hair shadows do not bleed outward. */
 export function expandFillSeparated(
