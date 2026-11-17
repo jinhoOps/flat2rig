@@ -13,7 +13,7 @@ use glam::DVec2;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Canonical layered template Z-order (bottom-to-top Live2D draw order: `neck` sits under `clothes` and `face`).
 pub const TEMPLATE_LAYER_ORDER: [&str; 21] = [
@@ -5717,6 +5717,8 @@ pub fn synthesize_template_bank_for_stage(
 
     // Expand per-part hidden underlaps by the seam requirements measured from `deform` over the shared
     // pose envelope (T13a); `margins` (`core::part_overlap_margins`) is only the no-seam fallback.
+    // T13b: each seam uses max(coupled, uncoupled) requirement so runtime coupling never shrinks a
+    // hidden area (Cubism deformers move independently; PSD hand-off continuity).
     apply_motion_proportional_underlaps(
         &final_layer_ids,
         &final_visible_masks,
@@ -6463,6 +6465,81 @@ pub fn synthesize_template_bank_for_stage(
     }
 }
 
+/// Fits a stroke centre line `v = a + b·u + c·u²` (head-local) to a thin visible feature (brow,
+/// lash line) by count-weighted least squares over integer `u` columns, plus the median column
+/// half-thickness. `None` when the feature is empty. Fewer than 3 columns fall back to a line or a
+/// constant so a short stub still extends straight instead of curling.
+fn fit_stroke_centerline(mask: &[u8], frame: HeadFrame, w: usize) -> Option<(f64, f64, f64, f64)> {
+    let mut cols: BTreeMap<i64, (f64, usize, f64, f64)> = BTreeMap::new();
+    for (i, &a) in mask.iter().enumerate() {
+        if a == 0 {
+            continue;
+        }
+        let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
+        let e = cols.entry(u.round() as i64).or_insert((0.0, 0, f64::MAX, f64::MIN));
+        e.0 += v;
+        e.1 += 1;
+        e.2 = e.2.min(v);
+        e.3 = e.3.max(v);
+    }
+    if cols.is_empty() {
+        return None;
+    }
+    let mut thick: Vec<f64> = cols.values().map(|c| c.3 - c.2 + 1.0).collect();
+    thick.sort_by(|a, b| a.total_cmp(b));
+    let half = thick[thick.len() / 2] * 0.5;
+    // Normal equations over (1, u, u²), weighted by column counts; `u` centred for conditioning.
+    let tot: f64 = cols.values().map(|c| c.1 as f64).sum();
+    let u0 = cols.iter().map(|(&u, c)| u as f64 * c.1 as f64).sum::<f64>() / tot;
+    let degree = (cols.len().min(3)).saturating_sub(1);
+    let mut m = [[0.0f64; 3]; 3];
+    let mut r = [0.0f64; 3];
+    for (&u, c) in &cols {
+        let x = u as f64 - u0;
+        let wgt = c.1 as f64;
+        let y = c.0 / c.1 as f64;
+        let basis = [1.0, x, x * x];
+        for j in 0..=degree {
+            r[j] += wgt * basis[j] * y;
+            for k in 0..=degree {
+                m[j][k] += wgt * basis[j] * basis[k];
+            }
+        }
+    }
+    let n = degree + 1;
+    // Gaussian elimination with partial pivoting on the n×n system.
+    for col in 0..n {
+        let piv = (col..n).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
+        if m[piv][col].abs() < 1e-12 {
+            return Some((r[0] / m[0][0].max(1e-12), 0.0, 0.0, half));
+        }
+        m.swap(col, piv);
+        r.swap(col, piv);
+        for row in 0..n {
+            if row != col {
+                let f = m[row][col] / m[col][col];
+                let pivot_row = m[col];
+                for (dst, src) in m[row][col..n].iter_mut().zip(&pivot_row[col..n]) {
+                    *dst -= f * src;
+                }
+                r[row] -= f * r[col];
+            }
+        }
+    }
+    let mut coef = [0.0f64; 3];
+    for j in 0..n {
+        coef[j] = r[j] / m[j][j];
+    }
+    // Un-centre: v = c0 + c1 (u − u0) + c2 (u − u0)².
+    let (c0, c1, c2) = (coef[0], coef[1], coef[2]);
+    Some((
+        c0 - c1 * u0 + c2 * u0 * u0,
+        c1 - 2.0 * c2 * u0,
+        c2,
+        half,
+    ))
+}
+
 /// Expands per-part hidden occlusion underlaps (`final_tpl_masks`) by the per-seam requirement
 /// measured from the real `core::deform` over the shared pose envelope (`rig::seams`, T13a).
 /// `core::part_overlap_margins` (`fallback`) is used only where a part has no matching seam.
@@ -6502,7 +6579,7 @@ fn apply_motion_proportional_underlaps(
         .map(|id| crate::core::infer_part_role(id, None))
         .collect();
     let seam_graph = seams::extract_seam_graph(final_layer_ids, &roles, final_visible_masks, w, h);
-    let table = seams::SeamMarginTable::new(seams::seam_requirements(
+    let table = seams::SeamMarginTable::new(seams::hidden_area_seam_requirements(
         &seam_graph,
         final_visible_masks,
         &ev.fg_alpha,
@@ -6800,6 +6877,44 @@ fn apply_motion_proportional_underlaps(
         }
     }
 
+    // 5b. Brows and upper eyelids under hair (T13b): when bangs / side locks / head wear sway they
+    // uncover the rest of the brow stroke or lash line, which must continue there instead of bare
+    // skin. The reach is the measured seam requirement (`table.need`, only where such a seam exists;
+    // no closed-form fallback). The hidden area follows the stroke, not a blob: a quadratic centre
+    // line `v_c(u)` fitted to the visible feature in head-local columns, widened by the median
+    // half-thickness, restricted to pixels the accepted upper layers own at rest.
+    for p in 0..final_len {
+        let is_upper_lid = roles[p] == R::Eye && final_layer_ids[p].ends_with("_upper");
+        if roles[p] != R::Brow && !is_upper_lid {
+            continue;
+        }
+        #[cfg(test)]
+        if tests::SKIP_FEATURE_UNDERLAP.with(|c| c.get()) {
+            continue;
+        }
+        let accept = |q: usize, r: R| is_hair(r) || head_wear[q];
+        let Some(need) = table.need(p, accept) else { continue };
+        let Some((ca, cb, cc, half)) = fit_stroke_centerline(&final_visible_masks[p], frame, w) else {
+            continue;
+        };
+        let reach = reach_for(p, need);
+        let f_vis = mask_bool(&final_visible_masks[p]);
+        let f_dist = dilation_distance(&f_vis, w, h, max_dil(p, &reach));
+        for i in 0..n {
+            if ev.fg_alpha[i] == 0 {
+                continue;
+            }
+            let Some(q) = vis_owner[i] else { continue };
+            if q <= p || !accept(q, roles[q]) || !within(&f_dist, i, reach[q]) {
+                continue;
+            }
+            let (u, v) = frame.to_local(DVec2::new((i % w) as f64, (i / w) as f64));
+            if (v - (ca + cb * u + cc * u * u)).abs() <= half + 1.0 {
+                final_tpl_masks[p][i] = final_tpl_masks[p][i].max(ev.fg_alpha[i]);
+            }
+        }
+    }
+
     // 6. Hair seam underlaps for every hair layer by role (`hair_front*`, `hair_side*`, `hair_back*`).
     let front_root_fallback = fallback.hair_hat_root.max(fallback.hair_side_front_seam);
     for fi in (0..final_len).filter(|&p| roles[p] == R::HairFront) {
@@ -6990,6 +7105,11 @@ fn pad_texture_rgb(tex: &mut [u8], m_vis: &[u8], m_fill: &[u8], w: usize, h: usi
 mod tests {
     use super::*;
     use crate::core::Point;
+
+    thread_local! {
+        /// Test-only: skip the 5b brow / upper-lid block to measure its contribution (T13b).
+        pub(super) static SKIP_FEATURE_UNDERLAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     #[test]
     fn template_bank_keeps_partition_disjoint_and_synthesizes_motion_layers() {
@@ -7918,5 +8038,292 @@ mod tests {
                 }
             }
         }
+    }
+
+    struct T13bRun {
+        out: TemplateSynthesisOutput,
+        reqs: Vec<seams::SeamRequirement>,
+        graph: seams::SeamGraph,
+        coverage: seams::SeamCoverageReport,
+        exposure: crate::rig::exposure::ExposureMap,
+    }
+
+    fn t13b_run(coupled: bool) -> T13bRun {
+        let (w, h, rgba, lm, ids, masks) = t13_fixture_1024();
+        let n = w * h;
+        crate::core::with_seam_coupling(coupled, || {
+            let out = synthesize_template_bank_for_stage(
+                &rgba,
+                w,
+                h,
+                &lm,
+                &[],
+                &ids,
+                &masks,
+                &vec!["model".into(); ids.len()],
+                &vec![0.92; ids.len()],
+                &TemplateStyleSelection::default(),
+                "full",
+            );
+            let fg: Vec<u8> = (0..n).map(|i| rgba[i * 4 + 3]).collect();
+            let roles: Vec<_> = out
+                .part_ids
+                .iter()
+                .map(|id| crate::core::infer_part_role(id, None))
+                .collect();
+            let mut graph = seams::extract_seam_graph(&out.part_ids, &roles, &out.masks, w, h);
+            seams::annotate_seam_couplings(&mut graph, &lm);
+            let env = &seams::pose_envelope().poses;
+            let reqs = seams::hidden_area_seam_requirements(
+                &graph,
+                &out.masks,
+                &fg,
+                &lm,
+                w,
+                h,
+                env,
+                seams::DEFAULT_MAX_SAMPLES_PER_SEAM,
+            );
+            let coverage = seams::check_seam_coverage(
+                &graph,
+                &out.part_ids,
+                &out.masks,
+                &out.fill_masks,
+                &fg,
+                &lm,
+                w,
+                h,
+                env,
+                2,
+            );
+            let exposure = crate::rig::exposure::compute_exposure_map(
+                &out.part_ids,
+                &out.masks,
+                &out.fill_masks,
+                &lm,
+                w,
+                h,
+                env,
+            );
+            T13bRun {
+                out,
+                reqs,
+                graph,
+                coverage,
+                exposure,
+            }
+        })
+    }
+
+    /// T13b on the 1024px fixture: coupled vs uncoupled `deform` end to end (hidden-area synthesis,
+    /// seam requirements, coverage, exposure map), plus the brow / upper-lid hidden-area decision.
+    /// Numbers are printed with `T13B_*` prefixes (`cargo test --lib t13b_ -- --nocapture`).
+    #[test]
+    fn t13b_coupling_and_exposure_map_on_1024_artwork() {
+        let (w, h, _, _, _, _) = t13_fixture_1024();
+        let before = t13b_run(false);
+        let after = t13b_run(true);
+        assert!(crate::core::seam_coupling_enabled());
+
+        // Table 1: per seam, uncoupled → coupled.
+        println!("T13B_SEAM | upper | lower | coupling | max rel px (before → after) | depth px | underlap px before → after (coupled / uncoupled, adopted) | lowerMisses | holes |");
+        let cov_of = |r: &seams::SeamCoverageReport, u: &str, l: &str| {
+            r.seams
+                .iter()
+                .find(|s| s.upper_id == u && s.lower_id == l)
+                .map(|s| (s.lower_misses, s.holes))
+        };
+        for a in &after.reqs {
+            let b = before
+                .reqs
+                .iter()
+                .find(|b| b.upper_id == a.upper_id && b.lower_id == a.lower_id);
+            let coupling = after
+                .graph
+                .find(&a.upper_id, &a.lower_id)
+                .and_then(|s| s.coupling)
+                .map_or("-".to_string(), |c| {
+                    format!(
+                        "{:?} up={:.2} low={:.2} falloff={:.0}px",
+                        c.kind, c.upper_weight, c.lower_weight, c.falloff_px
+                    )
+                });
+            let (bm, bh) = cov_of(&before.coverage, &a.upper_id, &a.lower_id).unwrap_or((0, 0));
+            let (am, ah) = cov_of(&after.coverage, &a.upper_id, &a.lower_id).unwrap_or((0, 0));
+            println!(
+                "T13B_SEAM | {} | {} | {} | {} → {:.1} | {} → {:.1} | {} → {} ({} / {}, {}) | {} → {} | {} → {} |",
+                a.upper_id,
+                a.lower_id,
+                coupling,
+                b.map_or("new".into(), |b| format!("{:.1}", b.max_relative_displacement_px)),
+                a.max_relative_displacement_px,
+                b.map_or("-".into(), |b| format!("{:.1}", b.max_exposure_depth_px)),
+                a.max_exposure_depth_px,
+                b.map_or("-".into(), |b| b.required_underlap_px.to_string()),
+                a.required_underlap_px,
+                a.coupled_underlap_px.map_or("-".into(), |v| v.to_string()),
+                a.uncoupled_underlap_px.map_or("-".into(), |v| v.to_string()),
+                a.adopted.unwrap_or("-"),
+                bm,
+                am,
+                bh,
+                ah,
+            );
+        }
+        // Coupled seams: the relative displacement shrinks and the requirement is re-measured
+        // from the coupled `deform` (no constant copied anywhere).
+        for (u, l) in [("face", "neck"), ("clothes", "neck")] {
+            let a = after.reqs.iter().find(|r| r.upper_id == u && r.lower_id == l).unwrap();
+            let b = before.reqs.iter().find(|r| r.upper_id == u && r.lower_id == l).unwrap();
+            assert!(
+                a.max_relative_displacement_px < b.max_relative_displacement_px,
+                "{u}/{l}: {} -> {}",
+                b.max_relative_displacement_px,
+                a.max_relative_displacement_px
+            );
+            // The coupled requirement shrinks, but hidden-area generation keeps the larger
+            // (uncoupled) one: coupling never reduces an underlap.
+            assert!(a.coupled_underlap_px.unwrap() <= b.required_underlap_px, "{u}/{l}");
+            assert_eq!(a.uncoupled_underlap_px, Some(b.required_underlap_px), "{u}/{l}");
+            assert_eq!(a.required_underlap_px, b.required_underlap_px, "{u}/{l}");
+            assert_eq!(a.adopted, Some("uncoupled"), "{u}/{l}");
+            assert!(after.graph.find(u, l).unwrap().coupling.is_some());
+        }
+        println!(
+            "T13B_COVERAGE before checks={} lower_misses={} holes={} | after checks={} lower_misses={} holes={}",
+            before.coverage.checks,
+            before.coverage.lower_misses,
+            before.coverage.holes,
+            after.coverage.checks,
+            after.coverage.lower_misses,
+            after.coverage.holes
+        );
+        assert_eq!(after.coverage.holes, 0, "{:?}", after.coverage.violations.first());
+        for a in &after.reqs {
+            assert_eq!(
+                Some(a.required_underlap_px),
+                a.coupled_underlap_px.max(a.uncoupled_underlap_px),
+                "{}/{}",
+                a.upper_id,
+                a.lower_id
+            );
+        }
+        // Coupling never shrinks a hidden area (PSD hand-off continuity): every layer of the
+        // coupled run keeps at least the uncoupled run's hidden texels.
+        println!("T13B_HIDDEN | layer | hidden px before → after |");
+        for (p, id) in after.out.part_ids.iter().enumerate() {
+            let hb = before.exposure.layers[p].hidden_px;
+            let ha = after.exposure.layers[p].hidden_px;
+            println!("T13B_HIDDEN | {id} | {hb} → {ha} |");
+            assert!(ha >= hb, "{id}: hidden area shrank {hb} -> {ha}");
+            let lost = (0..w * h)
+                .filter(|&i| before.exposure.hidden[p][i] && !after.exposure.hidden[p][i])
+                .count();
+            assert_eq!(lost, 0, "{id}: {lost} hidden texels of the uncoupled run lost");
+        }
+
+        // Table 3 (fixture): exposure per layer and holes, uncoupled → coupled.
+        println!("T13B_EXPO | layer | hidden px | exposed px | mean freq | max freq | max depth px | p95 depth px | rest exposed |");
+        for (tag, run) in [("before", &before), ("after", &after)] {
+            for l in run.exposure.layers.iter().filter(|l| l.hidden_px > 0) {
+                println!(
+                    "T13B_EXPO | {tag} | {} | {} | {} | {:.3} | {:.3} | {} | {} | {} |",
+                    l.id,
+                    l.hidden_px,
+                    l.exposed_px,
+                    l.mean_frequency,
+                    l.max_frequency,
+                    l.max_depth_px.map_or("n/a (no visible px)".into(), |d| format!("{d:.1}")),
+                    l.p95_depth_px.map_or("n/a".into(), |d| format!("{d:.1}")),
+                    l.rest_exposed_px
+                );
+            }
+            let hs = &run.exposure.holes;
+            println!(
+                "T13B_EXPO_TOTAL | {tag} | poses={} hidden={} exposed={} max_depth={:.1} | holes px_total={} px_max={} poses={} comps_total={} comps_max={} worst={:?} rest_enclosed={} rest_uncovered_fg={}",
+                run.exposure.poses,
+                run.exposure.hidden_px_total,
+                run.exposure.exposed_px_total,
+                run.exposure.max_depth_px,
+                hs.hole_px_total,
+                hs.hole_px_max,
+                hs.hole_poses,
+                hs.hole_components_total,
+                hs.hole_components_max,
+                hs.worst_pose,
+                hs.rest_enclosed_px,
+                hs.rest_uncovered_fg_px
+            );
+            assert_eq!(run.exposure.poses, seams::pose_envelope().poses.len());
+            assert!(run.exposure.exposed_px_total > 0);
+            for l in &run.exposure.layers {
+                assert_eq!(l.exposed_px + l.unexposed_hidden_px, l.hidden_px, "{}", l.id);
+            }
+        }
+
+        // Brow / upper-lid decision (T13a open item). Same coupled pipeline with the 5b block
+        // switched off (T13a state) and on. The block's zone = hidden texels it adds. Without it the
+        // zone shows the face's hidden skin when hair moves; with it, the brow stroke / lash line.
+        let feature = |id: &str| id.starts_with("brow") || (id.starts_with("eye") && id.ends_with("_upper"));
+        SKIP_FEATURE_UNDERLAP.with(|c| c.set(true));
+        let off = t13b_run(true);
+        SKIP_FEATURE_UNDERLAP.with(|c| c.set(false));
+        assert_eq!(off.out.part_ids, after.out.part_ids);
+        let face_p = after.out.part_ids.iter().position(|id| id == "face").unwrap();
+        println!("T13B_BROW | layer | hidden px off → on | zone px (added) | off: face skin exposed in zone px / max freq / max depth px | on: feature exposed in zone px / mean freq / max freq / max depth px | layer max depth off → on | hair→feature lowerMisses off → on |");
+        let mut any_meaningful = false;
+        for (p, id) in after.out.part_ids.iter().enumerate() {
+            if !feature(id) {
+                continue;
+            }
+            let zone: Vec<usize> = (0..w * h)
+                .filter(|&i| after.exposure.hidden[p][i] && !off.exposure.hidden[p][i])
+                .collect();
+            let dist = seams::outside_distance(&after.out.masks[p], w, h);
+            let stat = |run: &T13bRun, layer: usize| {
+                let (mut ex, mut sum, mut maxf, mut maxd) = (0usize, 0.0f64, 0.0f64, 0.0f64);
+                for &i in &zone {
+                    let f = run.exposure.frequency(layer, i);
+                    if f > 0.0 {
+                        ex += 1;
+                        sum += f;
+                        maxf = maxf.max(f);
+                        maxd = maxd.max(dist[i] as f64);
+                    }
+                }
+                (ex, if ex > 0 { sum / ex as f64 } else { 0.0 }, maxf, maxd)
+            };
+            let (fx, _, ff, fd) = stat(&off, face_p);
+            let (ex, em, ef, ed) = stat(&after, p);
+            let misses = |r: &seams::SeamCoverageReport| -> usize {
+                r.seams
+                    .iter()
+                    .filter(|s| s.lower_id == *id && s.upper_id.starts_with("hair"))
+                    .map(|s| s.lower_misses)
+                    .sum()
+            };
+            let depth = |run: &T13bRun| {
+                run.exposure
+                    .layer(id)
+                    .and_then(|l| l.max_depth_px)
+                    .map_or("-".to_string(), |d| format!("{d:.1}"))
+            };
+            println!(
+                "T13B_BROW | {id} | {} → {} | {} | {fx} / {ff:.3} / {fd:.1} | {ex} / {em:.3} / {ef:.3} / {ed:.1} | {} → {} | {} → {} |",
+                off.exposure.layer(id).unwrap().hidden_px,
+                after.exposure.layer(id).unwrap().hidden_px,
+                zone.len(),
+                depth(&off),
+                depth(&after),
+                misses(&off.coverage),
+                misses(&after.coverage),
+            );
+            if ex > 0 && ed >= 4.0 {
+                any_meaningful = true;
+            }
+            assert!(misses(&after.coverage) <= misses(&off.coverage), "{id}");
+            assert_eq!(off.coverage.holes, 0);
+        }
+        assert!(any_meaningful, "brow/lid hidden areas added by 5b are exposed by the envelope");
     }
 }

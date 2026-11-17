@@ -1439,7 +1439,215 @@ pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
     deform_with_shapes(point, id, lm, pose, None)
 }
 
+// -------------------------------------------------------------------------------------------------
+// T13b — coupled seam deformation
+// -------------------------------------------------------------------------------------------------
+//
+// Each layer keeps its own (uncoupled) displacement field `own(x)`. Near a seam the layer is blended
+// toward its partner's field: `coupled(x) = own(x) + c(x) · (partner(x) − own(x))`, with `c = 1` on
+// the seam line and smoothly falling to `0` at the falloff distance. Beyond the falloff the field is
+// *exactly* the uncoupled one, so every point far from a seam (crown, face centre, hair tips, torso
+// centre, irises) keeps its full motion. Parameter ranges and coefficients are untouched; only the
+// *relative* displacement across the seam shrinks. Mirrored 1:1 in `src/engine.ts` (`deform`).
+//
+// - Neck top ↔ head: the neck follows the head (`face` field) fully above the chin line and fades
+//   back to its own damped follow over `NECK_HEAD_COUPLING_FALLOFF_HH` head heights below it.
+// - Neck base ↔ body: the neck blends toward the body field over its own head-follow span
+//   (`NECK_SPAN_HH`, the same span its uncoupled weight uses), reaching the body field at the base.
+// - Collar ↔ neck base: body/clothes inside the neck column (`COLLAR_COUPLING_*_ED` eye distances
+//   around the head axis) blend toward the *neck-base* field (raw neck blended toward the body by the
+//   neck-base weight) with weight `column · neck_body`. The collar never inherits the neck-top ↔
+//   head term, so clothes just under the chin keep the body field and do not turn with the head;
+//   the collar meets the neck only where the neck itself is attached to the body. Outside the
+//   column (shoulders) and below the neck span (torso) clothes are unchanged.
+// - Hair root ↔ scalp: hair layers blend toward the head field inside `HAIR_ROOT_COUPLING_BAND_HH`
+//   head heights below their sway root (C¹ sway onset instead of a kink); beyond it sway is unchanged.
+
+/// Neck head-follow span below the chin (head heights). Shared by the uncoupled neck weight and the
+/// neck-base ↔ body coupling, so the two cannot drift apart.
+pub const NECK_SPAN_HH: f64 = 0.42;
+/// Neck-top ↔ head coupling falloff below the chin line (head heights).
+pub const NECK_HEAD_COUPLING_FALLOFF_HH: f64 = 0.06;
+/// Hair-root ↔ scalp coupling band below each strand's sway root (head heights).
+pub const HAIR_ROOT_COUPLING_BAND_HH: f64 = 0.25;
+/// Collar column: full coupling within this |u| (eye distances) of the head axis…
+pub const COLLAR_COUPLING_INNER_ED: f64 = 0.35;
+/// …fading to none at this |u|.
+pub const COLLAR_COUPLING_OUTER_ED: f64 = 0.60;
+
+thread_local! {
+    static SEAM_COUPLING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether `deform` applies the T13b seam coupling on this thread (default `true`).
+pub fn seam_coupling_enabled() -> bool {
+    SEAM_COUPLING.with(|c| c.get())
+}
+
+/// Runs `f` with seam coupling enabled/disabled on the current thread only (used to measure the
+/// uncoupled baseline end to end, e.g. `flat2rig-cli --exposure-baseline`). Thread-local so parallel
+/// tests never observe each other's setting.
+pub fn with_seam_coupling<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let prev = SEAM_COUPLING.with(|c| c.replace(enabled));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SEAM_COUPLING.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+#[inline]
+fn smoothstep01(edge0: f64, edge1: f64, x: f64) -> f64 {
+    if edge1 <= edge0 {
+        return if x >= edge1 { 1.0 } else { 0.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Seam-coupling weights at a rest-space point for a layer (`0` = uncoupled).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeamCouplingWeights {
+    /// Neck → head (`face`) field blend near the chin line.
+    pub neck_head: f64,
+    /// Neck → body field blend toward the neck base.
+    pub neck_body: f64,
+    /// Body/clothes → neck-base field blend (`column(|u|) · neck_body`; never the neck-top term).
+    pub collar: f64,
+    /// Hair → head field blend inside the root band.
+    pub hair_root: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CouplingClass {
+    Neck,
+    Collar,
+    Hair,
+    None,
+}
+
+fn coupling_class(id: &str) -> CouplingClass {
+    let role = infer_part_role(id, None);
+    if role == PartRole::Neck {
+        CouplingClass::Neck
+    } else if id.starts_with("hair") {
+        CouplingClass::Hair
+    } else if matches!(role, PartRole::Body | PartRole::Clothes) {
+        CouplingClass::Collar
+    } else {
+        CouplingClass::None
+    }
+}
+
+fn neck_coupling(hf: &HeadFrame, pv: f64) -> (f64, f64) {
+    let hh = hf.hh;
+    (
+        1.0 - smoothstep01(hf.chin_v, hf.chin_v + hh * NECK_HEAD_COUPLING_FALLOFF_HH, pv),
+        smoothstep01(hf.chin_v, hf.chin_v + hh * NECK_SPAN_HH, pv),
+    )
+}
+
+/// Coupling weights the T13b `deform` uses for `id` at rest point `point` (independent of the pose).
+pub fn seam_coupling_weights(point: Point, id: &str, lm: &Landmarks) -> SeamCouplingWeights {
+    let hf = HeadFrame::from_landmarks(lm, 0, 0);
+    let (pu, pv) = hf.to_local(point.v());
+    let mut out = SeamCouplingWeights::default();
+    match coupling_class(id) {
+        CouplingClass::Neck => {
+            (out.neck_head, out.neck_body) = neck_coupling(&hf, pv);
+        }
+        CouplingClass::Collar => {
+            // Only the neck-base (body-side) component; the neck-top ↔ head weight stays 0.
+            let (_, neck_body) = neck_coupling(&hf, pv);
+            let column = 1.0
+                - smoothstep01(
+                    hf.eye_dist * COLLAR_COUPLING_INNER_ED,
+                    hf.eye_dist * COLLAR_COUPLING_OUTER_ED,
+                    pu.abs(),
+                );
+            out.neck_body = neck_body;
+            out.collar = column * neck_body;
+        }
+        CouplingClass::Hair => {
+            let (_, root_offset) = hair_sway_profile(id);
+            let root_y = lm.crown.y + hf.hh * root_offset;
+            let t = (point.y - root_y) / hf.hh;
+            out.hair_root = 1.0 - smoothstep01(0.0, HAIR_ROOT_COUPLING_BAND_HH, t);
+        }
+        CouplingClass::None => {}
+    }
+    out
+}
+
+/// Coupled neck field at `point` given the raw (uncoupled) neck displacement there.
+fn coupled_neck_field(
+    point: Point,
+    raw_neck: DVec2,
+    wts: &SeamCouplingWeights,
+    lm: &Landmarks,
+    pose: &Pose,
+) -> DVec2 {
+    let mut n = raw_neck;
+    if wts.neck_head > 0.0 {
+        let head = deform_uncoupled(point, "face", lm, pose).v();
+        n += (head - n) * wts.neck_head;
+    }
+    if wts.neck_body > 0.0 {
+        let body = deform_uncoupled(point, "body", lm, pose).v();
+        n += (body - n) * wts.neck_body;
+    }
+    n
+}
+
+/// T13b uncoupled per-layer field (the pre-T13b `deform`). Kept public for before/after
+/// measurements and the Rust/TS parity fixture; rendering uses `deform`.
+pub fn deform_uncoupled(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
+    deform_uncoupled_with_shapes(point, id, lm, pose, None)
+}
+
 pub fn deform_with_shapes(
+    point: Point,
+    id: &str,
+    lm: &Landmarks,
+    pose: &Pose,
+    shape_deform: Option<&ShapeDeformInput>,
+) -> Point {
+    let raw = deform_uncoupled_with_shapes(point, id, lm, pose, shape_deform);
+    if !seam_coupling_enabled() {
+        return raw;
+    }
+    let class = coupling_class(id);
+    if class == CouplingClass::None {
+        return raw;
+    }
+    let wts = seam_coupling_weights(point, id, lm);
+    match class {
+        CouplingClass::Neck => coupled_neck_field(point, raw.v(), &wts, lm, pose).into(),
+        CouplingClass::Collar => {
+            if wts.collar <= 0.0 {
+                return raw;
+            }
+            // Neck-base field: raw neck blended toward the body (no neck-top ↔ head term).
+            let raw_neck = deform_uncoupled(point, "neck", lm, pose).v();
+            let base = coupled_neck_field(point, raw_neck, &wts, lm, pose);
+            (raw.v() + (base - raw.v()) * wts.collar).into()
+        }
+        CouplingClass::Hair => {
+            if wts.hair_root <= 0.0 {
+                return raw;
+            }
+            let head = deform_uncoupled(point, "face", lm, pose).v();
+            (raw.v() + (head - raw.v()) * wts.hair_root).into()
+        }
+        CouplingClass::None => raw,
+    }
+}
+
+fn deform_uncoupled_with_shapes(
     point: Point,
     id: &str,
     lm: &Landmarks,
@@ -1606,7 +1814,7 @@ pub fn deform_with_shapes(
         }
     }
     let weight = if id == "neck" {
-        ((hf.chin_v + hh * 0.42 - pv) / (hh * 0.42)).clamp(0., 1.)
+        ((hf.chin_v + hh * NECK_SPAN_HH - pv) / (hh * NECK_SPAN_HH)).clamp(0., 1.)
     } else {
         1.
     };

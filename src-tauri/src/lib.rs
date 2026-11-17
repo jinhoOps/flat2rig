@@ -19,6 +19,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use image::ImageEncoder;
 use std::sync::atomic::Ordering;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
@@ -569,6 +570,78 @@ struct Sample {
     value: f64,
     vertices: Vec<core::Point>,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExposureOverlay {
+    /// Summary (per-layer exposed area, frequency, depth; holes) of `rig::exposure::ExposureMap`.
+    summary: rig::exposure::ExposureMap,
+    /// Seam coverage summary over the same envelope (`holes` / `lowerMisses`).
+    seam_holes: usize,
+    seam_lower_misses: usize,
+    /// Transparent RGBA heatmap as a PNG data URL (canvas-sized).
+    heatmap: String,
+}
+
+/// T13b: exposure map over the shared pose envelope for the advanced-screen heatmap overlay.
+/// `parts` must be bottom-to-top in composite order (the same order the renderer draws).
+#[tauri::command]
+async fn compute_exposure_map(
+    parts: Vec<MeshInput>,
+    width: usize,
+    height: usize,
+    landmarks: core::Landmarks,
+) -> Result<ExposureOverlay, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let n = core::check_size(width, height)?;
+        landmarks.validate(width, height)?;
+        if parts.len() > 64 {
+            return Err("Too many parts".into());
+        }
+        let mut ids = Vec::with_capacity(parts.len());
+        let mut visible = Vec::with_capacity(parts.len());
+        let mut fills = Vec::with_capacity(parts.len());
+        for part in parts {
+            visible.push(core::decode_bytes(&part.mask, n)?);
+            fills.push(match part.fill_mask {
+                Some(ref f) => core::decode_bytes(f, n)?,
+                None => vec![0u8; n],
+            });
+            ids.push(part.id);
+        }
+        let env = &rig::seams::pose_envelope().poses;
+        let summary = rig::exposure::compute_exposure_map(
+            &ids, &visible, &fills, &landmarks, width, height, env,
+        );
+        let roles: Vec<core::PartRole> =
+            ids.iter().map(|id| core::infer_part_role(id, None)).collect();
+        let fg: Vec<u8> = (0..n)
+            .map(|i| visible.iter().map(|m| m[i]).max().unwrap_or(0))
+            .collect();
+        let graph = rig::seams::extract_seam_graph(&ids, &roles, &visible, width, height);
+        let coverage = rig::seams::check_seam_coverage(
+            &graph, &ids, &visible, &fills, &fg, &landmarks, width, height, env, 2,
+        );
+        let rgba = rig::exposure::exposure_heatmap_rgba(&summary, None);
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &rgba,
+                width as u32,
+                height as u32,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| format!("exposure heatmap PNG: {e}"))?;
+        Ok(ExposureOverlay {
+            summary,
+            seam_holes: coverage.holes,
+            seam_lower_misses: coverage.lower_misses,
+            heatmap: format!("data:image/png;base64,{}", STANDARD.encode(png)),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn build_rig(
     parts: Vec<MeshInput>,
@@ -798,6 +871,7 @@ pub fn run() {
             propose_parts,
             refine_part_prompt,
             build_rig,
+            compute_exposure_map,
             fill_part,
             fill_part_occlusion,
             save_artifact,

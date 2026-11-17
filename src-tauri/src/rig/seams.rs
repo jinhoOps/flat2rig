@@ -15,7 +15,8 @@
 //!   and imported by TS (`src/rig/poseEnvelope.ts`), so Rust and TS read the same table. Its
 //!   ranges must equal `PARAM_DEFS` (no shrinking); the TS test enforces that.
 //! - `core::part_overlap_margins` remains as the fallback when a seam is missing (landmarks only).
-//! - `coupling` is a placeholder filled by T13b (coupled seam deformation).
+//! - `coupling` is filled by `annotate_seam_couplings` (T13b coupled seam deformation; the weights
+//!   come from `core::seam_coupling_weights`, the same function `deform` uses).
 
 use crate::core::{deform, effective_part_mask, HeadFrame, Landmarks, PartRole, Point, Pose};
 use glam::DVec2;
@@ -154,12 +155,94 @@ pub fn pose_envelope() -> &'static PoseEnvelope {
 // Seam graph
 // ---------------------------------------------------------------------------------------------
 
-/// T13b placeholder: coupled deformation weights across a seam. Always `None` in T13a.
+/// T13b coupled-deformation kinds (see `core::deform_with_shapes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SeamCouplingKind {
+    /// Neck top follows the head field near the chin line (`face`/`neck`).
+    NeckHead,
+    /// Neck base and the collar column share one field (`clothes`|`body` / `neck`).
+    Collar,
+    /// Hair blends toward the head field inside its root band (hair / `face` or hair / hair).
+    HairRoot,
+}
+
+/// T13b coupling attached to a seam. Weights are the mean `core::seam_coupling_weights` blend of
+/// each side toward its partner field over the seam boundary (`0` = that side keeps its own field;
+/// a hair seam lying entirely beyond the root band reports `0` on both sides).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeamCoupling {
-    pub upper_follow: f64,
-    pub lower_follow: f64,
+    pub kind: SeamCouplingKind,
+    pub upper_weight: f64,
+    pub lower_weight: f64,
+    /// Distance (px) over which the coupling falls from its seam-line value to 0.
+    pub falloff_px: f64,
+}
+
+fn coupling_kind(upper: PartRole, lower: PartRole) -> Option<SeamCouplingKind> {
+    use PartRole as R;
+    let is_hair = |r: PartRole| matches!(r, R::HairFront | R::HairSideL | R::HairSideR | R::HairBack);
+    match (upper, lower) {
+        (R::Face, R::Neck) | (R::Neck, R::Face) => Some(SeamCouplingKind::NeckHead),
+        (R::Clothes | R::Body, R::Neck) | (R::Neck, R::Clothes | R::Body) => {
+            Some(SeamCouplingKind::Collar)
+        }
+        (a, b) if (is_hair(a) && (is_hair(b) || b == R::Face)) || (is_hair(b) && a == R::Face) => {
+            Some(SeamCouplingKind::HairRoot)
+        }
+        _ => None,
+    }
+}
+
+/// Blend weight of layer `id` toward its partner field for a coupling kind at `p`.
+fn side_weight(kind: SeamCouplingKind, p: Point, id: &str, lm: &Landmarks) -> f64 {
+    let w = crate::core::seam_coupling_weights(p, id, lm);
+    match kind {
+        // Only the neck side is blended (toward the head field); `face` keeps its own field.
+        SeamCouplingKind::NeckHead => w.neck_head,
+        // The neck side blends toward the body field; body/clothes blend toward the coupled neck.
+        SeamCouplingKind::Collar => {
+            if crate::core::infer_part_role(id, None) == PartRole::Neck {
+                w.neck_body
+            } else {
+                w.collar
+            }
+        }
+        SeamCouplingKind::HairRoot => w.hair_root,
+    }
+}
+
+/// Fills `SeamContract.coupling` for every coupled seam (T13b). Weights are read from
+/// `core::seam_coupling_weights`, the same function `deform` uses, so they cannot drift.
+pub fn annotate_seam_couplings(graph: &mut SeamGraph, lm: &Landmarks) {
+    let hh = HeadFrame::from_landmarks(lm, 0, 0).hh;
+    for seam in &mut graph.seams {
+        let Some(kind) = coupling_kind(seam.upper_role, seam.lower_role) else {
+            seam.coupling = None;
+            continue;
+        };
+        let pts = seam.boundary_samples(256);
+        let mean = |id: &str| {
+            if pts.is_empty() {
+                0.0
+            } else {
+                pts.iter().map(|&p| side_weight(kind, p, id, lm)).sum::<f64>() / pts.len() as f64
+            }
+        };
+        let falloff_px = hh
+            * match kind {
+                SeamCouplingKind::NeckHead => crate::core::NECK_HEAD_COUPLING_FALLOFF_HH,
+                SeamCouplingKind::Collar => crate::core::NECK_SPAN_HH,
+                SeamCouplingKind::HairRoot => crate::core::HAIR_ROOT_COUPLING_BAND_HH,
+            };
+        seam.coupling = Some(SeamCoupling {
+            kind,
+            upper_weight: mean(&seam.upper_id),
+            lower_weight: mean(&seam.lower_id),
+            falloff_px,
+        });
+    }
 }
 
 /// One stacked layer pair with a shared visible boundary. `upper` draws above `lower`.
@@ -346,7 +429,7 @@ fn dv(p: Point) -> DVec2 {
 }
 
 #[inline]
-fn pixel(p: DVec2, w: usize, h: usize) -> Option<usize> {
+pub(crate) fn pixel(p: DVec2, w: usize, h: usize) -> Option<usize> {
     let x = p.x.round();
     let y = p.y.round();
     if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= w as f64 || y >= h as f64 {
@@ -357,7 +440,7 @@ fn pixel(p: DVec2, w: usize, h: usize) -> Option<usize> {
 }
 
 /// Chamfer (1, √2) distance from each pixel to the nearest `mask > 0` pixel (0 inside).
-fn outside_distance(mask: &[u8], w: usize, h: usize) -> Vec<f32> {
+pub(crate) fn outside_distance(mask: &[u8], w: usize, h: usize) -> Vec<f32> {
     let inf = f32::MAX / 4.0;
     let d1 = 1.0f32;
     let d2 = std::f32::consts::SQRT_2;
@@ -433,6 +516,15 @@ pub struct SeamRequirement {
     /// Moving boundary-point × pose pairs whose whole exposed band has no supported sample
     /// (background or layers below `lower` only).
     pub unsupported_samples: usize,
+    /// T13b hidden-area merge (`hidden_area_seam_requirements`): underlap measured with the coupled
+    /// runtime `deform` and with the uncoupled field. `required_underlap_px` is their max so that
+    /// coupling never shrinks a hidden area (PSD hand-off: Cubism deformers move independently).
+    /// `None` for plain single-field measurements.
+    pub coupled_underlap_px: Option<usize>,
+    pub uncoupled_underlap_px: Option<usize>,
+    pub uncoupled_max_relative_displacement_px: Option<f64>,
+    /// Which field set `required_underlap_px`: `coupled`, `uncoupled`, or `equal`.
+    pub adopted: Option<&'static str>,
 }
 
 /// Requirements for every seam using the real `core::deform`.
@@ -543,6 +635,10 @@ where
             worst_pose: worst.as_ref().map(|(n, _)| n.clone()),
             worst_point: worst.map(|(_, p)| p),
             unsupported_samples: unsupported,
+            coupled_underlap_px: None,
+            uncoupled_underlap_px: None,
+            uncoupled_max_relative_displacement_px: None,
+            adopted: None,
         });
     }
     out
@@ -571,6 +667,47 @@ where
         }
     }
     best
+}
+
+/// Requirements for hidden-area (underlap) generation: per seam, the max of the requirement with the
+/// coupled runtime `deform` and with the uncoupled field (`core::with_seam_coupling(false, …)`).
+/// Measurement fields (relative displacement, depth, worst pose) are the coupled runtime's; the
+/// uncoupled values and the adopted side are recorded. When coupling is disabled on this thread the
+/// two fields are identical and the plain uncoupled requirements are returned.
+#[allow(clippy::too_many_arguments)]
+pub fn hidden_area_seam_requirements(
+    graph: &SeamGraph,
+    visible_masks: &[Vec<u8>],
+    fg_alpha: &[u8],
+    lm: &Landmarks,
+    w: usize,
+    h: usize,
+    poses: &[EnvelopePose],
+    max_samples_per_seam: usize,
+) -> Vec<SeamRequirement> {
+    let run = || seam_requirements(graph, visible_masks, fg_alpha, lm, w, h, poses, max_samples_per_seam);
+    if !crate::core::seam_coupling_enabled() {
+        return run();
+    }
+    let coupled = run();
+    let uncoupled = crate::core::with_seam_coupling(false, run);
+    coupled
+        .into_iter()
+        .zip(uncoupled)
+        .map(|(mut c, u)| {
+            let (cr, ur) = (c.required_underlap_px, u.required_underlap_px);
+            c.coupled_underlap_px = Some(cr);
+            c.uncoupled_underlap_px = Some(ur);
+            c.uncoupled_max_relative_displacement_px = Some(u.max_relative_displacement_px);
+            c.adopted = Some(match cr.cmp(&ur) {
+                std::cmp::Ordering::Greater => "coupled",
+                std::cmp::Ordering::Less => "uncoupled",
+                std::cmp::Ordering::Equal => "equal",
+            });
+            c.required_underlap_px = cr.max(ur);
+            c
+        })
+        .collect()
 }
 
 /// Seam requirements indexed for the hidden-area generator. Queries return `None` when no seam
@@ -650,6 +787,13 @@ pub struct SeamCoverageSummary {
     pub lower_misses: usize,
     pub holes: usize,
     pub max_miss_depth_px: f64,
+    /// Holes per envelope pose group (`axis`, `headBodyOpposite`, `hairPhase`, ...).
+    pub hole_pose_groups: BTreeMap<String, usize>,
+    /// Pose with the most holes on this seam, and its hole count.
+    pub worst_hole_pose: Option<String>,
+    pub worst_hole_pose_holes: usize,
+    /// Max band depth (px) of a hole sample on this seam.
+    pub max_hole_depth_px: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -836,6 +980,7 @@ where
             .collect();
         for pe in poses {
             let f_lower = |x: DVec2| d(x, seam.lower_id.as_str(), &pe.pose);
+            let holes_before = sum.holes;
             for &bp in &pts {
                 sum.checks += 1;
                 let b = dv(bp);
@@ -851,6 +996,8 @@ where
                         sum.max_miss_depth_px = sum.max_miss_depth_px.max(t);
                         if hole {
                             sum.holes += 1;
+                            sum.max_hole_depth_px = sum.max_hole_depth_px.max(t);
+                            *sum.hole_pose_groups.entry(pe.group.clone()).or_default() += 1;
                         }
                         let v = CoverageViolation {
                             upper_id: seam.upper_id.clone(),
@@ -875,6 +1022,11 @@ where
                     sum.moving_checks += 1;
                 }
             }
+            let pose_holes = sum.holes - holes_before;
+            if pose_holes > sum.worst_hole_pose_holes {
+                sum.worst_hole_pose_holes = pose_holes;
+                sum.worst_hole_pose = Some(pe.name.clone());
+            }
         }
         report.checks += sum.checks;
         report.lower_misses += sum.lower_misses;
@@ -890,7 +1042,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::infer_part_role;
+    use crate::core::{deform_uncoupled, infer_part_role};
 
     fn roles(ids: &[String]) -> Vec<PartRole> {
         ids.iter().map(|id| infer_part_role(id, None)).collect()
@@ -1101,11 +1253,13 @@ mod tests {
             .collect();
         let env = &pose_envelope().poses;
         let lmr = &lm;
-        let base = |p: Point, id: &str, pose: &Pose| deform(p, id, lmr, pose);
+        // Uncoupled field: inside the collar column the T13b coupled field makes clothes and neck
+        // identical (relative displacement 0), which would make the scaling check vacuous.
+        let base = |p: Point, id: &str, pose: &Pose| deform_uncoupled(p, id, lmr, pose);
         let (m1, pose1) = max_relative_displacement(&points, "clothes", "neck", env, base);
         let scaled = |k: f64| {
             move |p: Point, id: &str, pose: &Pose| {
-                let q = deform(p, id, lmr, pose);
+                let q = deform_uncoupled(p, id, lmr, pose);
                 Point {
                     x: p.x + k * (q.x - p.x),
                     y: p.y + k * (q.y - p.y),
@@ -1335,15 +1489,11 @@ mod tests {
         assert!(!follows_hair_sway("face", &lm));
     }
 
-    /// Shared Rust/TS fixture: the envelope as each side interprets it plus the max relative
-    /// displacement of fixed boundary points across the envelope using each side's `deform`.
-    /// Regenerate with `FLAT2RIG_BLESS=1 cargo test seam_envelope_parity`.
-    #[test]
-    fn seam_envelope_parity_fixture_matches_rust_deform() {
-        let lm = lm_1024();
-        let env = &pose_envelope().poses;
-        type Case = (&'static str, &'static str, Vec<(f64, f64)>);
-        let cases: Vec<Case> = vec![
+    type Case = (&'static str, &'static str, Vec<(f64, f64)>);
+
+    /// Seam point sets shared by the parity fixture and the T13b coupling test.
+    fn parity_cases() -> Vec<Case> {
+        vec![
             (
                 "face",
                 "neck",
@@ -1386,26 +1536,224 @@ mod tests {
             ("hat", "hair_front", vec![(512.0, 150.5)]),
             ("acc_ribbon", "hair_back", vec![(700.0, 300.5)]),
             ("clothes_hands", "clothes", vec![(560.0, 860.5)]),
-        ];
-        let mut out_cases = Vec::new();
-        for (upper, lower, pts) in &cases {
+            // T13b: hair root band (strand edges near the scalp), collar corner, body / neck.
+            (
+                "hair_front",
+                "face",
+                vec![(512.0, 120.5), (452.0, 168.5), (512.0, 182.5), (574.0, 200.5)],
+            ),
+            (
+                "hair_side_L_2",
+                "hair_back",
+                vec![(650.5, 240.0), (690.5, 280.0)],
+            ),
+            ("body", "neck", vec![(486.0, 660.5), (538.0, 660.5)]),
+            ("clothes", "neck", vec![(560.5, 645.0), (466.0, 639.5)]),
+        ]
+    }
+
+    /// Points far from every coupled seam (name, layer, point). T13b must leave their motion as is.
+    /// The hair layer's own crown is its root seam with the scalp (coupled), so the crown is checked
+    /// on the head (`face`) layer.
+    fn far_points() -> Vec<(&'static str, &'static str, (f64, f64))> {
+        vec![
+            ("crownFace", "face", (512.0, 120.0)),
+            ("faceCentre", "face", (512.0, 400.0)),
+            ("noseTip", "face", (512.0, 440.0)),
+            ("bangTip", "hair_front", (510.0, 324.0)),
+            ("bangTip2", "hair_front_2", (470.0, 368.0)),
+            ("sideLockTipR", "hair_side_R", (330.0, 715.0)),
+            ("sideLockTipL", "hair_side_L_2", (694.0, 755.0)),
+            ("backHairTip", "hair_back", (512.0, 855.0)),
+            ("torsoCentre", "clothes", (512.0, 800.0)),
+            ("torsoCentreBody", "body", (512.0, 820.0)),
+            ("shoulderR", "clothes", (330.0, 700.0)),
+            ("shoulderL", "clothes", (694.0, 700.0)),
+            ("irisR", "eyeR_iris", (400.0, 360.0)),
+            ("irisL", "eyeL_iris", (624.0, 360.0)),
+            ("browR", "browR", (400.0, 300.0)),
+            ("mouth", "mouth_upper", (512.0, 488.0)),
+        ]
+    }
+
+    fn max_displacement<D: Fn(Point, &str, &Pose) -> Point>(
+        p: Point,
+        id: &str,
+        env: &[EnvelopePose],
+        f: D,
+    ) -> f64 {
+        env.iter()
+            .map(|pe| (dv(f(p, id, &pe.pose)) - dv(p)).length())
+            .fold(0.0, f64::max)
+    }
+
+    /// T13b: coupling lowers the envelope max relative displacement of the coupled seams and leaves
+    /// every point far from them exactly where the uncoupled field puts it, in every pose.
+    #[test]
+    fn t13b_coupling_reduces_seam_relative_displacement_and_keeps_far_points_unchanged() {
+        let lm = lm_1024();
+        let env = &pose_envelope().poses;
+        let coupled = |p: Point, id: &str, pose: &Pose| deform(p, id, &lm, pose);
+        let uncoupled = |p: Point, id: &str, pose: &Pose| deform_uncoupled(p, id, &lm, pose);
+        println!("T13B_REL | upper | lower | points | uncoupled max rel px | coupled max rel px |");
+        for (upper, lower, pts) in parity_cases() {
             let points: Vec<Point> = pts.iter().map(|&(x, y)| Point { x, y }).collect();
-            let (m, pose) = max_relative_displacement(&points, upper, lower, env, |p, id, pose| {
-                deform(p, id, &lm, pose)
-            });
+            let (mu, _) = max_relative_displacement(&points, upper, lower, env, uncoupled);
+            let (mc, _) = max_relative_displacement(&points, upper, lower, env, coupled);
+            println!("T13B_REL | {upper} | {lower} | {pts:?} | {mu:.2} | {mc:.2} |");
+            let coupled_pair = matches!(
+                (upper, lower),
+                ("face", "neck") | ("clothes", "neck") | ("body", "neck")
+            ) || (upper.starts_with("hair") && pts.iter().all(|p| p.1 < 300.0));
+            if coupled_pair {
+                assert!(
+                    mc < mu - 1e-3,
+                    "{upper}/{lower}: coupling must reduce relative displacement ({mu} -> {mc})"
+                );
+            }
+        }
+        // Far points: same displacement in every pose (not only the max) - no motion reduction.
+        println!("T13B_FAR | point | layer | uncoupled max disp px | coupled max disp px |");
+        for (name, id, (x, y)) in far_points() {
+            let p = Point { x, y };
+            for pe in env {
+                let a = coupled(p, id, &pe.pose);
+                let b = uncoupled(p, id, &pe.pose);
+                assert!(
+                    (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9,
+                    "{name} ({id}) moved differently in {}: {a:?} vs {b:?}",
+                    pe.name
+                );
+            }
+            let (du, dc) = (
+                max_displacement(p, id, env, uncoupled),
+                max_displacement(p, id, env, coupled),
+            );
+            println!("T13B_FAR | {name} | {id} | {du:.3} | {dc:.3} |");
+            assert!(du > 0.0, "{name} must move in the envelope");
+        }
+        // The thread-local switch reproduces the uncoupled field through the public `deform`.
+        let p = Point { x: 512.0, y: 562.5 };
+        let pose = &env.iter().find(|e| e.pose.angle_z != 0.0).unwrap().pose;
+        let off = crate::core::with_seam_coupling(false, || deform(p, "neck", &lm, pose));
+        let raw = deform_uncoupled(p, "neck", &lm, pose);
+        assert_eq!((off.x, off.y), (raw.x, raw.y));
+        assert!(crate::core::seam_coupling_enabled());
+    }
+
+    #[test]
+    fn coupling_annotation_reads_deform_weights_for_coupled_role_pairs_only() {
+        let (w, h) = (1024usize, 1024usize);
+        let n = w * h;
+        let ids: Vec<String> = ["hair_back", "neck", "clothes", "face", "hair_front"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut masks = vec![vec![0u8; n]; ids.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let (xf, yf) = (x as f64, y as f64);
+                let layer = if ((xf - 512.0) / 200.0).hypot((yf - 210.0) / 115.0) <= 1.0 {
+                    4
+                } else if ((xf - 512.0) / 180.0).hypot((yf - 340.0) / 220.0) <= 1.0 {
+                    3
+                } else if (xf - 512.0).abs() <= 210.0 && (640.0..=940.0).contains(&yf) {
+                    2
+                } else if (xf - 512.0).abs() <= 46.0 && (540.0..=660.0).contains(&yf) {
+                    1
+                } else if ((xf - 512.0) / 260.0).hypot((yf - 520.0) / 340.0) <= 1.0 {
+                    0
+                } else {
+                    continue;
+                };
+                masks[layer][y * w + x] = 255;
+            }
+        }
+        let lm = lm_1024();
+        let mut graph = extract_seam_graph(&ids, &roles(&ids), &masks, w, h);
+        assert!(graph.seams.iter().all(|s| s.coupling.is_none()));
+        annotate_seam_couplings(&mut graph, &lm);
+        let fn_ = graph.find("face", "neck").unwrap().coupling.unwrap();
+        assert_eq!(fn_.kind, SeamCouplingKind::NeckHead);
+        assert!(fn_.lower_weight > 0.95, "{fn_:?}");
+        assert_eq!(fn_.upper_weight, 0.0);
+        let cn = graph.find("clothes", "neck").unwrap().coupling.unwrap();
+        assert_eq!(cn.kind, SeamCouplingKind::Collar);
+        // Clothes blend toward the neck-base field only by the neck-base weight (≈0.4 at y=640).
+        assert!(cn.upper_weight > 0.2 && cn.upper_weight < 0.9, "{cn:?}");
+        assert!(cn.lower_weight > 0.2, "{cn:?}");
+        let hf = graph.find("hair_front", "face").unwrap().coupling.unwrap();
+        assert_eq!(hf.kind, SeamCouplingKind::HairRoot);
+        assert!(graph.find("clothes", "hair_back").unwrap().coupling.is_none());
+        assert!(graph.find("face", "hair_back").unwrap().coupling.is_some());
+    }
+
+    /// Shared Rust/TS fixture: the envelope as each side interprets it, the max relative
+    /// displacement of fixed seam points with the coupled (`deform`) and uncoupled
+    /// (`deform_uncoupled`) fields, far reference point displacements, and coupling weights.
+    /// Regenerate with `FLAT2RIG_BLESS=1 cargo test seam_envelope_parity`.
+    #[test]
+    fn seam_envelope_parity_fixture_matches_rust_deform() {
+        let lm = lm_1024();
+        let env = &pose_envelope().poses;
+        let coupled = |p: Point, id: &str, pose: &Pose| deform(p, id, &lm, pose);
+        let uncoupled = |p: Point, id: &str, pose: &Pose| deform_uncoupled(p, id, &lm, pose);
+        let mut out_cases = Vec::new();
+        for (upper, lower, pts) in &parity_cases() {
+            let points: Vec<Point> = pts.iter().map(|&(x, y)| Point { x, y }).collect();
+            let (m, pose) = max_relative_displacement(&points, upper, lower, env, coupled);
+            let (mu, pose_u) = max_relative_displacement(&points, upper, lower, env, uncoupled);
             out_cases.push(serde_json::json!({
                 "upper": upper,
                 "lower": lower,
                 "points": pts.iter().map(|&(x, y)| serde_json::json!([x, y])).collect::<Vec<_>>(),
                 "maxRelativeDisplacementPx": m,
                 "worstPose": pose,
+                "uncoupledMaxRelativeDisplacementPx": mu,
+                "uncoupledWorstPose": pose_u,
             }));
         }
+        let far: Vec<serde_json::Value> = far_points()
+            .iter()
+            .map(|&(name, id, (x, y))| {
+                let p = Point { x, y };
+                serde_json::json!({
+                    "name": name,
+                    "id": id,
+                    "point": [x, y],
+                    "maxDisplacementPx": max_displacement(p, id, env, coupled),
+                })
+            })
+            .collect();
+        let weight_samples: Vec<(&str, (f64, f64))> = vec![
+            ("neck", (512.0, 560.0)),
+            ("neck", (512.0, 590.0)),
+            ("neck", (512.0, 650.0)),
+            ("clothes", (512.0, 650.0)),
+            ("clothes", (590.0, 660.0)),
+            ("body", (512.0, 760.0)),
+            ("hair_front", (512.0, 170.0)),
+            ("hair_side_L_2", (690.0, 260.0)),
+            ("hair_back", (512.0, 200.0)),
+            ("face", (512.0, 400.0)),
+        ];
+        let weights: Vec<serde_json::Value> = weight_samples
+            .iter()
+            .map(|&(id, (x, y))| {
+                serde_json::json!({
+                    "id": id,
+                    "point": [x, y],
+                    "weights": crate::core::seam_coupling_weights(Point { x, y }, id, &lm),
+                })
+            })
+            .collect();
         let doc = serde_json::json!({
-            "description": "T13a Rust/TS parity: envelope poses as parsed by Rust (Pose::default() merged) and max relative seam displacement over the envelope using core::deform. TS asserts the same values with engine.ts deform.",
+            "description": "T13a/T13b Rust/TS parity: envelope poses as parsed by Rust (Pose::default() merged); max relative seam displacement over the envelope with core::deform (coupled, T13b) and core::deform_uncoupled; far reference point max displacement (coupled); seam coupling weights. TS asserts the same values with engine.ts deform / deformUncoupled / seamCouplingWeights.",
             "landmarks": lm,
             "envelope": env.iter().map(|p| serde_json::json!({ "name": p.name, "pose": p.pose })).collect::<Vec<_>>(),
             "cases": out_cases,
+            "farPoints": far,
+            "couplingWeights": weights,
         });
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/seam-envelope-parity.json");
@@ -1419,21 +1767,34 @@ mod tests {
             fixture["envelope"], doc["envelope"],
             "envelope interpretation drifted"
         );
+        let close = |a: &serde_json::Value, b: &serde_json::Value, what: &str| {
+            let (x, y) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+            assert!((x - y).abs() < 1e-9, "{what}: fixture {x} vs rust {y}");
+        };
         let fc = fixture["cases"].as_array().unwrap();
         assert_eq!(fc.len(), out_cases.len());
         for (a, b) in fc.iter().zip(&out_cases) {
             assert_eq!(a["upper"], b["upper"]);
             assert_eq!(a["lower"], b["lower"]);
-            let (x, y) = (
-                a["maxRelativeDisplacementPx"].as_f64().unwrap(),
-                b["maxRelativeDisplacementPx"].as_f64().unwrap(),
+            let what = format!("{} / {}", a["upper"], a["lower"]);
+            close(&a["maxRelativeDisplacementPx"], &b["maxRelativeDisplacementPx"], &what);
+            close(
+                &a["uncoupledMaxRelativeDisplacementPx"],
+                &b["uncoupledMaxRelativeDisplacementPx"],
+                &what,
             );
-            assert!(
-                (x - y).abs() < 1e-9,
-                "{} / {}: fixture {x} vs rust {y}",
-                a["upper"],
-                a["lower"]
-            );
+        }
+        let ff = fixture["farPoints"].as_array().unwrap();
+        assert_eq!(ff.len(), far.len());
+        for (a, b) in ff.iter().zip(&far) {
+            close(&a["maxDisplacementPx"], &b["maxDisplacementPx"], a["name"].as_str().unwrap());
+        }
+        let fw = fixture["couplingWeights"].as_array().unwrap();
+        assert_eq!(fw.len(), weights.len());
+        for (a, b) in fw.iter().zip(&weights) {
+            for k in ["neckHead", "neckBody", "collar", "hairRoot"] {
+                close(&a["weights"][k], &b["weights"][k], k);
+            }
         }
     }
 }

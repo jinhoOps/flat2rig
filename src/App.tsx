@@ -80,6 +80,7 @@ import {
   cancelAnalysis,
   checkAppUpdate,
   chooseOnnxModel,
+  computeExposureMap,
   desktop,
   detectLandmarksForFace,
   downloadModel,
@@ -92,6 +93,7 @@ import {
   relaunchApp,
   saveFile,
   setModelPath as setRegisteredModelPath,
+  type ExposureOverlayResult,
   type FaceAnalysisResponse,
   type MeshQualityReport,
   type RefinePromptResult,
@@ -194,6 +196,13 @@ export default function App() {
     [wire, setWire] = useState(false),
     [original, setOriginal] = useState(false),
     [solo, setSolo] = useState(false);
+  // T13b exposure-frequency heatmap (advanced screen). Cached per `project.parts` identity.
+  const [exposureOverlay, setExposureOverlay] = useState(false);
+  const [exposureData, setExposureData] = useState<{
+    parts: Project["parts"];
+    image: HTMLImageElement;
+    result: ExposureOverlayResult;
+  } | null>(null);
   const [detailMode, setDetailMode] = useState<"detail" | "parent">("detail");
   const [templateMode, setTemplateMode] = useState(true);
   const [hairSplit, setHairSplit] = useState(true);
@@ -1348,6 +1357,41 @@ export default function App() {
     }
     return 12;
   };
+  const toggleExposureOverlay = (on: boolean) => {
+    setExposureOverlay(on);
+    if (!on || !project) return;
+    if (exposureData && exposureData.parts === project.parts) return;
+    if (!desktop) {
+      setMessage("노출 맵은 데스크톱 앱(Rust 렌더러)에서만 계산합니다.");
+      setExposureOverlay(false);
+      return;
+    }
+    const snapshot = project;
+    void task("노출 맵 계산 중 (포즈 포락선 전체)", async () => {
+      const ordered = snapshot.parts
+        .map((part, i) => ({ part, i }))
+        .sort((a, b) => (a.part.compositeOrder ?? a.i) - (b.part.compositeOrder ?? b.i))
+        .map(({ part }) => part)
+        .filter((part) => part.visible && part.status !== "missing");
+      const result = await computeExposureMap(
+        ordered,
+        snapshot.width,
+        snapshot.height,
+        snapshot.landmarks,
+      );
+      if (!result) return;
+      const image = await loadImage(result.heatmap);
+      setExposureData({ parts: snapshot.parts, image, result });
+      const h = result.summary.holes;
+      setMessage(
+        `노출 맵 · ${result.summary.poses}포즈 · 노출 숨은 영역 ${result.summary.exposedPxTotal.toLocaleString()}px / ${result.summary.hiddenPxTotal.toLocaleString()}px · 최대 깊이 ${result.summary.maxDepthPx.toFixed(1)}px · 갇힌 구멍 ${h.holePxMax}px(최대 포즈) · 이음새 구멍 ${result.seamHoles}`,
+      );
+    });
+  };
+  const exposureImage =
+    exposureOverlay && project && exposureData?.parts === project.parts
+      ? exposureData.image
+      : null;
   const fillPart = () => {
     const p = projectRef.current,
       part = p?.parts.find((t) => t.id === selected);
@@ -2181,6 +2225,7 @@ export default function App() {
                   original={original}
                   overlay={overlay}
                   fillOverlay={fillOverlay}
+                  exposureOverlay={tab === "advanced" ? exposureImage : null}
                   compareDiff={compareDiff}
                   wire={wire}
                   solo={solo}
@@ -3146,6 +3191,17 @@ export default function App() {
                           />
                           선택 파츠만 보기
                         </label>
+                        {tab === "advanced" && (
+                          <label title="허용 모션(공유 포즈 포락선) 전체에서 숨은 영역이 드러나는 빈도: 노랑(드묾)→빨강(항상), 옅은 파랑=드러나지 않는 숨은 영역(유지), 자홍=갇힌 구멍">
+                            <input
+                              type="checkbox"
+                              checked={exposureOverlay}
+                              disabled={!!busy || !project?.parts.length}
+                              onChange={(e) => toggleExposureOverlay(e.target.checked)}
+                            />
+                            노출 빈도 히트맵 (T13b)
+                          </label>
+                        )}
                       </div>
                       <div className="two-buttons">
                         <button disabled={!!busy} onClick={fillPart}>

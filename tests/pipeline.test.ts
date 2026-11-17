@@ -7,6 +7,7 @@ import {
   cleanSubtractedSiblingMask,
   compositePartTexture,
   deform,
+  deformUncoupled,
   defaultLandmarks,
   effectiveMask,
   expandFillSeparated,
@@ -17,6 +18,7 @@ import {
   maxSeamRelativeDisplacement,
   partOverlapMargins,
   recommendedFillRadius,
+  seamCouplingWeights,
   separate,
 } from "../src/engine";
 import {
@@ -206,6 +208,53 @@ describe("image partition and editing invariants", () => {
     expect(deform(pt, { id: "body" }, lm, pose)).toEqual(pt);
     expect(deform(pt, { id: "clothes", role: "clothes" }, lm, pose)).toEqual(pt);
     expect(deform(pt, { id: "hair_side_R", role: "hair_side_R" }, lm, pose)).not.toEqual(pt);
+  });
+  it("T13b couples the collar to the neck base only (never the head) while torso centre and shoulders stay put", () => {
+    const lm: Landmarks = {
+      eyeR: { x: 400, y: 360 },
+      eyeL: { x: 624, y: 360 },
+      mouth: { x: 512, y: 492 },
+      chin: { x: 512, y: 560 },
+      crown: { x: 512, y: 120 },
+    };
+    const pose = { ...REST, angleX: 30, angleY: -25, angleZ: 20, bodyAngleZ: -10, hair: 1 };
+    // Collar inside the neck column: clothes and neck move closer (relative displacement shrinks).
+    const collar = { x: 512, y: 645 };
+    const c = deform(collar, { id: "clothes", role: "clothes" }, lm, pose);
+    const n = deform(collar, { id: "neck" }, lm, pose);
+    const cRaw = deformUncoupled(collar, { id: "clothes", role: "clothes" }, lm, pose);
+    const nRaw = deformUncoupled(collar, { id: "neck" }, lm, pose);
+    const relRaw = Math.hypot(cRaw.x - nRaw.x, cRaw.y - nRaw.y);
+    expect(relRaw).toBeGreaterThan(5);
+    expect(Math.hypot(c.x - n.x, c.y - n.y)).toBeLessThan(relRaw * 0.6);
+    // Clothes right under the chin never inherit the neck-top ↔ head term: they stay (almost) on
+    // the body field instead of turning with the head.
+    const underChin = { x: 512, y: 566 };
+    const w = seamCouplingWeights(underChin, { id: "clothes", role: "clothes" }, lm);
+    expect(w.neckHead).toBe(0);
+    expect(w.collar).toBeLessThan(0.01);
+    const cu = deform(underChin, { id: "clothes", role: "clothes" }, lm, pose);
+    const cuRaw = deformUncoupled(underChin, { id: "clothes", role: "clothes" }, lm, pose);
+    expect(Math.hypot(cu.x - cuRaw.x, cu.y - cuRaw.y)).toBeLessThan(0.5);
+    // Neck classification is role based: an explicit-role neck layer couples like `neck`.
+    const custom = seamCouplingWeights({ x: 512, y: 560 }, { id: "neck_inner", role: "neck" }, lm);
+    expect(custom.neckHead).toBe(1);
+    // Jaw line: the neck top follows the head (face) field.
+    const jaw = { x: 512, y: 560 };
+    const f = deform(jaw, { id: "face" }, lm, pose);
+    const nj = deform(jaw, { id: "neck" }, lm, pose);
+    expect(Math.hypot(f.x - nj.x, f.y - nj.y)).toBeLessThan(1e-6);
+    // Far from the seams nothing changes: torso centre, shoulders, face centre, hair tips.
+    for (const [id, p] of [
+      ["clothes", { x: 512, y: 800 }],
+      ["clothes", { x: 330, y: 700 }],
+      ["body", { x: 694, y: 720 }],
+      ["face", { x: 512, y: 400 }],
+      ["hair_side_R", { x: 330, y: 715 }],
+      ["hair_front", { x: 510, y: 324 }],
+    ] as const) {
+      expect(deform(p, { id }, lm, pose), id).toEqual(deformUncoupled(p, { id }, lm, pose));
+    }
   });
   it("triangulates large curved torso masks cleanly without center collapse", () => {
     const w = 160,
@@ -1880,6 +1929,13 @@ describe("preserved part merging on regeneration", () => {
         points: [number, number][];
         maxRelativeDisplacementPx: number;
         worstPose: string | null;
+        uncoupledMaxRelativeDisplacementPx: number;
+      }[];
+      farPoints: { name: string; id: string; point: [number, number]; maxDisplacementPx: number }[];
+      couplingWeights: {
+        id: string;
+        point: [number, number];
+        weights: { neckHead: number; neckBody: number; collar: number; hairRoot: number };
       }[];
     };
     // Rust parses the same JSON over Pose::default(); TS merges over REST. Both must agree.
@@ -1896,12 +1952,65 @@ describe("preserved part merging on regeneration", () => {
         fixture.landmarks,
       );
       expect(Math.abs(got.maxPx - c.maxRelativeDisplacementPx), `${c.upper}/${c.lower}`).toBeLessThan(1e-6);
+      const raw = maxSeamRelativeDisplacement(
+        c.points.map(([x, y]) => ({ x, y })),
+        { id: c.upper },
+        { id: c.lower },
+        fixture.landmarks,
+        POSE_ENVELOPE,
+        deformUncoupled,
+      );
+      expect(
+        Math.abs(raw.maxPx - c.uncoupledMaxRelativeDisplacementPx),
+        `uncoupled ${c.upper}/${c.lower}`,
+      ).toBeLessThan(1e-6);
     }
+    // T13b far reference points: coupled max displacement equals Rust, and equals the uncoupled
+    // field pose by pose (coupling never reduces motion away from seams).
+    expect(fixture.farPoints.length).toBeGreaterThan(10);
+    for (const f of fixture.farPoints) {
+      const p = { x: f.point[0], y: f.point[1] };
+      let maxD = 0;
+      for (const pose of POSE_ENVELOPE) {
+        const a = deform(p, { id: f.id }, fixture.landmarks, pose.params);
+        const b = deformUncoupled(p, { id: f.id }, fixture.landmarks, pose.params);
+        expect(Math.abs(a.x - b.x) + Math.abs(a.y - b.y), `${f.name} ${pose.name}`).toBeLessThan(1e-9);
+        maxD = Math.max(maxD, Math.hypot(a.x - p.x, a.y - p.y));
+      }
+      expect(Math.abs(maxD - f.maxDisplacementPx), f.name).toBeLessThan(1e-6);
+    }
+    for (const c of fixture.couplingWeights) {
+      const got = seamCouplingWeights({ x: c.point[0], y: c.point[1] }, { id: c.id }, fixture.landmarks);
+      for (const k of ["neckHead", "neckBody", "collar", "hairRoot"] as const) {
+        expect(Math.abs(got[k] - c.weights[k]), `${c.id} ${k}`).toBeLessThan(1e-9);
+      }
+    }
+    // Coupled seams: relative displacement shrinks (face/neck, collar).
+    const fn = fixture.cases.find((c) => c.upper === "face" && c.lower === "neck")!;
+    expect(fn.maxRelativeDisplacementPx).toBeLessThan(fn.uncoupledMaxRelativeDisplacementPx);
     // Scaling the deform displacement field scales the measured requirement (no copied constants).
     const c0 = fixture.cases.find((c) => c.upper === "clothes" && c.lower === "neck")!;
     const pts = c0.points.map(([x, y]) => ({ x, y }));
-    const base = maxSeamRelativeDisplacement(pts, { id: "clothes" }, { id: "neck" }, fixture.landmarks);
+    const base = maxSeamRelativeDisplacement(
+      pts,
+      { id: "clothes" },
+      { id: "neck" },
+      fixture.landmarks,
+      POSE_ENVELOPE,
+      deformUncoupled,
+    );
     expect(base.maxPx).toBeGreaterThan(1);
-    expect(base.worstPose).toBe(c0.worstPose);
+    const scaled = maxSeamRelativeDisplacement(
+      pts,
+      { id: "clothes" },
+      { id: "neck" },
+      fixture.landmarks,
+      POSE_ENVELOPE,
+      (p, part, lm, params) => {
+        const q = deformUncoupled(p, part, lm, params);
+        return { x: p.x + 2 * (q.x - p.x), y: p.y + 2 * (q.y - p.y) };
+      },
+    );
+    expect(Math.abs(scaled.maxPx - 2 * base.maxPx)).toBeLessThan(1e-6);
   });
 });

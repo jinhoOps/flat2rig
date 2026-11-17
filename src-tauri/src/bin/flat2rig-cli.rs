@@ -8,6 +8,7 @@ use flat2rig_lib::analysis::{
     templates::TemplateStyleSelection,
 };
 use flat2rig_lib::core;
+use flat2rig_lib::rig::{exposure, seams};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -285,6 +286,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut proportion: Option<String> = None;
     let mut stage: Option<String> = None;
+    let mut coupled = true;
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -305,6 +307,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "Missing value for --stage (expected full, base_silhouette, features_overlay, clothes_overlay, hair_overlay, or base_body)",
             )?;
             stage = Some(parse_stage_override(val)?);
+        } else if arg == "--uncoupled" {
+            // T13b baseline: run the whole pipeline (hidden-area synthesis, seam requirements,
+            // exposure map, motion previews) with the pre-T13b uncoupled `deform`.
+            coupled = false;
         } else if arg.starts_with("--") {
             return Err(format!("Unknown flag: {arg}").into());
         } else {
@@ -314,9 +320,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if positional.len() < 2 {
         return Err(
-            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
+            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
         );
     }
+    core::with_seam_coupling(coupled, || run_pipeline(&positional, proportion, stage, coupled))
+}
+
+fn run_pipeline(
+    positional: &[&str],
+    proportion: Option<String>,
+    stage: Option<String>,
+    coupled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let img = image::open(positional[0])?.into_rgba8();
     let (w, h) = img.dimensions();
@@ -476,6 +491,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let mut motion_buffers: Vec<image::RgbaImage> =
         (0..motion_poses.len()).map(|_| image::RgbaImage::new(w, h)).collect();
+    let mut part_meshes: Vec<core::Mesh> = Vec::with_capacity(proposed.part_ids.len());
 
     for idx in 0..proposed.part_ids.len() {
         let id = &proposed.part_ids[idx];
@@ -521,6 +537,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             draw_deformed_part(buf, &eff_part, &mesh, id, &landmarks, pose);
         }
         meshes.push(json!({"id": id, "mesh": mesh}));
+        part_meshes.push(mesh);
         mesh_quality.push(quality);
         part_coverage.push(json!({
             "id": id,
@@ -535,6 +552,96 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (buf, (filename, _)) in motion_buffers.iter().zip(motion_poses.iter()) {
         buf.save(output.join(filename))?;
     }
+    // T13b: seam contracts with coupling, numeric requirements, coverage, and the exposure map over
+    // the shared pose envelope, using the same ArtMeshes as the motion previews.
+    let (wu, hu) = (w as usize, h as usize);
+    let n = wu * hu;
+    let fill_full: Vec<Vec<u8>> = (0..proposed.part_ids.len())
+        .map(|i| {
+            proposed
+                .fill_masks
+                .get(i)
+                .and_then(|o| o.clone())
+                .unwrap_or_else(|| vec![0u8; n])
+        })
+        .collect();
+    let fg_alpha: Vec<u8> = (0..n)
+        .map(|i| proposed.masks.iter().map(|m| m[i]).max().unwrap_or(0))
+        .collect();
+    let roles: Vec<core::PartRole> = proposed
+        .part_ids
+        .iter()
+        .map(|id| core::infer_part_role(id, None))
+        .collect();
+    let env = &seams::pose_envelope().poses;
+    let mut graph = seams::extract_seam_graph(&proposed.part_ids, &roles, &proposed.masks, wu, hu);
+    seams::annotate_seam_couplings(&mut graph, &landmarks);
+    let requirements = seams::hidden_area_seam_requirements(
+        &graph,
+        &proposed.masks,
+        &fg_alpha,
+        &landmarks,
+        wu,
+        hu,
+        env,
+        seams::DEFAULT_MAX_SAMPLES_PER_SEAM,
+    );
+    let coverage = seams::check_seam_coverage(
+        &graph,
+        &proposed.part_ids,
+        &proposed.masks,
+        &fill_full,
+        &fg_alpha,
+        &landmarks,
+        wu,
+        hu,
+        env,
+        2,
+    );
+    let exposure = exposure::compute_exposure_map_with(
+        &proposed.part_ids,
+        &proposed.masks,
+        &fill_full,
+        &part_meshes,
+        wu,
+        hu,
+        env,
+        |p, id, pose| core::deform(p, id, &landmarks, pose),
+    );
+    let heat = exposure::exposure_heatmap_rgba(&exposure, Some(img.as_raw()));
+    image::RgbaImage::from_raw(w, h, heat)
+        .ok_or("exposure heatmap size mismatch")?
+        .save(output.join("exposure.png"))?;
+    let seam_rows: Vec<serde_json::Value> = requirements
+        .iter()
+        .map(|r| {
+            let cov = coverage
+                .seams
+                .iter()
+                .find(|s| s.upper_id == r.upper_id && s.lower_id == r.lower_id);
+            json!({
+                "upper": r.upper_id,
+                "lower": r.lower_id,
+                "coupling": graph.find(&r.upper_id, &r.lower_id).and_then(|s| s.coupling),
+                "boundaryPoints": r.boundary_points,
+                "maxRelativeDisplacementPx": r.max_relative_displacement_px,
+                "maxExposureDepthPx": r.max_exposure_depth_px,
+                "requiredUnderlapPx": r.required_underlap_px,
+                "coupledUnderlapPx": r.coupled_underlap_px,
+                "uncoupledUnderlapPx": r.uncoupled_underlap_px,
+                "uncoupledMaxRelativeDisplacementPx": r.uncoupled_max_relative_displacement_px,
+                "adoptedUnderlap": r.adopted,
+                "worstPose": r.worst_pose,
+                "lowerMisses": cov.map_or(0, |c| c.lower_misses),
+                "holes": cov.map_or(0, |c| c.holes),
+                "maxMissDepthPx": cov.map(|c| c.max_miss_depth_px),
+                "maxHoleDepthPx": cov.map(|c| c.max_hole_depth_px),
+                "holePoseGroups": cov.map(|c| &c.hole_pose_groups),
+                "worstHolePose": cov.and_then(|c| c.worst_hole_pose.clone()),
+                "worstHolePoseHoles": cov.map_or(0, |c| c.worst_hole_pose_holes),
+            })
+        })
+        .collect();
     let model_hash = proposed
         .model_hashes
         .get("part_decoder")
@@ -555,6 +662,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "partsMeta": proposed.metas,
         "partCoverage": part_coverage,
         "meshQuality": mesh_quality,
+        "seamCoupling": coupled,
+        "exposure": exposure,
+        "exposureImage": "exposure.png",
+        "exposureLegend": "rest-space hidden texels exposed in the pose envelope: yellow (rare) -> red (every pose); faint blue = hidden but never exposed (kept for PSD continuity); magenta = posed-space hole (uncovered gap not present at rest); grey = dimmed artwork",
+        "seamCoverage": {
+            "poses": coverage.poses,
+            "checks": coverage.checks,
+            "lowerMisses": coverage.lower_misses,
+            "holes": coverage.holes,
+            "violations": coverage.violations.iter().take(16).collect::<Vec<_>>(),
+        },
+        "seams": seam_rows,
         "elapsedMs": start.elapsed().as_millis(),
         "engine": "Rust / ort / delaunator / glam"
     });

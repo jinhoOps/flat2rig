@@ -38,6 +38,8 @@ interface Props {
   original: boolean;
   overlay: boolean;
   fillOverlay?: boolean;
+  /** T13b exposure-frequency heatmap (canvas-sized, rest space), drawn over the working canvas. */
+  exposureOverlay?: CanvasImageSource | null;
   compareDiff?: boolean;
   wire: boolean;
   solo: boolean;
@@ -374,6 +376,7 @@ export default function Viewport(props: Props) {
         drawDiffOverlay(ctx, source, p.width, p.height);
       if (!preview && props.overlay && activeTint) ctx.drawImage(activeTint, 0, 0);
       if (!preview && props.fillOverlay && fillTint) ctx.drawImage(fillTint, 0, 0);
+      if (!preview && props.exposureOverlay) ctx.drawImage(props.exposureOverlay, 0, 0);
       if (!preview && (tool === "landmark" || tool === "face" || !p.parts.length))
         drawAnalysisOverlay(
           ctx,
@@ -412,6 +415,7 @@ export default function Viewport(props: Props) {
       props.compareDiff,
       props.overlay,
       props.fillOverlay,
+      props.exposureOverlay,
       source,
       p.parts,
       p.width,

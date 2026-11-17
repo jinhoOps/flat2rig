@@ -1485,7 +1485,145 @@ export interface ShapeDeformInput {
   mouth?: RegionDeformParams;
 }
 
+// -------------------------------------------------------------------------------------------------
+// T13b coupled seam deformation — mirrors Rust `core::deform_with_shapes` (see the comment block
+// there). `coupled(x) = own(x) + c(x)·(partner(x) − own(x))`; `c` is 1 on the seam line and exactly 0
+// beyond the falloff, so points far from seams keep their full motion. No parameter range or
+// coefficient changes.
+// -------------------------------------------------------------------------------------------------
+
+/** Neck head-follow span below the chin (head heights); shared by the neck weight and coupling. */
+export const NECK_SPAN_HH = 0.42;
+/** Neck-top ↔ head coupling falloff below the chin line (head heights). */
+export const NECK_HEAD_COUPLING_FALLOFF_HH = 0.06;
+/** Hair-root ↔ scalp coupling band below each strand's sway root (head heights). */
+export const HAIR_ROOT_COUPLING_BAND_HH = 0.25;
+/** Collar column: full coupling within this |u| (eye distances) of the head axis… */
+export const COLLAR_COUPLING_INNER_ED = 0.35;
+/** …fading to none at this |u|. */
+export const COLLAR_COUPLING_OUTER_ED = 0.6;
+
+function smoothstep01(edge0: number, edge1: number, x: number): number {
+  if (edge1 <= edge0) return x >= edge1 ? 1 : 0;
+  const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+export interface SeamCouplingWeights {
+  neckHead: number;
+  neckBody: number;
+  collar: number;
+  hairRoot: number;
+}
+
+type CouplingClass = "neck" | "collar" | "hair" | "none";
+
+function couplingClass(part: Pick<Part, "id" | "role">): CouplingClass {
+  const role = inferPartRole(part.id, part.role);
+  if (role === "neck") return "neck";
+  if (isHairPart(part)) return "hair";
+  if (role === "body" || role === "clothes") return "collar";
+  return "none";
+}
+
+function neckCoupling(hf: HeadFrame, pv: number): [number, number] {
+  return [
+    1 - smoothstep01(hf.chinV, hf.chinV + hf.hh * NECK_HEAD_COUPLING_FALLOFF_HH, pv),
+    smoothstep01(hf.chinV, hf.chinV + hf.hh * NECK_SPAN_HH, pv),
+  ];
+}
+
+/** Coupling weights `deform` uses for a layer at a rest point (pose independent). Mirrors Rust
+ * `core::seam_coupling_weights`. */
+export function seamCouplingWeights(
+  p: Point,
+  part: Pick<Part, "id" | "role">,
+  lm: Landmarks,
+): SeamCouplingWeights {
+  const hf = buildHeadFrame(lm, 0, 0);
+  const [pu, pv] = toHeadLocal(hf, p.x, p.y);
+  const out: SeamCouplingWeights = { neckHead: 0, neckBody: 0, collar: 0, hairRoot: 0 };
+  const cls = couplingClass(part);
+  if (cls === "neck") {
+    [out.neckHead, out.neckBody] = neckCoupling(hf, pv);
+  }
+  if (cls === "collar") {
+    // Only the neck-base (body-side) component; the neck-top ↔ head weight stays 0.
+    const [, neckBody] = neckCoupling(hf, pv);
+    const column =
+      1 -
+      smoothstep01(
+        hf.eyeDist * COLLAR_COUPLING_INNER_ED,
+        hf.eyeDist * COLLAR_COUPLING_OUTER_ED,
+        Math.abs(pu),
+      );
+    out.neckBody = neckBody;
+    out.collar = column * neckBody;
+  }
+  if (cls === "hair") {
+    const [, rootOffset] = hairSwayProfile(part);
+    const rootY = lm.crown.y + hf.hh * rootOffset;
+    const t = (p.y - rootY) / hf.hh;
+    out.hairRoot = 1 - smoothstep01(0, HAIR_ROOT_COUPLING_BAND_HH, t);
+  }
+  return out;
+}
+
+function coupledNeckField(
+  p: Point,
+  rawNeck: Point,
+  wts: SeamCouplingWeights,
+  lm: Landmarks,
+  params: Parameters,
+): Point {
+  let x = rawNeck.x;
+  let y = rawNeck.y;
+  if (wts.neckHead > 0) {
+    const head = deformUncoupled(p, { id: "face" }, lm, params);
+    x += (head.x - x) * wts.neckHead;
+    y += (head.y - y) * wts.neckHead;
+  }
+  if (wts.neckBody > 0) {
+    const body = deformUncoupled(p, { id: "body" }, lm, params);
+    x += (body.x - x) * wts.neckBody;
+    y += (body.y - y) * wts.neckBody;
+  }
+  return { x, y };
+}
+
 export function deform(
+  p: Point,
+  part: Pick<Part, "id" | "role">,
+  lm: Landmarks,
+  params: Parameters,
+  shapeDeform?: ShapeDeformInput,
+): Point {
+  const raw = deformUncoupled(p, part, lm, params, shapeDeform);
+  const cls = couplingClass(part);
+  if (cls === "none") return raw;
+  const wts = seamCouplingWeights(p, part, lm);
+  if (cls === "neck") return coupledNeckField(p, raw, wts, lm, params);
+  if (cls === "collar") {
+    if (wts.collar <= 0) return raw;
+    // Neck-base field: raw neck blended toward the body (no neck-top ↔ head term).
+    const rawNeck = deformUncoupled(p, { id: "neck" }, lm, params);
+    const base = coupledNeckField(p, rawNeck, wts, lm, params);
+    return {
+      x: raw.x + (base.x - raw.x) * wts.collar,
+      y: raw.y + (base.y - raw.y) * wts.collar,
+    };
+  }
+  if (wts.hairRoot <= 0) return raw;
+  const head = deformUncoupled(p, { id: "face" }, lm, params);
+  return {
+    x: raw.x + (head.x - raw.x) * wts.hairRoot,
+    y: raw.y + (head.y - raw.y) * wts.hairRoot,
+  };
+}
+
+/** T13b uncoupled per-layer field (the pre-T13b `deform`); mirrors Rust `core::deform_uncoupled`.
+ * Kept for before/after measurements and the parity fixture; rendering uses `deform`. */
+export function deformUncoupled(
   p: Point,
   part: Pick<Part, "id" | "role">,
   lm: Landmarks,
@@ -1665,7 +1803,7 @@ export function deform(
   }
   const weight =
     part.id === "neck"
-      ? clamp((hf.chinV + headH * 0.42 - pv) / (headH * 0.42), 0, 1)
+      ? clamp((hf.chinV + headH * NECK_SPAN_HH - pv) / (headH * NECK_SPAN_HH), 0, 1)
       : 1;
   pu +=
     params.angleX *
@@ -1743,13 +1881,14 @@ export function maxSeamRelativeDisplacement(
   lower: Pick<Part, "id" | "role">,
   lm: Landmarks,
   poses: readonly EnvelopePose[] = POSE_ENVELOPE,
+  deformFn: typeof deform = deform,
 ): { maxPx: number; worstPose: string | null } {
   let maxPx = 0;
   let worstPose: string | null = null;
   for (const pose of poses) {
     for (const b of points) {
-      const u = deform(b, upper, lm, pose.params);
-      const l = deform(b, lower, lm, pose.params);
+      const u = deformFn(b, upper, lm, pose.params);
+      const l = deformFn(b, lower, lm, pose.params);
       const r = Math.hypot(u.x - l.x, u.y - l.y);
       if (r > maxPx + 1e-12) {
         maxPx = r;

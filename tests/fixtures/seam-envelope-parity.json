@@ -2,7 +2,7 @@
   "cases": [
     {
       "lower": "neck",
-      "maxRelativeDisplacementPx": 9.211269463275444,
+      "maxRelativeDisplacementPx": 0.12312847957802474,
       "points": [
         [
           470.0,
@@ -17,12 +17,14 @@
           548.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 9.211269463275444,
+      "uncoupledWorstPose": "same3:head+-+/breath1",
       "upper": "face",
-      "worstPose": "same3:head+-+/breath1"
+      "worstPose": "opp3:head++-/breath1"
     },
     {
       "lower": "neck",
-      "maxRelativeDisplacementPx": 44.55298880914496,
+      "maxRelativeDisplacementPx": 16.255123440808738,
       "points": [
         [
           470.0,
@@ -37,6 +39,8 @@
           650.0
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 44.55298880914496,
+      "uncoupledWorstPose": "same3:head++-/breath1",
       "upper": "clothes",
       "worstPose": "same3:head++-/breath1"
     },
@@ -57,6 +61,8 @@
           290.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 9.284483170611018,
+      "uncoupledWorstPose": "headHairBody:head++/hair+",
       "upper": "hair_front",
       "worstPose": "headHairBody:head++/hair+"
     },
@@ -73,6 +79,8 @@
           520.0
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 26.513820812115174,
+      "uncoupledWorstPose": "headHairBody:head++/hair+",
       "upper": "hair_side_R",
       "worstPose": "headHairBody:head++/hair+"
     },
@@ -89,6 +97,8 @@
           760.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 178.43006419728366,
+      "uncoupledWorstPose": "headHairBody:head++/hair-",
       "upper": "hair_side_L_2",
       "worstPose": "headHairBody:head++/hair-"
     },
@@ -105,6 +115,8 @@
           720.0
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 171.89116098145553,
+      "uncoupledWorstPose": "same3:head+--/breath1",
       "upper": "body",
       "worstPose": "same3:head+--/breath1"
     },
@@ -121,6 +133,8 @@
           780.0
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 189.40721591776594,
+      "uncoupledWorstPose": "opp3:head-++/breath1",
       "upper": "clothes",
       "worstPose": "opp3:head-++/breath1"
     },
@@ -137,6 +151,8 @@
           348.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 9.449999999999989,
+      "uncoupledWorstPose": "eyeLSmile=1",
       "upper": "eyeL_upper",
       "worstPose": "eyeLSmile=1"
     },
@@ -149,6 +165,8 @@
           378.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 11.531105757905438,
+      "uncoupledWorstPose": "gaze:++",
       "upper": "eyeR_lower",
       "worstPose": "gaze:++"
     },
@@ -161,6 +179,8 @@
           300.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 22.643076923076933,
+      "uncoupledWorstPose": "brows:y+form+",
       "upper": "browL",
       "worstPose": "brows:y+form+"
     },
@@ -177,18 +197,22 @@
           491.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 5.977530864197547,
+      "uncoupledWorstPose": "mouthOpen/form-",
       "upper": "mouth_upper",
       "worstPose": "mouthOpen/form-"
     },
     {
       "lower": "hair_front",
-      "maxRelativeDisplacementPx": 2.1703999999998427,
+      "maxRelativeDisplacementPx": 0.4080502835462161,
       "points": [
         [
           512.0,
           150.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 2.1703999999998427,
+      "uncoupledWorstPose": "headHairBody:head++/hair+",
       "upper": "hat",
       "worstPose": "headHairBody:head++/hair+"
     },
@@ -201,6 +225,8 @@
           300.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 4.640999999999963,
+      "uncoupledWorstPose": "hairBack=-1",
       "upper": "acc_ribbon",
       "worstPose": "hairBack=-1"
     },
@@ -213,11 +239,225 @@
           860.5
         ]
       ],
+      "uncoupledMaxRelativeDisplacementPx": 0.0,
+      "uncoupledWorstPose": null,
       "upper": "clothes_hands",
       "worstPose": null
+    },
+    {
+      "lower": "face",
+      "maxRelativeDisplacementPx": 3.4741420813523556,
+      "points": [
+        [
+          512.0,
+          120.5
+        ],
+        [
+          452.0,
+          168.5
+        ],
+        [
+          512.0,
+          182.5
+        ],
+        [
+          574.0,
+          200.5
+        ]
+      ],
+      "uncoupledMaxRelativeDisplacementPx": 4.222281319758744,
+      "uncoupledWorstPose": "headHairBody:head++/hair+",
+      "upper": "hair_front",
+      "worstPose": "headHairBody:head++/hair+"
+    },
+    {
+      "lower": "hair_back",
+      "maxRelativeDisplacementPx": 7.135059776528919,
+      "points": [
+        [
+          650.5,
+          240.0
+        ],
+        [
+          690.5,
+          280.0
+        ]
+      ],
+      "uncoupledMaxRelativeDisplacementPx": 7.568880000000036,
+      "uncoupledWorstPose": "hairSign:++-",
+      "upper": "hair_side_L_2",
+      "worstPose": "hairSign:++-"
+    },
+    {
+      "lower": "neck",
+      "maxRelativeDisplacementPx": 7.529658197589194,
+      "points": [
+        [
+          486.0,
+          660.5
+        ],
+        [
+          538.0,
+          660.5
+        ]
+      ],
+      "uncoupledMaxRelativeDisplacementPx": 39.89810954569147,
+      "uncoupledWorstPose": "same3:head++-/breath1",
+      "upper": "body",
+      "worstPose": "same3:head++-/breath1"
+    },
+    {
+      "lower": "neck",
+      "maxRelativeDisplacementPx": 16.408568791634043,
+      "points": [
+        [
+          560.5,
+          645.0
+        ],
+        [
+          466.0,
+          639.5
+        ]
+      ],
+      "uncoupledMaxRelativeDisplacementPx": 44.97356076130707,
+      "uncoupledWorstPose": "same3:head++-/breath1",
+      "upper": "clothes",
+      "worstPose": "same3:head++-/breath1"
     }
   ],
-  "description": "T13a Rust/TS parity: envelope poses as parsed by Rust (Pose::default() merged) and max relative seam displacement over the envelope using core::deform. TS asserts the same values with engine.ts deform.",
+  "couplingWeights": [
+    {
+      "id": "neck",
+      "point": [
+        512.0,
+        560.0
+      ],
+      "weights": {
+        "collar": 0.0,
+        "hairRoot": 0.0,
+        "neckBody": 0.0,
+        "neckHead": 1.0
+      }
+    },
+    {
+      "id": "neck",
+      "point": [
+        512.0,
+        590.0
+      ],
+      "weights": {
+        "collar": 0.0,
+        "hairRoot": 0.0,
+        "neckBody": 0.0705042132770249,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "neck",
+      "point": [
+        512.0,
+        650.0
+      ],
+      "weights": {
+        "collar": 0.0,
+        "hairRoot": 0.0,
+        "neckBody": 0.48052386136380076,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "clothes",
+      "point": [
+        512.0,
+        650.0
+      ],
+      "weights": {
+        "collar": 0.48052386136380076,
+        "hairRoot": 0.0,
+        "neckBody": 0.48052386136380076,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "clothes",
+      "point": [
+        590.0,
+        660.0
+      ],
+      "weights": {
+        "collar": 0.5615491995994613,
+        "hairRoot": 0.0,
+        "neckBody": 0.5615491995994613,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "body",
+      "point": [
+        512.0,
+        760.0
+      ],
+      "weights": {
+        "collar": 1.0,
+        "hairRoot": 0.0,
+        "neckBody": 1.0,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "hair_front",
+      "point": [
+        512.0,
+        170.0
+      ],
+      "weights": {
+        "collar": 0.0,
+        "hairRoot": 0.5679939894815929,
+        "neckBody": 0.0,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "hair_side_L_2",
+      "point": [
+        690.0,
+        260.0
+      ],
+      "weights": {
+        "collar": 0.0,
+        "hairRoot": 0.25121562734785874,
+        "neckBody": 0.0,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "hair_back",
+      "point": [
+        512.0,
+        200.0
+      ],
+      "weights": {
+        "collar": 0.0,
+        "hairRoot": 0.7487843726521413,
+        "neckBody": 0.0,
+        "neckHead": 0.0
+      }
+    },
+    {
+      "id": "face",
+      "point": [
+        512.0,
+        400.0
+      ],
+      "weights": {
+        "collar": 0.0,
+        "hairRoot": 0.0,
+        "neckBody": 0.0,
+        "neckHead": 0.0
+      }
+    }
+  ],
+  "description": "T13a/T13b Rust/TS parity: envelope poses as parsed by Rust (Pose::default() merged); max relative seam displacement over the envelope with core::deform (coupled, T13b) and core::deform_uncoupled; far reference point max displacement (coupled); seam coupling weights. TS asserts the same values with engine.ts deform / deformUncoupled / seamCouplingWeights.",
   "envelope": [
     {
       "name": "rest",
@@ -2756,6 +2996,152 @@
         "mouth": 1.0,
         "mouthForm": -1.0
       }
+    }
+  ],
+  "farPoints": [
+    {
+      "id": "face",
+      "maxDisplacementPx": 341.2963345004336,
+      "name": "crownFace",
+      "point": [
+        512.0,
+        120.0
+      ]
+    },
+    {
+      "id": "face",
+      "maxDisplacementPx": 181.99723302665464,
+      "name": "faceCentre",
+      "point": [
+        512.0,
+        400.0
+      ]
+    },
+    {
+      "id": "face",
+      "maxDisplacementPx": 157.07540857361755,
+      "name": "noseTip",
+      "point": [
+        512.0,
+        440.0
+      ]
+    },
+    {
+      "id": "hair_front",
+      "maxDisplacementPx": 227.58047080028663,
+      "name": "bangTip",
+      "point": [
+        510.0,
+        324.0
+      ]
+    },
+    {
+      "id": "hair_front_2",
+      "maxDisplacementPx": 208.78147613824524,
+      "name": "bangTip2",
+      "point": [
+        470.0,
+        368.0
+      ]
+    },
+    {
+      "id": "hair_side_R",
+      "maxDisplacementPx": 173.56802485333,
+      "name": "sideLockTipR",
+      "point": [
+        330.0,
+        715.0
+      ]
+    },
+    {
+      "id": "hair_side_L_2",
+      "maxDisplacementPx": 193.74129992633004,
+      "name": "sideLockTipL",
+      "point": [
+        694.0,
+        755.0
+      ]
+    },
+    {
+      "id": "hair_back",
+      "maxDisplacementPx": 202.11943217120245,
+      "name": "backHairTip",
+      "point": [
+        512.0,
+        855.0
+      ]
+    },
+    {
+      "id": "clothes",
+      "maxDisplacementPx": 26.038100837077934,
+      "name": "torsoCentre",
+      "point": [
+        512.0,
+        800.0
+      ]
+    },
+    {
+      "id": "body",
+      "maxDisplacementPx": 24.08034889444053,
+      "name": "torsoCentreBody",
+      "point": [
+        512.0,
+        820.0
+      ]
+    },
+    {
+      "id": "clothes",
+      "maxDisplacementPx": 41.299271677510916,
+      "name": "shoulderR",
+      "point": [
+        330.0,
+        700.0
+      ]
+    },
+    {
+      "id": "clothes",
+      "maxDisplacementPx": 41.299271677510866,
+      "name": "shoulderL",
+      "point": [
+        694.0,
+        700.0
+      ]
+    },
+    {
+      "id": "eyeR_iris",
+      "maxDisplacementPx": 230.53729012374126,
+      "name": "irisR",
+      "point": [
+        400.0,
+        360.0
+      ]
+    },
+    {
+      "id": "eyeL_iris",
+      "maxDisplacementPx": 230.53729012374126,
+      "name": "irisL",
+      "point": [
+        624.0,
+        360.0
+      ]
+    },
+    {
+      "id": "browR",
+      "maxDisplacementPx": 261.9234868212344,
+      "name": "browR",
+      "point": [
+        400.0,
+        300.0
+      ]
+    },
+    {
+      "id": "mouth_upper",
+      "maxDisplacementPx": 127.49090630483951,
+      "name": "mouth",
+      "point": [
+        512.0,
+        488.0
+      ]
     }
   ],
   "landmarks": {

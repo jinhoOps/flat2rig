@@ -533,6 +533,71 @@ export async function buildRig(
   });
 }
 
+/** T13b exposure-map summary (mirrors Rust `rig::exposure::ExposureMap`, per-pixel data omitted). */
+export interface ExposureLayerSummary {
+  id: string;
+  role: string | null;
+  hiddenPx: number;
+  exposedPx: number;
+  unexposedHiddenPx: number;
+  meanFrequency: number;
+  maxFrequency: number;
+  maxDepthPx: number | null;
+  p95DepthPx: number | null;
+  restExposedPx: number;
+}
+
+export interface ExposureOverlayResult {
+  summary: {
+    width: number;
+    height: number;
+    poses: number;
+    render: string;
+    layers: ExposureLayerSummary[];
+    hiddenPxTotal: number;
+    exposedPxTotal: number;
+    maxDepthPx: number;
+    holes: {
+      restEnclosedPx: number;
+      restUncoveredFgPx: number;
+      holePxTotal: number;
+      holePxMax: number;
+      holePoses: number;
+      holeComponentsTotal: number;
+      holeComponentsMax: number;
+      worstPose: string | null;
+    };
+  };
+  seamHoles: number;
+  seamLowerMisses: number;
+  /** Transparent canvas-sized heatmap PNG data URL. */
+  heatmap: string;
+}
+
+/**
+ * T13b: exposure map over the shared pose envelope (Rust ArtMesh render), for the advanced-screen
+ * heatmap overlay. Desktop only — the browser fallback has no exposure renderer and returns `null`.
+ * `parts` must be bottom-to-top in composite order.
+ */
+export async function computeExposureMap(
+  parts: Part[],
+  width: number,
+  height: number,
+  landmarks: Landmarks,
+): Promise<ExposureOverlayResult | null> {
+  if (!desktop) return null;
+  return invoke<ExposureOverlayResult>("compute_exposure_map", {
+    parts: parts.map((p) => ({
+      id: p.id,
+      mask: base64(p.mask),
+      fillMask: p.fillMask ? base64(p.fillMask) : null,
+    })),
+    width,
+    height,
+    landmarks,
+  });
+}
+
 export async function fillOcclusionNative(
   data: Uint8ClampedArray,
   visibleMask: Uint8Array,
