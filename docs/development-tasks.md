@@ -141,7 +141,7 @@
 | --- | --- | --- | --- | --- |
 | 1 | T8 | 부위별 모션 비례 겹침 여유분 | 1차 구현(`79610ec`), Windows 미검증 | 틈 방지의 최소 조건 |
 | 2 | T13 | 이음새 계약(`SeamGraph`)·노출 맵(`ExposureMap`)·결합 변형 | T13a 구현(이음새 계약·포즈 포락선·수치 여유분·커버리지 검사, 테스트 통과, Windows 원화 모션 미검증) · T13b 구현(노출 맵·이음새 결합 변형·CLI/고급 화면 오버레이·눈썹/윗눈꺼풀 숨은 영역, 테스트 통과, 원화 3종 CLI 수치 기록, 원화 이음새 `holes` 0 미충족(결합 전부터 있던 구멍), 숨은 영역은 결합 전/후 max 요구량으로 생성, Windows 앱 모션·오버레이 GUI 미검증) | T8 상수 복제를 대체하고, 이후 모든 작업의 기준 영역(노출 밴드)을 제공 |
-| 3 | T14 | 원본감 평가 하네스(정답 PSD·자기 지도 홀드아웃) | 계획 | 합성기를 바꾸기 전에 현 기준선을 측정해야 개선을 판정할 수 있음 |
+| 3 | T14 | 원본감 평가 하네스(정답 PSD·자기 지도 홀드아웃) | 구현·기준선 기록(CLI `--eval-holdout`/`--eval-truth`, `stats.json` `fidelity`, 원화 3종 홀드아웃 + Himikan 정답 비교 수치·비교 이미지, 기본 실행 출력 불변 확인, 테스트 통과; 임계값 미정 → 판정 없음, Windows 앱 `미검증`) | 합성기를 바꾸기 전에 현 기준선을 측정해야 개선을 판정할 수 있음 |
 | 4 | T9 | 경계 후광 제거·`fillKind` 분류·`flat/cel` 팔레트 필드 | 계획 | 넓어진 T8 밴드가 오염된 시드로 칠해지는 문제를 먼저 해소 |
 | 5 | T10 | 눈·입 클리핑 밀폐 | 계획 | T9 텍스처 위에서 클리핑 정합 |
 | 6 | T15 | 선화·구조 연장 | 계획 | 색 필드가 안정된 뒤 선 레이어를 얹음 |
@@ -224,6 +224,15 @@
 선행: T13(노출 맵). 주요 파일: `src-tauri/src/bin/flat2rig-cli.rs`, `tools/evaluation/`, `docs/validation.md`. Python은 평가·리포트에만 사용한다(AGENTS.md 4절).
 
 목적: "원본처럼 보이는가"를 측정 가능한 수치로 바꾼다. **합성기 개선(T9·T15·T16) 전에 현재 조화 보간 합성기의 기준선을 먼저 기록한다.**
+
+상태 (2026-11-18): **구현 · 기준선 기록 · `cargo test` 56/56, `cargo clippy --all-targets -D warnings`, `npm test` 43/43, `tsc` 통과 · 임계값 미정(판정 없음) · Windows 앱 `미검증`**. 수치·정의·제한은 [validation.md](validation.md) T14 절.
+
+- **평가 모듈** `src-tauri/src/rig/fidelity.rs`(`t14-v1`): ΔE2000(Sharma 2005 표 21쌍 1e-4 검증)·팔레트 군집 일치·이음새 단차(그래디언트 불연속)·선화 끊김·국소 분산 질감 차를 **노출 밴드 안에서만** 계산하고, 각 지표에 노출 빈도 가중값·표본 수·노출 면적을 함께 둔다. 숨은 영역을 줄여 좋아지는 지표는 없다.
+- **정답 비교(Himikan)**: `tools/evaluation/himikan-layer-map.v1.json`(대응 21파츠, 정답 없음 3파츠, 제외 레이어 10장과 사유)와 `tools/evaluation/himikan_truth.py`(평가 전용 Python)가 PSD 레이어를 CLI 입력 그리드(683×1024, 면적 매핑)로 옮겨 `artifacts/t14/himikan-truth/`(Git 제외)에 쓴다. 왕복 검증: 재합성 vs 입력 ΔE00 평균 0.30 / p95 1.38, 레이어 무게중심 최대 0.17px, L/R 오류 0. 노출 밴드 = T13b `ExposureMap`이 드러낸 숨은 텍셀.
+- **자기 지도 홀드아웃(원화 3종)**: 이음새마다 하위 파츠 가시 픽셀 중 상위 파츠로부터 `maxExposureDepthPx` 이내 밴드를 `templates::with_eval_holdout`(스레드 로컬, 평가 전용)로 숨은 텍셀과 같은 분기에 넣어 다시 합성한다. 분할은 제품 경로 그대로(`masksIdentical`·`fillMasksIdentical` 세 원화 모두 `true`). 래퍼가 없으면 합성 경로는 바이트 단위로 같다(단위 테스트 + HEAD 대비 원화 3종 CLI 출력 34/34 파일 동일).
+- **기준선 요약**(정답 비교 / 홀드아웃, ΔE00 평균 / p95): Himikan 정답 `face` 2.34 / 5.29, `clothes` 2.98 / 14.38, `hair_back` 6.67 / 26.28(선화 끊김 129/129), `eyeR/L_iris` 13.42 / 10.66 평균, `eyeR/L_upper` 38.57 / 33.82 평균. 홀드아웃 `face` 0.81(Himikan)·2.77(Sutteang), `clothes` 11.29(Himikan, σL* 0.09 vs 4.24)·7.66(Sutteang), 홍채 24–35. 육안으로 가장 나쁜 것: Himikan 홀드아웃 `clothes`(칼라 무늬 → 회색 단색), `clothes_inner`(덮는 머리색 복사, ΔE 36.87), 정답 `hair_back`(선·결 소실 — ΔE 평균은 작아 단일 ΔE 판정 부적합).
+- **T16 착수 조건**: 미충족(판단 불가) — T9·T15 이전이고 `fillKind` 분류가 없어 `texture`/`semantic` 밴드를 나눌 수 없다. 현 기준선의 질감 밴드는 육안으로 원화와 구분된다(σL* 합성/정답 0.09/4.24, 0.15/3.34, 3.43/6.61).
+- 남은 제한: 이음새 최대 깊이를 폭으로 쓰면 Rritteang·Sutteang 일부 파츠가 통째로 홀드아웃되어(`wholeLayerHeldOut`) 이음새 밴드 대리가 아니다(별도 표). 밴드를 한 번에 홀드아웃한다. 증거 마스크는 원본 그대로. 정답 그리드 리샘플 오차 바닥값. 노출 맵의 눈·입 모양 조정·물리 흔들림 미포함. 임계값은 T9 이후 기준선 대비 개선과 육안 판정을 대조해 정한다.
 
 작업:
 
@@ -325,7 +334,7 @@
 | 2 | `feat(T8): scale per-part overlap fillMask margins by HeadFrame motion` (`79610ec`, 완료) | 목·머리카락·의상 반대/최대 변위 공백 0 (Windows 미검증) |
 | 2a | `fix(T8): role-based fill radius dispatch with Rust/TS parity test` (구현됨 · `cargo test`/`npm test` 통과) | Rust/TS 동일 입력 동일 반경 (공유 fixture 통과, Windows 원화 모션 `미검증`) |
 | 3 | `feat(T13): derive seam contracts, pose envelope margins, and exposure map` (T13a `2ba7adc` · T13b 구현됨, 커밋 전) | 변형 상수 복제 0(여유분 경로 충족, `part_overlap_margins` 폴백 복제는 잔존), 이음새 커버리지 위반 0(1024px 합성 fixture `holes` 0 충족 · 원화 3종 `holes` Himikan 52 / Rritteang 11,907 / Sutteang 1,974, 결합 전후 동일 → **미충족**), 결합으로 숨은 영역이 줄지 않음(테스트 고정), 노출 면적 기록(합성 fixture + 원화 3종 결합 전/후 기록), Windows 앱 모션·오버레이 GUI `미검증` |
-| 4 | `test(T14): add hidden-area fidelity harness (PSD ground truth + holdout)` | 현 합성기 기준선 수치·비교 이미지 |
+| 4 | `test(T14): add hidden-area fidelity harness (PSD ground truth + holdout)` (구현됨 · 커밋 전) | 현 합성기 기준선 수치·비교 이미지(원화 3종 홀드아웃 + Himikan 정답 비교 기록, 기본 실행 출력 불변 확인, `cargo test`/`clippy`/`npm test`/`tsc` 통과; 임계값 미정 → 통과/미통과 판정 없음, Windows 앱 `미검증`) |
 | 5 | `feat(T9): decontaminate rim halos, classify fillKind, palette-snapped cel field` | 경계 흰 테두리·목 얼룩 제거 + T14 지표 개선 |
 | 6 | `feat(T10): seal eye clipping and closed-lid curves across expressions` | 감은 눈·슬픔·시선 극값 홍채/흰자 누출 0 |
 | 7 | `feat(T15): separate line art and extend strokes/contours into exposure bands` | 선화 끊김 감소, 이중 선화 신규 0 |

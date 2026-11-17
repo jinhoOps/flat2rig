@@ -5,10 +5,10 @@ use flat2rig_lib::analysis::{
     models::{ModelRegistry, ModelRole},
     parts::{propose_parts_auto_with_template_stage, propose_parts_with_sam_with_options},
     state::AnalysisState,
-    templates::TemplateStyleSelection,
+    templates::{with_eval_holdout, TemplateStyleSelection},
 };
 use flat2rig_lib::core;
-use flat2rig_lib::rig::{exposure, seams};
+use flat2rig_lib::rig::{exposure, fidelity, seams};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -287,6 +287,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut proportion: Option<String> = None;
     let mut stage: Option<String> = None;
     let mut coupled = true;
+    let mut eval = EvalOptions::default();
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -311,6 +312,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // T13b baseline: run the whole pipeline (hidden-area synthesis, seam requirements,
             // exposure map, motion previews) with the pre-T13b uncoupled `deform`.
             coupled = false;
+        } else if arg == "--eval-holdout" {
+            // T14 (evaluation only): seam holdout re-synthesized by the hidden-texel path.
+            eval.holdout = true;
+        } else if let Some(val) = arg.strip_prefix("--eval-truth=") {
+            eval.truth_dir = Some(PathBuf::from(val));
+        } else if arg == "--eval-truth" {
+            i += 1;
+            let val = args
+                .get(i)
+                .ok_or("Missing value for --eval-truth (directory with truth-manifest.json)")?;
+            eval.truth_dir = Some(PathBuf::from(val));
         } else if arg.starts_with("--") {
             return Err(format!("Unknown flag: {arg}").into());
         } else {
@@ -320,10 +332,161 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if positional.len() < 2 {
         return Err(
-            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
+            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
         );
     }
-    core::with_seam_coupling(coupled, || run_pipeline(&positional, proportion, stage, coupled))
+    core::with_seam_coupling(coupled, || {
+        run_pipeline(&positional, proportion, stage, coupled, &eval)
+    })
+}
+
+/// T14 evaluation flags. Both off = the product run (outputs unchanged, no `fidelity` key).
+#[derive(Default)]
+struct EvalOptions {
+    holdout: bool,
+    truth_dir: Option<PathBuf>,
+}
+
+impl EvalOptions {
+    fn any(&self) -> bool {
+        self.holdout || self.truth_dir.is_some()
+    }
+}
+
+fn decode_texture_raw(tex_url: Option<&str>) -> Option<Vec<u8>> {
+    let b64 = tex_url?.strip_prefix("data:image/png;base64,")?;
+    let bytes = STANDARD.decode(b64).ok()?;
+    Some(image::load_from_memory(&bytes).ok()?.into_rgba8().into_raw())
+}
+
+type TruthSet = (serde_json::Value, std::collections::HashMap<String, Vec<u8>>);
+
+/// Loads `DIR/truth-manifest.json` (`{"width","height","parts":{id: file}}`) written by
+/// `tools/evaluation/himikan_truth.py`; every truth image must share the input pixel grid.
+fn load_truth(dir: &std::path::Path, w: u32, h: u32) -> Result<TruthSet, Box<dyn std::error::Error>> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("truth-manifest.json"))?)?;
+    let (mw, mh) = (
+        manifest["width"].as_u64().unwrap_or(0),
+        manifest["height"].as_u64().unwrap_or(0),
+    );
+    if (mw, mh) != (w as u64, h as u64) {
+        return Err(format!("truth canvas {mw}x{mh} does not match input {w}x{h}").into());
+    }
+    let mut out = std::collections::HashMap::new();
+    if let Some(parts) = manifest["parts"].as_object() {
+        for (id, file) in parts {
+            let file = file.as_str().ok_or("truth part file must be a string")?;
+            let img = image::open(dir.join(file))?.into_rgba8();
+            if img.dimensions() != (w, h) {
+                return Err(format!("truth image {file} is not {w}x{h}").into());
+            }
+            out.insert(id.clone(), img.into_raw());
+        }
+    }
+    Ok((manifest, out))
+}
+
+/// T14: fidelity report (`stats.json` `fidelity`) and comparison images in `OUTPUT/fidelity/`.
+/// The holdout pass re-runs the same proposal under `with_eval_holdout`; its textures are only
+/// compared, never written as parts.
+fn run_fidelity<F>(
+    eval: &EvalOptions,
+    output: &std::path::Path,
+    proposed: &flat2rig_lib::analysis::parts::PartsProposalOutput,
+    propose: &F,
+    requirements: &[seams::SeamRequirement],
+    exposure: &exposure::ExposureMap,
+    img: &image::RgbaImage,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>>
+where
+    F: Fn() -> Result<flat2rig_lib::analysis::parts::PartsProposalOutput, String>,
+{
+    let (w, h) = img.dimensions();
+    let (wu, hu) = (w as usize, h as usize);
+    let fid_dir = output.join("fidelity");
+    std::fs::create_dir_all(&fid_dir)?;
+    let mut fid = serde_json::Map::new();
+    fid.insert("spec".into(), fidelity::metrics_spec());
+    if eval.holdout {
+        let t_h = std::time::Instant::now();
+        let plan = fidelity::build_holdout_plan(
+            &proposed.part_ids,
+            &proposed.masks,
+            requirements,
+            exposure,
+            img.as_raw(),
+            wu,
+            hu,
+        );
+        let held = with_eval_holdout(plan.holdout.clone(), propose)?;
+        let masks_identical = held.part_ids == proposed.part_ids && held.masks == proposed.masks;
+        let fills_identical = held.fill_masks == proposed.fill_masks;
+        let held_tex: Vec<Option<Vec<u8>>> = (0..held.part_ids.len())
+            .map(|i| decode_texture_raw(held.textures.get(i).and_then(|o| o.as_deref())))
+            .collect();
+        // Only comparable when the partition is unchanged (holdout touches textures only).
+        let parts = if masks_identical {
+            fidelity::holdout_fidelity(
+                &plan,
+                &proposed.part_ids,
+                &proposed.masks,
+                &held_tex,
+                img.as_raw(),
+                wu,
+                hu,
+                Some(&fid_dir),
+            )
+        } else {
+            Vec::new()
+        };
+        fid.insert(
+            "holdout".into(),
+            json!({
+                "masksIdentical": masks_identical,
+                "fillMasksIdentical": fills_identical,
+                "heldOutPx": plan.seam_of.iter().filter(|&&s| s >= 0).count(),
+                "seams": plan.seams,
+                "parts": parts,
+                "elapsedMs": t_h.elapsed().as_millis(),
+            }),
+        );
+    }
+    if let Some(dir) = &eval.truth_dir {
+        let (manifest, truth) = load_truth(dir, w, h)?;
+        let product_tex: Vec<Option<Vec<u8>>> = (0..proposed.part_ids.len())
+            .map(|i| decode_texture_raw(proposed.textures.get(i).and_then(|o| o.as_deref())))
+            .collect();
+        let parts = fidelity::ground_truth_fidelity(
+            &proposed.part_ids,
+            &proposed.masks,
+            exposure,
+            &product_tex,
+            &truth,
+            img.as_raw(),
+            wu,
+            hu,
+            Some(&fid_dir),
+        );
+        let without: Vec<&String> = proposed
+            .part_ids
+            .iter()
+            .filter(|id| !truth.contains_key(*id))
+            .collect();
+        fid.insert(
+            "groundTruth".into(),
+            json!({
+                "truthDir": dir.to_string_lossy(),
+                "layerMap": manifest.get("layerMap"),
+                "layerMapVersion": manifest.get("layerMapVersion"),
+                "excludedLayers": manifest.get("excluded"),
+                "partsWithoutTruth": without,
+                "parts": parts,
+            }),
+        );
+    }
+    fid.insert("imageDir".into(), json!("fidelity"));
+    Ok(serde_json::Value::Object(fid))
 }
 
 fn run_pipeline(
@@ -331,6 +494,7 @@ fn run_pipeline(
     proportion: Option<String>,
     stage: Option<String>,
     coupled: bool,
+    eval: &EvalOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let img = image::open(positional[0])?.into_rgba8();
@@ -421,22 +585,25 @@ fn run_pipeline(
         mouth_style: None,
         clothes_style: None,
     });
-    let proposed = propose_parts_auto_with_template_stage(
-        &state,
-        img.as_raw(),
-        w as usize,
-        h as usize,
-        &landmarks,
-        &points_28,
-        face_bbox,
-        32.0,
-        positional.get(2).copied(),
-        "detail",
-        true,
-        true,
-        style_overrides.as_ref(),
-        stage.as_deref(),
-    )?;
+    let propose = || {
+        propose_parts_auto_with_template_stage(
+            &state,
+            img.as_raw(),
+            w as usize,
+            h as usize,
+            &landmarks,
+            &points_28,
+            face_bbox,
+            32.0,
+            positional.get(2).copied(),
+            "detail",
+            true,
+            true,
+            style_overrides.as_ref(),
+            stage.as_deref(),
+        )
+    };
+    let proposed = propose()?;
 
     let mut meshes = Vec::new();
     let mut mesh_quality = Vec::new();
@@ -647,7 +814,7 @@ fn run_pipeline(
         .get("part_decoder")
         .or_else(|| proposed.model_hashes.get("background"))
         .cloned();
-    let stats = json!({
+    let mut stats = json!({
         "width": w,
         "height": h,
         "parts": proposed.masks.len(),
@@ -677,6 +844,18 @@ fn run_pipeline(
         "elapsedMs": start.elapsed().as_millis(),
         "engine": "Rust / ort / delaunator / glam"
     });
+    if eval.any() {
+        // T14 (evaluation only): nothing below changes the product outputs computed above.
+        stats["fidelity"] = run_fidelity(
+            eval,
+            &output,
+            &proposed,
+            &propose,
+            &requirements,
+            &exposure,
+            &img,
+        )?;
+    }
     std::fs::write(output.join("rig.json"), serde_json::to_vec_pretty(&meshes)?)?;
     std::fs::write(
         output.join("stats.json"),

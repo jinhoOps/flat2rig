@@ -498,6 +498,68 @@ fn sample_quantile_color(
     samples[idx.min(samples.len() - 1)].1
 }
 
+/// T14 (evaluation only) — self-supervised holdout. Visible pixels of a layer listed in `layers`
+/// are treated as that layer's hidden area by the texture stage: they are removed from every
+/// colour-field seed, they take the same hidden-texel branch as `fillMask` texels, and the source
+/// colour at those pixels is replaced by `occluder_rgb` (the colour of the upper layer that would
+/// cover them), so no branch can read the held-out original pixel. Masks, evidence analysis, and
+/// palettes are computed from the unmodified input, so the partition is unchanged. The result is
+/// never written to a project; `flat2rig-cli --eval-holdout` compares it with the original pixels.
+#[derive(Debug, Clone, Default)]
+pub struct EvalHoldout {
+    /// Per final layer id: held-out visible pixels (canvas-sized).
+    pub layers: HashMap<String, Vec<bool>>,
+    /// Source colour substituted at held-out pixels (`(pixel index, rgb)`).
+    pub occluder_rgb: Vec<(usize, [u8; 3])>,
+}
+
+impl EvalHoldout {
+    fn union(&self, n: usize) -> Vec<bool> {
+        let mut u = vec![false; n];
+        for m in self.layers.values() {
+            for (o, &b) in u.iter_mut().zip(m) {
+                *o |= b;
+            }
+        }
+        u
+    }
+}
+
+thread_local! {
+    static EVAL_HOLDOUT: std::cell::RefCell<Option<std::rc::Rc<EvalHoldout>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with an evaluation holdout active on this thread only (T14). Without this wrapper the
+/// synthesis path is byte-identical to the product path.
+pub fn with_eval_holdout<R>(holdout: EvalHoldout, f: impl FnOnce() -> R) -> R {
+    let prev = EVAL_HOLDOUT.with(|c| c.replace(Some(std::rc::Rc::new(holdout))));
+    struct Restore(Option<std::rc::Rc<EvalHoldout>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            EVAL_HOLDOUT.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+fn current_eval_holdout() -> Option<std::rc::Rc<EvalHoldout>> {
+    EVAL_HOLDOUT.with(|c| c.borrow().clone())
+}
+
+/// Clears held-out pixels from a colour-field seed set (no-op without a holdout).
+fn drop_holdout_seeds(seeds: &mut [bool], holdout_union: Option<&[bool]>) {
+    if let Some(u) = holdout_union {
+        for (s, &b) in seeds.iter_mut().zip(u) {
+            if b {
+                *s = false;
+            }
+        }
+    }
+}
+
 fn resolve_style_choice(override_val: &Option<String>, auto_val: &str, valid: &[&str]) -> String {
     if let Some(ref s) = override_val {
         let trimmed = s.trim();
@@ -3842,6 +3904,9 @@ pub fn synthesize_template_bank_for_stage(
 ) -> TemplateSynthesisOutput {
     let stage = normalize_pipeline_stage(pipeline_stage);
     let n = w * h;
+    // T14 evaluation holdout (`None` on every product path).
+    let eval_holdout = current_eval_holdout();
+    let holdout_union: Option<Vec<bool>> = eval_holdout.as_ref().map(|h| h.union(n));
     let frame = HeadFrame::from_landmarks(landmarks, w, h);
     let eye_dist = frame.eye_dist.max(8.0);
     let hh = frame.hh.max(12.0);
@@ -3982,6 +4047,13 @@ pub fn synthesize_template_bank_for_stage(
         }
     }
     let skin_field = build_color_field(rgba, &pure_face_seeds, w, h, ev.palette.skin_base);
+    // T14 holdout: `skin_field` also drives the `face_detail` mask split, so the partition keeps the
+    // product field and only the texture stage uses a field without held-out seeds.
+    let holdout_skin_field = holdout_union.as_deref().map(|u| {
+        let mut seeds = pure_face_seeds.clone();
+        drop_holdout_seeds(&mut seeds, Some(u));
+        build_color_field(rgba, &seeds, w, h, ev.palette.skin_base)
+    });
 
     // 3. Evaluate template SDF masks (`tpl_masks[layer]`, 0..=255) across all 21 layers in Z-order.
     let num_layers = TEMPLATE_LAYER_ORDER.len();
@@ -5369,6 +5441,7 @@ pub fn synthesize_template_bank_for_stage(
     if hair_eroded.iter().filter(|&&v| v).count() < 16 {
         hair_eroded = erode_mask(&hair_seed_src, w, h, 1);
     }
+    drop_holdout_seeds(&mut hair_eroded, holdout_union.as_deref());
     let hair_field = if hair_eroded.iter().any(|&v| v) {
         build_color_field(rgba, &hair_eroded, w, h, base_hair_rgb)
     } else {
@@ -5380,6 +5453,7 @@ pub fn synthesize_template_bank_for_stage(
                 }
             }
         }
+        drop_holdout_seeds(&mut fallback_seeds, holdout_union.as_deref());
         build_color_field(rgba, &fallback_seeds, w, h, base_hair_rgb)
     };
 
@@ -5396,6 +5470,7 @@ pub fn synthesize_template_bank_for_stage(
     if clothes_eroded.iter().filter(|&&v| v).count() < 24 {
         clothes_eroded = erode_mask(&ev_clothes, w, h, 2);
     }
+    drop_holdout_seeds(&mut clothes_eroded, holdout_union.as_deref());
     let clothes_field = build_color_field(rgba, &clothes_eroded, w, h, ev.palette.clothes_primary);
 
     // Preserve any extra split hair strands (`hair_front_*`, `hair_side_R_*`, `hair_side_L_*`, `hair_back_*`) from upstream `hair_split`.
@@ -5804,6 +5879,34 @@ pub fn synthesize_template_bank_for_stage(
     let final_len = final_layer_ids.len();
 
     // 5. Synthesize clean hybrid per-part RGBA PNG textures across all canonical + dynamic layers!
+    // T14 holdout: held-out pixels read the occluder colour, never the original pixel.
+    let holdout_src: Option<Vec<u8>> = eval_holdout.as_ref().map(|hd| {
+        let mut src = rgba.to_vec();
+        for &(i, c) in &hd.occluder_rgb {
+            if i < n {
+                src[i * 4..i * 4 + 3].copy_from_slice(&c);
+            }
+        }
+        src
+    });
+    let rgba: &[u8] = holdout_src.as_deref().unwrap_or(rgba);
+    let skin_field = holdout_skin_field.as_ref().unwrap_or(&skin_field);
+    // T14 holdout: palettes / iris fits used by hidden-texel branches are re-estimated from the
+    // occluded source so they cannot carry held-out colours (product path: the same `ev`).
+    let ev_product: &AnalyzedEvidence = &ev;
+    let holdout_ev = holdout_src.as_deref().map(|src| {
+        analyze_evidence(
+            src,
+            w,
+            h,
+            landmarks,
+            points_28,
+            evidence_ids,
+            evidence_masks,
+            overrides,
+        )
+    });
+    let ev: &AnalyzedEvidence = holdout_ev.as_ref().unwrap_or(ev_product);
     let mut textures = Vec::with_capacity(final_len);
     for layer_idx in 0..final_len {
         let id = final_layer_ids[layer_idx].as_str();
@@ -5817,8 +5920,23 @@ pub fn synthesize_template_bank_for_stage(
         }
 
         let mut tex = vec![0u8; n * 4];
-        let m_vis = &final_visible_masks[layer_idx];
-        let m_fill = &fill_masks[layer_idx];
+        // T14 holdout: this layer's held-out visible pixels take the hidden-texel branch.
+        let held = eval_holdout.as_ref().and_then(|hd| hd.layers.get(id));
+        let held_masks: Option<(Vec<u8>, Vec<u8>)> = held.map(|hm| {
+            let mut vis = final_visible_masks[layer_idx].clone();
+            let mut fill = fill_masks[layer_idx].clone();
+            for i in 0..n {
+                if hm[i] && vis[i] > 0 {
+                    vis[i] = 0;
+                    fill[i] = 255;
+                }
+            }
+            (vis, fill)
+        });
+        let (m_vis, m_fill) = match &held_masks {
+            Some((v, f)) => (v, f),
+            None => (&final_visible_masks[layer_idx], &fill_masks[layer_idx]),
+        };
 
         let is_mannequin_stage = stage == "base_silhouette";
         match id {
@@ -6271,7 +6389,7 @@ pub fn synthesize_template_bank_for_stage(
                 }
             }
             "mouth_inner" => {
-                let (m_rx, m_ry) = mouth_radii(&ev, eye_dist, mouth_style);
+                let (m_rx, m_ry) = mouth_radii(ev, eye_dist, mouth_style);
                 let cavity_dark = [118u8, 48, 62];
                 let tongue_pink = [226u8, 128, 134];
                 let teeth_white = [250u8, 244, 245];
@@ -6305,7 +6423,7 @@ pub fn synthesize_template_bank_for_stage(
             }
             "mouth_upper" | "mouth_lower" => {
                 // mouth_upper / mouth_lower: preserve original lip line + seamless skin cushion over closed mouth_inner
-                let (m_rx, m_ry) = mouth_radii(&ev, eye_dist, mouth_style);
+                let (m_rx, m_ry) = mouth_radii(ev, eye_dist, mouth_style);
                 let is_upper = id == "mouth_upper";
                 for y in 0..h {
                     for x in 0..w {
@@ -6428,6 +6546,7 @@ pub fn synthesize_template_bank_for_stage(
         }
     }
 
+    let ev = ev_product;
     // Build per-layer provenance & confidence aligned with evidence.
     let mut provenances = Vec::with_capacity(final_len);
     let mut confidences = Vec::with_capacity(final_len);
@@ -6457,9 +6576,9 @@ pub fn synthesize_template_bank_for_stage(
         provenances,
         confidences,
         style_match: StyleMatchReport {
-            resolved: ev.resolved,
+            resolved: ev.resolved.clone(),
             match_score: ev.match_score,
-            metrics: ev.metrics,
+            metrics: ev.metrics.clone(),
             palette_summary,
         },
     }
@@ -7372,6 +7491,110 @@ mod tests {
         assert!((smoothstep(1.2, -1.2, 0.0) - 0.5).abs() < 1e-9);
         assert!((smoothstep(1.2, -1.2, 1.5) - 0.0).abs() < 1e-9);
         assert!((smoothstep(1.2, -1.2, -1.5) - 1.0).abs() < 1e-9);
+    }
+
+    /// T14: the evaluation holdout must not touch the product path. Without `with_eval_holdout` (and
+    /// after one returns) the output is identical; an empty holdout runs the holdout plumbing and is
+    /// still identical; a real holdout keeps the partition and re-synthesizes only through textures.
+    #[test]
+    fn t14_eval_holdout_is_inert_on_the_product_path_and_keeps_the_partition() {
+        let (w, h) = (256usize, 256usize);
+        let n = w * h;
+        let mut rgba = vec![0u8; n * 4];
+        let lm = Landmarks {
+            eye_r: Point { x: 96.0, y: 84.0 },
+            eye_l: Point { x: 160.0, y: 84.0 },
+            mouth: Point { x: 128.0, y: 118.0 },
+            chin: Point { x: 128.0, y: 140.0 },
+            crown: Point { x: 128.0, y: 24.0 },
+        };
+        let mut face_m = vec![0u8; n];
+        let mut clothes_m = vec![0u8; n];
+        let mut hair_m = vec![0u8; n];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let k = i * 4;
+                if (x as f64 - 128.0).hypot((y as f64 - 88.0) * 0.9) < 58.0 {
+                    if y < 60 {
+                        rgba[k..k + 4].copy_from_slice(&[70, 58, 88, 255]);
+                        hair_m[i] = 255;
+                    } else {
+                        // Vertical shading so a flat fill differs from the original.
+                        let s = (y as f64 - 60.0) * 0.6;
+                        rgba[k..k + 4].copy_from_slice(&[245, (220.0 - s) as u8, (205.0 - s) as u8, 255]);
+                        face_m[i] = 255;
+                    }
+                } else if y > 165 && (x as f64 - 128.0).abs() < 76.0 {
+                    rgba[k..k + 4].copy_from_slice(&[210, 212, 224, 255]);
+                    clothes_m[i] = 255;
+                }
+            }
+        }
+        let ids = vec!["hair_front".to_string(), "face".to_string(), "clothes".to_string()];
+        let masks = vec![hair_m, face_m, clothes_m];
+        let provs = vec!["model".to_string(); 3];
+        let confs = vec![0.9; 3];
+        let run = || {
+            synthesize_template_bank(
+                &rgba,
+                w,
+                h,
+                &lm,
+                &[],
+                &ids,
+                &masks,
+                &provs,
+                &confs,
+                &TemplateStyleSelection::default(),
+            )
+        };
+        let decode = |t: &Option<String>| -> Option<Vec<u8>> {
+            let b64 = t.as_ref()?.strip_prefix("data:image/png;base64,")?;
+            Some(image::load_from_memory(&STANDARD.decode(b64).ok()?).ok()?.to_rgba8().into_raw())
+        };
+        let base = run();
+        let empty = with_eval_holdout(EvalHoldout::default(), run);
+        let after = run();
+        for out in [&empty, &after] {
+            assert_eq!(out.part_ids, base.part_ids);
+            assert_eq!(out.masks, base.masks);
+            assert_eq!(out.fill_masks, base.fill_masks);
+            assert_eq!(out.textures, base.textures, "holdout plumbing changed a texture");
+        }
+
+        // Hold out a 12px band of visible face under the hair line; occluder = hair colour.
+        let face = base.part_ids.iter().position(|id| id == "face").unwrap();
+        let held: Vec<bool> = (0..n)
+            .map(|i| base.masks[face][i] > 0 && (i / w) < 72)
+            .collect();
+        let held_px = held.iter().filter(|&&b| b).count();
+        assert!(held_px > 100, "{held_px}");
+        let mut layers = HashMap::new();
+        layers.insert("face".to_string(), held.clone());
+        let occluder_rgb: Vec<(usize, [u8; 3])> = (0..n).filter(|&i| held[i]).map(|i| (i, [70, 58, 88])).collect();
+        let ho = with_eval_holdout(EvalHoldout { layers, occluder_rgb }, run);
+        assert_eq!(ho.part_ids, base.part_ids);
+        assert_eq!(ho.masks, base.masks, "holdout must not change the partition");
+        assert_eq!(ho.fill_masks, base.fill_masks);
+        let t_base = decode(&base.textures[face]).unwrap();
+        let t_ho = decode(&ho.textures[face]).unwrap();
+        let mut changed = 0usize;
+        for i in 0..n {
+            let (a, b) = (&t_base[i * 4..i * 4 + 3], &t_ho[i * 4..i * 4 + 3]);
+            if held[i] {
+                // Held-out pixels are re-synthesized (never the hair occluder colour, never copied).
+                assert_ne!(b, &[70u8, 58, 88][..], "held-out pixel copied the occluder at {i}");
+                if a != b {
+                    changed += 1;
+                }
+            } else if base.masks[face][i] > 0 {
+                assert_eq!(a, b, "visible non-held face pixel changed at {i}");
+            }
+        }
+        assert!(changed > held_px / 2, "{changed}/{held_px} held-out pixels re-synthesized");
+        // Product path afterwards is still identical.
+        assert_eq!(run().textures, base.textures);
     }
 
     #[test]
