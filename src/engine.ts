@@ -1418,7 +1418,20 @@ export function partOverlapMargins(
   };
 }
 
-/** Returns the motion-proportional manual/fallback occlusion fill radius for a part. */
+/**
+ * Within the `eye` role, white/iris sublayers are occluded by lids/brows and need gaze-travel
+ * underlap; lids/lashes are occluders and use the generic radius. Mirrors Rust
+ * `core::is_eye_occluded_sublayer`.
+ */
+function isEyeOccludedSublayer(id: string): boolean {
+  return id.endsWith("_white") || id.endsWith("_iris");
+}
+
+/**
+ * Returns the motion-proportional manual/fallback occlusion fill radius for a part, dispatched by
+ * its role (explicit `part.role`, else `inferPartRole`), identically to Rust
+ * `core::recommended_fill_radius` (guarded by `tests/fixtures/fill-radius-parity.json`).
+ */
 export function recommendedFillRadius(
   part: Pick<Part, "id" | "role">,
   lm: Landmarks,
@@ -1427,36 +1440,29 @@ export function recommendedFillRadius(
 ): number {
   const m = partOverlapMargins(lm, w, h);
   const hf = buildHeadFrame(lm, w, h);
-  const role = inferPartRole(part.id, part.role);
-  if (role === "hair_back" || part.id.startsWith("hair_back")) {
-    return m.hairBackUnderlap;
+  const generic = Math.max(6, Math.ceil(Math.max(8, hf.eyeDist) * 0.08));
+  switch (inferPartRole(part.id, part.role)) {
+    case "hair_back":
+      return m.hairBackUnderlap;
+    case "hair_front":
+    case "hair_side_L":
+    case "hair_side_R":
+      return Math.max(m.hairSideFrontSeam, m.hairHatRoot);
+    case "neck":
+      return Math.max(m.neckCollarX, m.neckCollarY, m.neckChinY);
+    case "face":
+      return m.faceScalpMargin;
+    case "body":
+    case "clothes":
+    case "hands":
+      return m.clothesHairUnderlap;
+    case "eye":
+      return isEyeOccludedSublayer(part.id)
+        ? Math.max(m.eyeGazeX, m.eyeGazeY)
+        : generic;
+    default:
+      return generic;
   }
-  if (isHairPart(part)) {
-    return Math.max(m.hairSideFrontSeam, m.hairHatRoot);
-  }
-  if (part.id === "neck" || role === "neck") {
-    return Math.max(m.neckCollarX, m.neckCollarY, m.neckChinY);
-  }
-  if (part.id === "face" || role === "face") {
-    return m.faceScalpMargin;
-  }
-  if (
-    part.id === "body" ||
-    role === "body" ||
-    role === "clothes" ||
-    role === "hands" ||
-    part.id.startsWith("clothes") ||
-    part.id.startsWith("hands")
-  ) {
-    return m.clothesHairUnderlap;
-  }
-  if (
-    part.id.startsWith("eye") &&
-    (part.id.endsWith("_white") || part.id.endsWith("_iris"))
-  ) {
-    return Math.max(m.eyeGazeX, m.eyeGazeY);
-  }
-  return Math.max(6, Math.ceil(Math.max(8, hf.eyeDist) * 0.08));
 }
 
 export interface RegionDeformParams {

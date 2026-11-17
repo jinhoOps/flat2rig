@@ -44,8 +44,10 @@ import {
   PARAM_DEFS,
   REST,
   type Landmarks,
+  type PartRole,
   type Project,
 } from "../src/types";
+import fillRadiusParity from "./fixtures/fill-radius-parity.json";
 import {
   createCustomExpression,
   createUndoHistory,
@@ -1797,5 +1799,36 @@ describe("preserved part merging on regeneration", () => {
     const frontP = deform(cheekHairPt, { id: "hair_front" }, lm1024, swayPose);
     const sideP = deform(cheekHairPt, { id: "hair_side_R" }, lm1024, swayPose);
     expect(Math.abs(frontP.x - sideP.x)).toBeLessThanOrEqual(m1024.hairSideFrontSeam);
+  });
+
+  it("dispatches recommendedFillRadius by role and matches the shared Rust/TS parity fixture", () => {
+    const fixture = fillRadiusParity as {
+      roleInference: { id: string; role: PartRole }[];
+      frames: {
+        label: string;
+        width: number;
+        height: number;
+        landmarks: Landmarks;
+        parts: { id: string; role?: PartRole; radius: number }[];
+      }[];
+    };
+    expect(fixture.roleInference.length).toBeGreaterThan(0);
+    expect(fixture.frames.length).toBeGreaterThan(0);
+    for (const c of fixture.roleInference) {
+      expect(inferPartRole(c.id), c.id).toBe(c.role);
+    }
+    for (const f of fixture.frames) {
+      for (const p of f.parts) {
+        expect(
+          recommendedFillRadius({ id: p.id, role: p.role }, f.landmarks, f.width, f.height),
+          `${f.label} / ${p.id} (${p.role ?? "inferred"})`,
+        ).toBe(p.radius);
+      }
+    }
+    // Variable multi-hair IDs must resolve through roles, not the fixed 18-ID table.
+    const ids = fixture.frames[0].parts.map((p) => p.id);
+    for (const id of ["hair_front_2", "hair_side_L_2", "hair_side_R_3", "hair_back_3"]) {
+      expect(ids).toContain(id);
+    }
   });
 });

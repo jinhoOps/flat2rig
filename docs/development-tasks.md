@@ -157,7 +157,7 @@
 
 - **상수 복제**: `deform` 계수를 폐형식으로 옮겨 적어 같은 상수가 Rust `deform`·Rust 여유분·TS 여유분 세 곳에 있다. `deform`을 수정하면 여유분이 조용히 어긋난다.
 - **검증 표본 부족**: 테스트가 목-옷깃 1점, 옆머리-앞머리 1점, 단일 포즈만 확인한다. 이음새 전체 경계와 포즈 포락선의 최댓값을 보장하지 않는다.
-- **역할 기반 위반**: Rust `recommended_fill_radius`는 ID 접두사로, TS `recommendedFillRadius`는 `role`로 분기한다. T13 전이라도 Rust를 역할 기반으로 맞추고 Rust/TS 동일 입력 동일 반경 테스트를 추가한다.
+- **역할 기반 위반** (`2a` 구현됨 · 테스트 통과, Windows 원화 모션 `미검증`): Rust `recommended_fill_radius`는 ID 접두사로, TS `recommendedFillRadius`는 `role`과 ID 접두사를 섞어 분기했다. 이제 양쪽 모두 `role`(명시 역할 우선, 없으면 Rust `core::infer_part_role` / TS `inferPartRole` 한 곳의 ID→역할 폴백)으로만 분기한다. `hair_back` → `hair_back_underlap`, `hair_front`·`hair_side_L/R` → `max(hair_side_front_seam, hair_hat_root)`, `neck` → `max(neck_collar_x, neck_collar_y, neck_chin_y)`, `face`(`face_detail` 포함) → `face_scalp_margin`, `body`·`clothes`·`hands` → `clothes_hair_underlap`, `eye` 중 `_white`/`_iris` → `max(eye_gaze_x, eye_gaze_y)`, 그 외 → `max(6, ceil(max(8, eye_dist)·0.08))`. 공유 표 `tests/fixtures/fill-radius-parity.json`(해상도 4종 × 가변 머리카락 `hair_front_2`·`hair_side_L_2`·`hair_side_R_3`·`hair_back_3` 등 52파츠, 역할 추론 표 포함)을 `cargo test`와 `tests/pipeline.test.ts`가 함께 읽어 같은 반경을 단언한다. 여유분 값은 바꾸지 않았다(역할과 ID가 일치하는 항목은 2a 이전 TS 값과 동일). 변경된 동작은 명시 역할이 ID 접두사와 충돌할 때 역할이 이긴다는 점뿐이며, 이전 Rust에서 `face_detail`이 일반 반경으로 떨어지던 TS 불일치도 해소됐다. 남은 제한: 눈 흰자/홍채 구분은 `eye` 역할 안의 ID 접미사에 의존하고, `templates.rs` `apply_motion_proportional_underlaps`의 ID 기반 이음새 적용과 상수 복제는 T13 범위로 남는다.
 - **품질 트레이드오프**: 여유분이 넓어질수록 시드에서 먼 조화 보간 픽셀이 늘어나 노출 시 뭉개진 영역이 커진다. T9·T14 없이 여유분만 더 키우지 않는다.
 
 작업:
@@ -293,7 +293,7 @@
 | --- | --- | --- |
 | 1 | `docs: align product plan, tasks, and invariants to hidden-area expansion` | 계획·규칙·아키텍처 문서 일관성 |
 | 2 | `feat(T8): scale per-part overlap fillMask margins by HeadFrame motion` (`79610ec`, 완료) | 목·머리카락·의상 반대/최대 변위 공백 0 (Windows 미검증) |
-| 2a | `fix(T8): role-based fill radius dispatch with Rust/TS parity test` | Rust/TS 동일 입력 동일 반경 |
+| 2a | `fix(T8): role-based fill radius dispatch with Rust/TS parity test` (구현됨 · `cargo test`/`npm test` 통과) | Rust/TS 동일 입력 동일 반경 (공유 fixture 통과, Windows 원화 모션 `미검증`) |
 | 3 | `feat(T13): derive seam contracts, pose envelope margins, and exposure map` | 변형 상수 복제 0, 이음새 커버리지 위반 0, 노출 면적 기록 |
 | 4 | `test(T14): add hidden-area fidelity harness (PSD ground truth + holdout)` | 현 합성기 기준선 수치·비교 이미지 |
 | 5 | `feat(T9): decontaminate rim halos, classify fillKind, palette-snapped cel field` | 경계 흰 테두리·목 얼룩 제거 + T14 지표 개선 |

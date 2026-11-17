@@ -1,0 +1,1207 @@
+{
+  "description": "Rust/TS parity table for role-based fill radius dispatch (T8 2a). Read by src-tauri/src/core.rs tests (include_str!) and tests/pipeline.test.ts. roleInference pins inferPartRole/infer_part_role; frames pin recommendedFillRadius/recommended_fill_radius per (landmarks, width, height, part id, optional explicit role). Expected radii were captured from the pre-2a TS implementation and are unchanged for every entry whose explicit role agrees with its ID; the last three parts per frame assert explicit-role-wins semantics.",
+  "roleInference": [
+    {
+      "id": "hair_back",
+      "role": "hair_back"
+    },
+    {
+      "id": "body",
+      "role": "body"
+    },
+    {
+      "id": "neck",
+      "role": "neck"
+    },
+    {
+      "id": "face",
+      "role": "face"
+    },
+    {
+      "id": "eyeR_white",
+      "role": "eye"
+    },
+    {
+      "id": "eyeR_iris",
+      "role": "eye"
+    },
+    {
+      "id": "eyeR_lower",
+      "role": "eye"
+    },
+    {
+      "id": "eyeR_upper",
+      "role": "eye"
+    },
+    {
+      "id": "eyeL_white",
+      "role": "eye"
+    },
+    {
+      "id": "eyeL_iris",
+      "role": "eye"
+    },
+    {
+      "id": "eyeL_lower",
+      "role": "eye"
+    },
+    {
+      "id": "eyeL_upper",
+      "role": "eye"
+    },
+    {
+      "id": "browR",
+      "role": "brow"
+    },
+    {
+      "id": "browL",
+      "role": "brow"
+    },
+    {
+      "id": "mouth_inner",
+      "role": "mouth"
+    },
+    {
+      "id": "mouth_lower",
+      "role": "mouth"
+    },
+    {
+      "id": "mouth_upper",
+      "role": "mouth"
+    },
+    {
+      "id": "hair_front",
+      "role": "hair_front"
+    },
+    {
+      "id": "hair_front_2",
+      "role": "hair_front"
+    },
+    {
+      "id": "hair_side_L",
+      "role": "hair_side_L"
+    },
+    {
+      "id": "hair_side_L_2",
+      "role": "hair_side_L"
+    },
+    {
+      "id": "hair_side_R",
+      "role": "hair_side_R"
+    },
+    {
+      "id": "hair_side_R_3",
+      "role": "hair_side_R"
+    },
+    {
+      "id": "hair_side_2",
+      "role": "hair_side_L"
+    },
+    {
+      "id": "hair_back_2",
+      "role": "hair_back"
+    },
+    {
+      "id": "hair_back_3",
+      "role": "hair_back"
+    },
+    {
+      "id": "face_detail",
+      "role": "face"
+    },
+    {
+      "id": "hat",
+      "role": "hat"
+    },
+    {
+      "id": "hat_2",
+      "role": "hat"
+    },
+    {
+      "id": "acc_glasses",
+      "role": "accessory"
+    },
+    {
+      "id": "acc_hairpin",
+      "role": "accessory"
+    },
+    {
+      "id": "acc_ribbon",
+      "role": "accessory"
+    },
+    {
+      "id": "clothes",
+      "role": "clothes"
+    },
+    {
+      "id": "clothes_outer",
+      "role": "clothes"
+    },
+    {
+      "id": "clothes_inner",
+      "role": "clothes"
+    },
+    {
+      "id": "clothes_collar",
+      "role": "clothes"
+    },
+    {
+      "id": "clothes_acc",
+      "role": "clothes"
+    },
+    {
+      "id": "clothes_hands",
+      "role": "hands"
+    },
+    {
+      "id": "hands_2",
+      "role": "hands"
+    },
+    {
+      "id": "strand_extra_1",
+      "role": "other"
+    },
+    {
+      "id": "layer_back_7",
+      "role": "other"
+    },
+    {
+      "id": "bangs_tuft",
+      "role": "other"
+    },
+    {
+      "id": "collar_piece",
+      "role": "other"
+    },
+    {
+      "id": "throat_skin",
+      "role": "other"
+    },
+    {
+      "id": "forehead_patch",
+      "role": "other"
+    },
+    {
+      "id": "sleeve_cuff",
+      "role": "other"
+    },
+    {
+      "id": "torso_base",
+      "role": "other"
+    },
+    {
+      "id": "ribbon_3",
+      "role": "other"
+    },
+    {
+      "id": "hair_tie",
+      "role": "hair_front"
+    },
+    {
+      "id": "hair_back_clip",
+      "role": "hair_back"
+    }
+  ],
+  "frames": [
+    {
+      "label": "64px base",
+      "width": 64,
+      "height": 64,
+      "landmarks": {
+        "eyeL": {
+          "x": 38,
+          "y": 24
+        },
+        "eyeR": {
+          "x": 22,
+          "y": 24
+        },
+        "mouth": {
+          "x": 30,
+          "y": 33
+        },
+        "chin": {
+          "x": 30,
+          "y": 40
+        },
+        "crown": {
+          "x": 30,
+          "y": 4
+        }
+      },
+      "parts": [
+        {
+          "id": "hair_back",
+          "radius": 13
+        },
+        {
+          "id": "body",
+          "radius": 9
+        },
+        {
+          "id": "neck",
+          "radius": 11
+        },
+        {
+          "id": "face",
+          "radius": 7
+        },
+        {
+          "id": "eyeR_white",
+          "radius": 5
+        },
+        {
+          "id": "eyeR_iris",
+          "radius": 5
+        },
+        {
+          "id": "eyeR_lower",
+          "radius": 6
+        },
+        {
+          "id": "eyeR_upper",
+          "radius": 6
+        },
+        {
+          "id": "eyeL_white",
+          "radius": 5
+        },
+        {
+          "id": "eyeL_iris",
+          "radius": 5
+        },
+        {
+          "id": "eyeL_lower",
+          "radius": 6
+        },
+        {
+          "id": "eyeL_upper",
+          "radius": 6
+        },
+        {
+          "id": "browR",
+          "radius": 6
+        },
+        {
+          "id": "browL",
+          "radius": 6
+        },
+        {
+          "id": "mouth_inner",
+          "radius": 6
+        },
+        {
+          "id": "mouth_lower",
+          "radius": 6
+        },
+        {
+          "id": "mouth_upper",
+          "radius": 6
+        },
+        {
+          "id": "hair_front",
+          "radius": 7
+        },
+        {
+          "id": "hair_front_2",
+          "radius": 7
+        },
+        {
+          "id": "hair_side_L",
+          "radius": 7
+        },
+        {
+          "id": "hair_side_L_2",
+          "radius": 7
+        },
+        {
+          "id": "hair_side_R",
+          "radius": 7
+        },
+        {
+          "id": "hair_side_R_3",
+          "radius": 7
+        },
+        {
+          "id": "hair_side_2",
+          "radius": 7
+        },
+        {
+          "id": "hair_back_2",
+          "radius": 13
+        },
+        {
+          "id": "hair_back_3",
+          "radius": 13
+        },
+        {
+          "id": "face_detail",
+          "radius": 7
+        },
+        {
+          "id": "hat",
+          "radius": 6
+        },
+        {
+          "id": "hat_2",
+          "radius": 6
+        },
+        {
+          "id": "acc_glasses",
+          "radius": 6
+        },
+        {
+          "id": "acc_hairpin",
+          "radius": 6
+        },
+        {
+          "id": "acc_ribbon",
+          "radius": 6
+        },
+        {
+          "id": "clothes",
+          "radius": 9
+        },
+        {
+          "id": "clothes_outer",
+          "radius": 9
+        },
+        {
+          "id": "clothes_inner",
+          "radius": 9
+        },
+        {
+          "id": "clothes_collar",
+          "radius": 9
+        },
+        {
+          "id": "clothes_acc",
+          "radius": 9
+        },
+        {
+          "id": "clothes_hands",
+          "radius": 9
+        },
+        {
+          "id": "hands_2",
+          "radius": 9
+        },
+        {
+          "id": "strand_extra_1",
+          "role": "hair_side_R",
+          "radius": 7
+        },
+        {
+          "id": "layer_back_7",
+          "role": "hair_back",
+          "radius": 13
+        },
+        {
+          "id": "bangs_tuft",
+          "role": "hair_front",
+          "radius": 7
+        },
+        {
+          "id": "collar_piece",
+          "role": "clothes",
+          "radius": 9
+        },
+        {
+          "id": "throat_skin",
+          "role": "neck",
+          "radius": 11
+        },
+        {
+          "id": "forehead_patch",
+          "role": "face",
+          "radius": 7
+        },
+        {
+          "id": "sleeve_cuff",
+          "role": "hands",
+          "radius": 9
+        },
+        {
+          "id": "torso_base",
+          "role": "body",
+          "radius": 9
+        },
+        {
+          "id": "eyeL_white",
+          "role": "eye",
+          "radius": 5
+        },
+        {
+          "id": "ribbon_3",
+          "role": "accessory",
+          "radius": 6
+        },
+        {
+          "id": "hair_tie",
+          "role": "accessory",
+          "radius": 6
+        },
+        {
+          "id": "hair_back_clip",
+          "role": "hat",
+          "radius": 6
+        },
+        {
+          "id": "neck",
+          "role": "clothes",
+          "radius": 9
+        }
+      ]
+    },
+    {
+      "label": "1024px",
+      "width": 1024,
+      "height": 1024,
+      "landmarks": {
+        "eyeL": {
+          "x": 608,
+          "y": 384
+        },
+        "eyeR": {
+          "x": 352,
+          "y": 384
+        },
+        "mouth": {
+          "x": 480,
+          "y": 528
+        },
+        "chin": {
+          "x": 480,
+          "y": 640
+        },
+        "crown": {
+          "x": 480,
+          "y": 64
+        }
+      },
+      "parts": [
+        {
+          "id": "hair_back",
+          "radius": 135
+        },
+        {
+          "id": "body",
+          "radius": 80
+        },
+        {
+          "id": "neck",
+          "radius": 102
+        },
+        {
+          "id": "face",
+          "radius": 51
+        },
+        {
+          "id": "eyeR_white",
+          "radius": 20
+        },
+        {
+          "id": "eyeR_iris",
+          "radius": 20
+        },
+        {
+          "id": "eyeR_lower",
+          "radius": 21
+        },
+        {
+          "id": "eyeR_upper",
+          "radius": 21
+        },
+        {
+          "id": "eyeL_white",
+          "radius": 20
+        },
+        {
+          "id": "eyeL_iris",
+          "radius": 20
+        },
+        {
+          "id": "eyeL_lower",
+          "radius": 21
+        },
+        {
+          "id": "eyeL_upper",
+          "radius": 21
+        },
+        {
+          "id": "browR",
+          "radius": 21
+        },
+        {
+          "id": "browL",
+          "radius": 21
+        },
+        {
+          "id": "mouth_inner",
+          "radius": 21
+        },
+        {
+          "id": "mouth_lower",
+          "radius": 21
+        },
+        {
+          "id": "mouth_upper",
+          "radius": 21
+        },
+        {
+          "id": "hair_front",
+          "radius": 52
+        },
+        {
+          "id": "hair_front_2",
+          "radius": 52
+        },
+        {
+          "id": "hair_side_L",
+          "radius": 52
+        },
+        {
+          "id": "hair_side_L_2",
+          "radius": 52
+        },
+        {
+          "id": "hair_side_R",
+          "radius": 52
+        },
+        {
+          "id": "hair_side_R_3",
+          "radius": 52
+        },
+        {
+          "id": "hair_side_2",
+          "radius": 52
+        },
+        {
+          "id": "hair_back_2",
+          "radius": 135
+        },
+        {
+          "id": "hair_back_3",
+          "radius": 135
+        },
+        {
+          "id": "face_detail",
+          "radius": 51
+        },
+        {
+          "id": "hat",
+          "radius": 21
+        },
+        {
+          "id": "hat_2",
+          "radius": 21
+        },
+        {
+          "id": "acc_glasses",
+          "radius": 21
+        },
+        {
+          "id": "acc_hairpin",
+          "radius": 21
+        },
+        {
+          "id": "acc_ribbon",
+          "radius": 21
+        },
+        {
+          "id": "clothes",
+          "radius": 80
+        },
+        {
+          "id": "clothes_outer",
+          "radius": 80
+        },
+        {
+          "id": "clothes_inner",
+          "radius": 80
+        },
+        {
+          "id": "clothes_collar",
+          "radius": 80
+        },
+        {
+          "id": "clothes_acc",
+          "radius": 80
+        },
+        {
+          "id": "clothes_hands",
+          "radius": 80
+        },
+        {
+          "id": "hands_2",
+          "radius": 80
+        },
+        {
+          "id": "strand_extra_1",
+          "role": "hair_side_R",
+          "radius": 52
+        },
+        {
+          "id": "layer_back_7",
+          "role": "hair_back",
+          "radius": 135
+        },
+        {
+          "id": "bangs_tuft",
+          "role": "hair_front",
+          "radius": 52
+        },
+        {
+          "id": "collar_piece",
+          "role": "clothes",
+          "radius": 80
+        },
+        {
+          "id": "throat_skin",
+          "role": "neck",
+          "radius": 102
+        },
+        {
+          "id": "forehead_patch",
+          "role": "face",
+          "radius": 51
+        },
+        {
+          "id": "sleeve_cuff",
+          "role": "hands",
+          "radius": 80
+        },
+        {
+          "id": "torso_base",
+          "role": "body",
+          "radius": 80
+        },
+        {
+          "id": "eyeL_white",
+          "role": "eye",
+          "radius": 20
+        },
+        {
+          "id": "ribbon_3",
+          "role": "accessory",
+          "radius": 21
+        },
+        {
+          "id": "hair_tie",
+          "role": "accessory",
+          "radius": 21
+        },
+        {
+          "id": "hair_back_clip",
+          "role": "hat",
+          "radius": 21
+        },
+        {
+          "id": "neck",
+          "role": "clothes",
+          "radius": 80
+        }
+      ]
+    },
+    {
+      "label": "2048px",
+      "width": 2048,
+      "height": 2048,
+      "landmarks": {
+        "eyeL": {
+          "x": 1216,
+          "y": 768
+        },
+        "eyeR": {
+          "x": 704,
+          "y": 768
+        },
+        "mouth": {
+          "x": 960,
+          "y": 1056
+        },
+        "chin": {
+          "x": 960,
+          "y": 1280
+        },
+        "crown": {
+          "x": 960,
+          "y": 128
+        }
+      },
+      "parts": [
+        {
+          "id": "hair_back",
+          "radius": 266
+        },
+        {
+          "id": "body",
+          "radius": 156
+        },
+        {
+          "id": "neck",
+          "radius": 200
+        },
+        {
+          "id": "face",
+          "radius": 97
+        },
+        {
+          "id": "eyeR_white",
+          "radius": 37
+        },
+        {
+          "id": "eyeR_iris",
+          "radius": 37
+        },
+        {
+          "id": "eyeR_lower",
+          "radius": 41
+        },
+        {
+          "id": "eyeR_upper",
+          "radius": 41
+        },
+        {
+          "id": "eyeL_white",
+          "radius": 37
+        },
+        {
+          "id": "eyeL_iris",
+          "radius": 37
+        },
+        {
+          "id": "eyeL_lower",
+          "radius": 41
+        },
+        {
+          "id": "eyeL_upper",
+          "radius": 41
+        },
+        {
+          "id": "browR",
+          "radius": 41
+        },
+        {
+          "id": "browL",
+          "radius": 41
+        },
+        {
+          "id": "mouth_inner",
+          "radius": 41
+        },
+        {
+          "id": "mouth_lower",
+          "radius": 41
+        },
+        {
+          "id": "mouth_upper",
+          "radius": 41
+        },
+        {
+          "id": "hair_front",
+          "radius": 99
+        },
+        {
+          "id": "hair_front_2",
+          "radius": 99
+        },
+        {
+          "id": "hair_side_L",
+          "radius": 99
+        },
+        {
+          "id": "hair_side_L_2",
+          "radius": 99
+        },
+        {
+          "id": "hair_side_R",
+          "radius": 99
+        },
+        {
+          "id": "hair_side_R_3",
+          "radius": 99
+        },
+        {
+          "id": "hair_side_2",
+          "radius": 99
+        },
+        {
+          "id": "hair_back_2",
+          "radius": 266
+        },
+        {
+          "id": "hair_back_3",
+          "radius": 266
+        },
+        {
+          "id": "face_detail",
+          "radius": 97
+        },
+        {
+          "id": "hat",
+          "radius": 41
+        },
+        {
+          "id": "hat_2",
+          "radius": 41
+        },
+        {
+          "id": "acc_glasses",
+          "radius": 41
+        },
+        {
+          "id": "acc_hairpin",
+          "radius": 41
+        },
+        {
+          "id": "acc_ribbon",
+          "radius": 41
+        },
+        {
+          "id": "clothes",
+          "radius": 156
+        },
+        {
+          "id": "clothes_outer",
+          "radius": 156
+        },
+        {
+          "id": "clothes_inner",
+          "radius": 156
+        },
+        {
+          "id": "clothes_collar",
+          "radius": 156
+        },
+        {
+          "id": "clothes_acc",
+          "radius": 156
+        },
+        {
+          "id": "clothes_hands",
+          "radius": 156
+        },
+        {
+          "id": "hands_2",
+          "radius": 156
+        },
+        {
+          "id": "strand_extra_1",
+          "role": "hair_side_R",
+          "radius": 99
+        },
+        {
+          "id": "layer_back_7",
+          "role": "hair_back",
+          "radius": 266
+        },
+        {
+          "id": "bangs_tuft",
+          "role": "hair_front",
+          "radius": 99
+        },
+        {
+          "id": "collar_piece",
+          "role": "clothes",
+          "radius": 156
+        },
+        {
+          "id": "throat_skin",
+          "role": "neck",
+          "radius": 200
+        },
+        {
+          "id": "forehead_patch",
+          "role": "face",
+          "radius": 97
+        },
+        {
+          "id": "sleeve_cuff",
+          "role": "hands",
+          "radius": 156
+        },
+        {
+          "id": "torso_base",
+          "role": "body",
+          "radius": 156
+        },
+        {
+          "id": "eyeL_white",
+          "role": "eye",
+          "radius": 37
+        },
+        {
+          "id": "ribbon_3",
+          "role": "accessory",
+          "radius": 41
+        },
+        {
+          "id": "hair_tie",
+          "role": "accessory",
+          "radius": 41
+        },
+        {
+          "id": "hair_back_clip",
+          "role": "hat",
+          "radius": 41
+        },
+        {
+          "id": "neck",
+          "role": "clothes",
+          "radius": 156
+        }
+      ]
+    },
+    {
+      "label": "1536x2048 tilted off-center",
+      "width": 1536,
+      "height": 2048,
+      "landmarks": {
+        "eyeL": {
+          "x": 905.5,
+          "y": 641.25
+        },
+        "eyeR": {
+          "x": 611,
+          "y": 598
+        },
+        "mouth": {
+          "x": 742,
+          "y": 905
+        },
+        "chin": {
+          "x": 731.5,
+          "y": 1102
+        },
+        "crown": {
+          "x": 802,
+          "y": 112.5
+        }
+      },
+      "parts": [
+        {
+          "id": "hair_back",
+          "radius": 229
+        },
+        {
+          "id": "body",
+          "radius": 135
+        },
+        {
+          "id": "neck",
+          "radius": 172
+        },
+        {
+          "id": "face",
+          "radius": 84
+        },
+        {
+          "id": "eyeR_white",
+          "radius": 23
+        },
+        {
+          "id": "eyeR_iris",
+          "radius": 23
+        },
+        {
+          "id": "eyeR_lower",
+          "radius": 24
+        },
+        {
+          "id": "eyeR_upper",
+          "radius": 24
+        },
+        {
+          "id": "eyeL_white",
+          "radius": 23
+        },
+        {
+          "id": "eyeL_iris",
+          "radius": 23
+        },
+        {
+          "id": "eyeL_lower",
+          "radius": 24
+        },
+        {
+          "id": "eyeL_upper",
+          "radius": 24
+        },
+        {
+          "id": "browR",
+          "radius": 24
+        },
+        {
+          "id": "browL",
+          "radius": 24
+        },
+        {
+          "id": "mouth_inner",
+          "radius": 24
+        },
+        {
+          "id": "mouth_lower",
+          "radius": 24
+        },
+        {
+          "id": "mouth_upper",
+          "radius": 24
+        },
+        {
+          "id": "hair_front",
+          "radius": 86
+        },
+        {
+          "id": "hair_front_2",
+          "radius": 86
+        },
+        {
+          "id": "hair_side_L",
+          "radius": 86
+        },
+        {
+          "id": "hair_side_L_2",
+          "radius": 86
+        },
+        {
+          "id": "hair_side_R",
+          "radius": 86
+        },
+        {
+          "id": "hair_side_R_3",
+          "radius": 86
+        },
+        {
+          "id": "hair_side_2",
+          "radius": 86
+        },
+        {
+          "id": "hair_back_2",
+          "radius": 229
+        },
+        {
+          "id": "hair_back_3",
+          "radius": 229
+        },
+        {
+          "id": "face_detail",
+          "radius": 84
+        },
+        {
+          "id": "hat",
+          "radius": 24
+        },
+        {
+          "id": "hat_2",
+          "radius": 24
+        },
+        {
+          "id": "acc_glasses",
+          "radius": 24
+        },
+        {
+          "id": "acc_hairpin",
+          "radius": 24
+        },
+        {
+          "id": "acc_ribbon",
+          "radius": 24
+        },
+        {
+          "id": "clothes",
+          "radius": 135
+        },
+        {
+          "id": "clothes_outer",
+          "radius": 135
+        },
+        {
+          "id": "clothes_inner",
+          "radius": 135
+        },
+        {
+          "id": "clothes_collar",
+          "radius": 135
+        },
+        {
+          "id": "clothes_acc",
+          "radius": 135
+        },
+        {
+          "id": "clothes_hands",
+          "radius": 135
+        },
+        {
+          "id": "hands_2",
+          "radius": 135
+        },
+        {
+          "id": "strand_extra_1",
+          "role": "hair_side_R",
+          "radius": 86
+        },
+        {
+          "id": "layer_back_7",
+          "role": "hair_back",
+          "radius": 229
+        },
+        {
+          "id": "bangs_tuft",
+          "role": "hair_front",
+          "radius": 86
+        },
+        {
+          "id": "collar_piece",
+          "role": "clothes",
+          "radius": 135
+        },
+        {
+          "id": "throat_skin",
+          "role": "neck",
+          "radius": 172
+        },
+        {
+          "id": "forehead_patch",
+          "role": "face",
+          "radius": 84
+        },
+        {
+          "id": "sleeve_cuff",
+          "role": "hands",
+          "radius": 135
+        },
+        {
+          "id": "torso_base",
+          "role": "body",
+          "radius": 135
+        },
+        {
+          "id": "eyeL_white",
+          "role": "eye",
+          "radius": 23
+        },
+        {
+          "id": "ribbon_3",
+          "role": "accessory",
+          "radius": 24
+        },
+        {
+          "id": "hair_tie",
+          "role": "accessory",
+          "radius": 24
+        },
+        {
+          "id": "hair_back_clip",
+          "role": "hat",
+          "radius": 24
+        },
+        {
+          "id": "neck",
+          "role": "clothes",
+          "radius": 135
+        }
+      ]
+    }
+  ]
+}

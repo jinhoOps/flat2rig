@@ -1293,24 +1293,111 @@ pub fn part_overlap_margins(lm: &Landmarks, w: usize, h: usize) -> PartOverlapMa
     }
 }
 
-/// Returns the motion-proportional manual/fallback occlusion fill radius for a given part ID.
-pub fn recommended_fill_radius(part_id: &str, lm: &Landmarks, w: usize, h: usize) -> usize {
+/// Part role mirroring TS `PartRole` (`src/types.ts`). Serialized names match the TS strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartRole {
+    #[serde(rename = "hair_front")]
+    HairFront,
+    #[serde(rename = "hair_side_L")]
+    HairSideL,
+    #[serde(rename = "hair_side_R")]
+    HairSideR,
+    #[serde(rename = "hair_back")]
+    HairBack,
+    #[serde(rename = "hat")]
+    Hat,
+    #[serde(rename = "accessory")]
+    Accessory,
+    #[serde(rename = "hands")]
+    Hands,
+    #[serde(rename = "body")]
+    Body,
+    #[serde(rename = "clothes")]
+    Clothes,
+    #[serde(rename = "neck")]
+    Neck,
+    #[serde(rename = "face")]
+    Face,
+    #[serde(rename = "eye")]
+    Eye,
+    #[serde(rename = "brow")]
+    Brow,
+    #[serde(rename = "mouth")]
+    Mouth,
+    #[serde(rename = "other")]
+    Other,
+}
+
+/// Rust counterpart of TS `inferPartRole`: an explicit role always wins; otherwise the role is
+/// resolved from the part ID. This is the single Rust ID→role fallback; keep it in lockstep with
+/// `src/types.ts` (guarded by `tests/fixtures/fill-radius-parity.json`).
+pub fn infer_part_role(id: &str, explicit_role: Option<PartRole>) -> PartRole {
+    if let Some(role) = explicit_role {
+        return role;
+    }
+    if id.starts_with("hair_side_L") {
+        PartRole::HairSideL
+    } else if id.starts_with("hair_side_R") {
+        PartRole::HairSideR
+    } else if id.starts_with("hair_side") {
+        PartRole::HairSideL
+    } else if id.starts_with("hair_back") {
+        PartRole::HairBack
+    } else if id.starts_with("hair") {
+        PartRole::HairFront
+    } else if id == "hat" || id.starts_with("hat_") {
+        PartRole::Hat
+    } else if id.starts_with("acc_") || id.starts_with("accessory") {
+        PartRole::Accessory
+    } else if id == "clothes_hands" || id == "hands" || id.starts_with("hands_") {
+        PartRole::Hands
+    } else if id == "body" {
+        PartRole::Body
+    } else if id == "clothes" || id.starts_with("clothes_") {
+        PartRole::Clothes
+    } else if id == "neck" {
+        PartRole::Neck
+    } else if id == "face" || id == "face_detail" {
+        PartRole::Face
+    } else if id.starts_with("eye") {
+        PartRole::Eye
+    } else if id.starts_with("brow") {
+        PartRole::Brow
+    } else if id.starts_with("mouth") {
+        PartRole::Mouth
+    } else {
+        PartRole::Other
+    }
+}
+
+/// Within the `eye` role, the white/iris sublayers are the ones occluded by lids/brows and need
+/// gaze-travel underlap; lids/lashes are occluders and use the generic radius.
+fn is_eye_occluded_sublayer(id: &str) -> bool {
+    id.ends_with("_white") || id.ends_with("_iris")
+}
+
+/// Returns the motion-proportional manual/fallback occlusion fill radius for a part, dispatched by
+/// its role (explicit or inferred via `infer_part_role`), identically to TS `recommendedFillRadius`.
+pub fn recommended_fill_radius(
+    part_id: &str,
+    explicit_role: Option<PartRole>,
+    lm: &Landmarks,
+    w: usize,
+    h: usize,
+) -> usize {
     let m = part_overlap_margins(lm, w, h);
     let hf = HeadFrame::from_landmarks(lm, w, h);
-    if part_id.starts_with("hair_back") {
-        m.hair_back_underlap
-    } else if part_id.starts_with("hair") {
-        m.hair_side_front_seam.max(m.hair_hat_root)
-    } else if part_id == "neck" {
-        m.neck_collar_x.max(m.neck_collar_y).max(m.neck_chin_y)
-    } else if part_id == "face" {
-        m.face_scalp_margin
-    } else if part_id == "body" || part_id.starts_with("clothes") || part_id.starts_with("hands") {
-        m.clothes_hair_underlap
-    } else if part_id.starts_with("eye") && (part_id.ends_with("_white") || part_id.ends_with("_iris")) {
-        m.eye_gaze_x.max(m.eye_gaze_y)
-    } else {
-        ((hf.eye_dist.max(8.0) * 0.08).ceil() as usize).max(6)
+    let generic = ((hf.eye_dist.max(8.0) * 0.08).ceil() as usize).max(6);
+    match infer_part_role(part_id, explicit_role) {
+        PartRole::HairBack => m.hair_back_underlap,
+        PartRole::HairFront | PartRole::HairSideL | PartRole::HairSideR => {
+            m.hair_side_front_seam.max(m.hair_hat_root)
+        }
+        PartRole::Neck => m.neck_collar_x.max(m.neck_collar_y).max(m.neck_chin_y),
+        PartRole::Face => m.face_scalp_margin,
+        PartRole::Body | PartRole::Clothes | PartRole::Hands => m.clothes_hair_underlap,
+        PartRole::Eye if is_eye_occluded_sublayer(part_id) => m.eye_gaze_x.max(m.eye_gaze_y),
+        _ => generic,
     }
 }
 
@@ -2086,6 +2173,56 @@ mod tests {
             side_p.x,
             m_1024.hair_side_front_seam
         );
+    }
+    #[test]
+    fn recommended_fill_radius_matches_shared_rust_ts_parity_fixture() {
+        #[derive(Deserialize)]
+        struct RoleCase {
+            id: String,
+            role: PartRole,
+        }
+        #[derive(Deserialize)]
+        struct PartCase {
+            id: String,
+            role: Option<PartRole>,
+            radius: usize,
+        }
+        #[derive(Deserialize)]
+        struct FrameCase {
+            label: String,
+            width: usize,
+            height: usize,
+            landmarks: Landmarks,
+            parts: Vec<PartCase>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Fixture {
+            role_inference: Vec<RoleCase>,
+            frames: Vec<FrameCase>,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../tests/fixtures/fill-radius-parity.json"))
+                .expect("parse fill-radius parity fixture");
+        assert!(!fixture.role_inference.is_empty() && !fixture.frames.is_empty());
+        for c in &fixture.role_inference {
+            assert_eq!(infer_part_role(&c.id, None), c.role, "role of {}", c.id);
+        }
+        let mut checked = 0;
+        for f in &fixture.frames {
+            for p in &f.parts {
+                let got = recommended_fill_radius(&p.id, p.role, &f.landmarks, f.width, f.height);
+                assert_eq!(got, p.radius, "{} / {} ({:?})", f.label, p.id, p.role);
+                checked += 1;
+            }
+        }
+        // Variable multi-hair IDs must resolve through roles, not the fixed 18-ID table.
+        let ids: Vec<&str> = fixture.frames[0].parts.iter().map(|p| p.id.as_str()).collect();
+        for id in ["hair_front_2", "hair_side_L_2", "hair_side_R_3", "hair_back_3"] {
+            assert!(ids.contains(&id), "fixture must cover {id}");
+            assert!(!IDS.contains(&id));
+        }
+        assert!(checked > 0);
     }
     #[test]
     fn large_curved_torso_mesh_is_dense_and_hole_free() {
