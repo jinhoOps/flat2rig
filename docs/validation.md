@@ -144,3 +144,10 @@ Cubism Editor에서 PSD/CSV를 실제 가져오는 검증(`cubismEditorImport: "
 4. **머리카락 이동 공백**: 머리카락을 움직일 때 피부나 배경의 빈 공간이 노출되지 않는가? (`미검증` — 현재 고정 `8~14px` 언더랩 기준이며 최대 흔들림 자동 공백 검사 없음)
 5. **경계 이중 선화·흰 테두리**: 파츠가 겹치는 곳에서 선화가 이중으로 보이거나 흰 테두리가 나타나지 않는가? (`미해결` — `Rritteang` 턱/손 경계 반투명 흰 이음새, `Sutteang` 목 상단 흰 얼룩 등 잔여 결함 확인됨)
 
+6. **(2026-11-18 추가) 노출 영역 원본감**: 허용 모션에서 드러나는 노출 밴드가 원화와 같은 팔레트·그림자 경계·선화 연속성을 갖는가? (`미구현 / 미측정` — 측정 하네스(`T14`)와 노출 맵(`T13`)이 아직 없음. 1–5번 결함이 0이어도 이 항목 수치 없이 통과로 기록하지 않음)
+
+## T8 1차 구현 상태 (2026-11-18 문서 검수 기록)
+
+- `79610ec` `feat(rig): scale per-part fillMask overlap margins with resolution and motion (T8)`이 반영되었다. 커밋에 `part_overlap_margins_scale_with_resolution_and_cover_opposing_motion` Rust 테스트와 `tests/pipeline.test.ts` 추가분이 포함되어 있다.
+- 이번 검수는 문서·소스 검토만 했고 테스트·CLI·WebView2를 실행하지 않았다. T8의 완료 조건(`1024px+` 원화에서 반대 이동·최대 흔들림 시 공백 0)은 **`미검증`**이다.
+- 소스 검수에서 확인한 제한(구조 개선은 `T13`): 변형 상수의 3중 복제(`deform` / `part_overlap_margins` / `partOverlapMargins`), 테스트 표본이 2점·단일 포즈뿐, Rust `recommended_fill_radius`의 ID 접두사 분기와 TS `role` 분기 불일치. 근거는 [template-architecture-review.md](template-architecture-review.md) 2026-11-18 항목에 있다.
