@@ -47,3 +47,11 @@ flat2rig는 일러스트 1장에서 눈·입 모양과 표정을 선택하고 �
 - **한 레이어당 한 파츠**: 독립적으로 움직이거나 변형해야 하는 요소는 각각 별도 이미지 레이어로 분리한다. 폴더로 묶더라도 여러 파츠를 하나의 이미지 레이어로 합치지 않는다.
 - **움직이는 모습을 기준으로 분리**: 정지 화면의 영역 구분만으로 끝내지 않고 눈 깜빡임·시선 이동·입 개폐·고개 회전·머리카락 흔들림에서 필요한 분리 단위와 겹침 순서를 고려한다. 예를 들어 흰자와 홍채, 위·아래 눈꺼풀은 독립적인 움직임이 필요하면 별도 파츠로 둔다. 움직일 때 드러나는 가림 영역은 기존 `fillMask` 규칙에 따라 별도로 보완한다.
 - **레이어 합성 모드는 일반(`normal`)·곱하기(`multiply`)·가산(`additive`) 세 가지로 제한**한다. 현재 PSD 내보내기는 5절에 따라 `normal`만 지원한다. `multiply`·`additive`는 해당 모드의 저장과 실제 Cubism Editor 가져오기를 검증한 뒤 지원하며, 그 전에는 지원한다고 표시하거나 원본 합성 모드를 조용히 `normal`로 바꾸지 않는다.
+
+## 7. 빌드 캐시(`src-tauri/target`) 관리
+- `src-tauri/target/`(`debug/build`, `release/build`, `debug/incremental`, `deps` 등)는 **Cargo 빌드 캐시 및 중간 산출물**이다. 프로파일(`dev`/`test`/`release`), 피처, `build.rs` 입력이 바뀔 때마다 새 `<crate>-<hash>` 폴더가 생성되며 이전 캐시가 자동 삭제되지 않아 수십 GB까지 누적될 수 있다.
+- **확인 기준**: 디스크 여유 공간 점검이나 대규모 빌드·의존성 변경 후 `src-tauri/target/` 용량이 과도하게 커진 경우(예: 15GB 이상) `debug/incremental`, `deps`, `build` 비율을 확인한다.
+- **정리 원칙**:
+  - 실행 중인 `tauri dev`나 Cargo 빌드 프로세스가 없을 때만 정리한다.
+  - 선택 정리: `src-tauri/`에서 `cargo clean --release` 또는 `cargo clean --profile dev` (전체 정리는 `cargo clean`). `cargo-sweep`이 설치된 경우 `cargo sweep -t 14` 등으로 오래된 해시 캐시만 제거할 수 있다.
+  - `target/`과 달리 `models/`(`manifest.json`, `.onnx`) 등 실제 런타임 에셋은 빌드 캐시가 아니므로 절대 삭제하지 않는다.
