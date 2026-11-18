@@ -552,3 +552,109 @@ tools/evaluation/.venv/Scripts/python.exe -I tools/evaluation/t14_report.py arti
 - (f) `noTruthVisualMetrics`는 "이 파츠 이하(flat2rig 순서) 파츠의 정답 합성"과 비교한다. flat2rig와 PSD의 상하 순서가 다른 곳(예: 눈썹 숨은 영역이 PSD에서는 앞머리 아래 이마)에서는 비교 대상이 실제 PSD 화면과 다를 수 있어 눈썹 값(0.41–0.98)은 해석하지 않는다.
 - (g) 선화 판정은 파츠 가시 중앙값 대비 L* −25 고정 규칙이다(어두운 파츠의 선, 색선은 놓칠 수 있음). 팔레트 k-means는 결정적 초기화, k=8 고정이다.
 - (h) 노출 맵 한계(T13b (e))를 그대로 물려받는다: 사용자 눈·입 모양 조정과 물리 흔들림을 포함하지 않는다. Windows 앱·Cubism 가져오기 검증 없음(`미검증`).
+
+## T9 경계 후광 제거 · 영역 유형 분류 · `flat/cel` 팔레트 필드 — T14 기준선 대비 (2026-11-18)
+
+- 실행: `cd src-tauri && cargo test` (lib 63/63 — 신규 `analysis::region_fill` 6: 셀 레벨셋 연장, 그라데이션 스냅 해제, 질감/선화 분류, 넓은 어두운 영역은 시드, 림 후광·상위 선화 제거와 자기 외곽선 유지·상위 레이어로 넘길 픽셀 목록과 그 계획 재현, 불투명 배경 감지; 신규 `rig::exposure::overlay_fill_over_a_lower_visible_seam_is_not_a_hidden_texel`; 갱신 1: `template_bank_preserves_rest_pose_visible_pixels_and_extra_hair_strands`는 가시 합성에서 "이음새 2px 림 밖 0 변화 + 변경 수 ≤ 림 보고 합계", 렌더러와 같은 유효 마스크 합성에서 "배경 후광·상위 레이어 자기 림 혼합 외 0 변화", 오버레이 텍셀 수 = 위로 넘긴 픽셀 수, 각 레이어 `fillMask`가 자기 가시 마스크와 겹치지 않음), `cargo clippy --all-targets -- -D warnings` (통과), `npm test` (45/45 — 신규 2: T9 이전 v3 프로젝트는 미분류로 읽힘·값 왕복·알 수 없는 값 거부, 브라우저 대체 경로는 `fillSynth: "diffusion"`·유형 없음), `npx tsc --noEmit` (통과). Windows 앱 모션·UI 표시는 확인하지 않았다(`미검증`).
+- 전/후 비교: 작업 전 HEAD(`6eb8e41`) 릴리스 CLI(`artifacts/t9/bin-before/`; T14 커밋 산출물과 원화 3종 65/52/53 파일 동일 확인)와 T9 릴리스 CLI를 같은 입력·같은 플래그로 실행했다. 아래 수치는 **리뷰 수정(이음새 오버레이) 반영본**(`artifacts/t9/after/`)이며, 수정 전 첫 T9 결과는 `artifacts/t9/after_v1/`에 남겼다. T9 CLI는 정지 포즈 가시 소유자 맵 `owner.png`(레이어 번호 + 1, 16-bit)를 추가로 쓴다(분할 비교용).
+
+```sh
+flat2rig-cli --eval-holdout --eval-truth artifacts/t14/himikan-truth artifacts/design-review/input.png artifacts/t9/after/himikan
+flat2rig-cli --eval-holdout ref/ritteang/Rritteang.png artifacts/t9/after/ritteang
+flat2rig-cli --eval-holdout ref/sutteang/2d_.png       artifacts/t9/after/sutteang
+tools/evaluation/.venv/Scripts/python.exe -I tools/evaluation/t9_report.py INPUT.png artifacts/t9/before/<원화> artifacts/t9/after/<원화> --auto-crops artifacts/t9/crops_auto
+```
+
+전체 표는 `artifacts/t9/report_{himikan,ritteang,sutteang}.md`(Git 제외). 실행 시간(평가 포함) Himikan 11.7초(전 11초), Sutteang 22.1초(전 21초).
+
+### 불변 확인 (숨은 영역을 줄이지 않음)
+
+- **가시 `mask` 분할**: 세 원화 모두 `foreground.png` 알파와 최상위 소유자 맵이 전/후 동일(`visible partition identical: True`), 파츠별 가시 픽셀 동일. 림 디컨태미네이션은 텍스처 RGB만 바꾼다.
+- **숨은 영역(`fillMask`)**: 전 T9 텍셀은 모두 그대로이고(`parts/<id>.png` 유효 알파에서 잃은 텍셀 0, 숨은 영역 생성 로직 불변), **늘어난 것은 상위 레이어의 이음새 오버레이 텍셀뿐**이다(아래 "이음새 오버레이"). 파츠별 `fillPixels` 전 → 후(괄호 = 오버레이): Himikan body 166,265 → 166,293 (28) · clothes 36,414 → 36,454 (40) · clothes_inner 0 → 844 (844) · face 26,608 → 26,632 (24) · clothes_hands 0 → 23 (23) · eyeR_iris 1,718 → 1,724 (6) · eyeR_lower 0 → 1 (1) · eyeR_upper 556 → 564 (8) · eyeL_white 3,219 → 3,220 (1) · eyeL_iris 1,747 → 1,750 (3) · eyeL_lower 0 → 5 (5) · eyeL_upper 551 → 560 (9) · hair_side_R 1,205 → 1,293 (88) · hair_side_L 1,551 → 1,647 (96) · hair_front 0 → 30 (30); 그대로 hair_back 157,285 · neck 8,679 · eyeR_white 3,890 · browR/L 746/907 · mouth_inner 62. Rritteang body 264,712 → 264,730 (18) · neck 47,172 → 47,189 (17) · clothes 72,984 → 73,369 (385) · face 259,056 → 259,179 (123) · eyeR_iris 8,780 → 8,795 (15) · eyeR_lower 0 → 54 (54) · eyeR_upper 4,212 → 4,374 (162) · eyeL_white 84,033 → 84,193 (160) · eyeL_iris 10,367 → 10,388 (21) · eyeL_lower 268 → 277 (9) · eyeL_upper 3,465 → 3,823 (358) · browR/L 5,702 → 5,704 (2) / 5,491 → 5,497 (6) · mouth_inner 8 → 16 (8) · acc_glasses 0 → 61 (61) · hair_side_R 2,212 → 3,076 (864) · hair_side_L 3,029 → 4,296 (1,267) · hair_front 64,786 → 64,889 (103) · hat 0 → 141 (141) · acc_hairpin 0 → 111 (111); 그대로 hair_back 696,875 · eyeR_white 79,608. Sutteang body 308,614 → 308,663 (49) · neck 45,630 → 45,645 (15) · clothes 24,433 → 25,131 (698) · face 52,930 → 53,072 (142) · face_detail 0 → 1 (1) · clothes_hands 0 → 188 (188) · eyeR_white 8,629 → 8,665 (36) · eyeR_iris 3,419 → 3,437 (18) · eyeR_lower 65 → 68 (3) · eyeR_upper 894 → 999 (105) · eyeL_white 8,099 → 8,117 (18) · eyeL_lower 113 → 129 (16) · eyeL_upper 888 → 1,017 (129) · browL 1,179 → 1,204 (25) · hair_side_R 9,110 → 9,489 (379) · hair_side_L 4,661 → 4,914 (253) · hair_front 385 → 637 (252) · acc_hairpin 0 → 10 (10); 그대로 hair_back 663,257 · eyeL_iris 3,294 · browR 1,044 · mouth_inner 86. 줄어든 파츠 없음.
+- **노출 맵·이음새**: 오버레이 텍셀은 정지 포즈에서 하위 레이어 가시 픽셀 위에 그려지는 것이므로 숨은 텍셀이 아니다 — `rig/exposure.rs`가 "더 아래 레이어가 가시인 픽셀 위의 `fillMask`"를 `overlayPx`로 따로 세고 숨은/노출 집계에서 뺀다(템플릿 숨은 영역은 위생 단계에서 더 위 가시 레이어 아래에만 있으므로 해당 없음). 숨은 합계 Himikan 408,423, Rritteang 1,591,612, Sutteang 1,128,338(전 = 후). 노출 합계는 83,266 → 82,395, 412,271 → 410,226, 335,176 → 334,038로 0.3–1.0% **줄었다** — 숨은 영역을 줄인 것이 아니라, 상위 레이어 메쉬가 이음새 오버레이만큼 넓어져 포즈에서 그 1–2px 띠를 더 덮기 때문이다. 같은 이유로 이음새 `holes` 52 → 52, 11,907 → 11,871, 1,974 → 1,973. 오버레이 합계 1,206 / 3,885 / 2,337px. 홀드아웃 실행 `masksIdentical`·`fillMasksIdentical` 세 원화 모두 `true`(오버레이 계획은 제품 분할·원본 픽셀만으로 정하므로 홀드아웃이 바꾸지 못한다). `deform`·`PARAM_DEFS`·이음새 요구량·숨은 영역 생성 로직은 바꾸지 않았다.
+- **이음새 오버레이(리뷰 수정)**: 하위 레이어 림에서 지우는 상위 외곽선 절반·상위 쪽 안티앨리어스 혼합·얼굴의 눈/눈썹/입 잔여 선화는 하위 텍스처에서는 깨끗한 색으로 바꾸고, **원래 색을 상위 레이어 텍스처에, 그 픽셀을 상위 레이어 `fillMask`에** 넣는다(가시 `mask` 분할 불변, 메쉬 `effective_part_mask`가 덮음). 계획은 텍스처 단계 전에 제품 분할·원본으로 한 번 정하고, 텍스처 단계는 그 계획을 따른다(`decontaminate_rim(…, Some(plan))`). 정지 포즈에서는 상위가 하위 위에 그려져 원래 선 두께가 되고, 모션에서는 선이 상위 파츠와 함께 움직인다. 오버레이 합계가 위로 넘긴 수(상위 선화 + 상위 쪽 혼합 + 잔여 선화)보다 조금 큰 것(Himikan 1,206 vs 1,203, Rritteang 3,885 vs 3,848)은 하위 텍스처가 이미 분기(얼굴 반점 정리 등)에서 바뀌어 텍스처 단계 집계에서 빠진 계획 픽셀이다(오버레이는 원래 색으로 그대로 그려진다).
+
+### 표 1 — 기본 포즈 vs 원화, ΔE00
+
+전경 = 원화 알파 ≥128 ∩ 파츠 전경. 림 = 다른 소유자(또는 배경)로부터 4-인접 2px 이내 전경 픽셀. **이음새 외곽선** = 림 중 다른 *파츠*(배경 아님)에 붙어 있고 원화 L*이 소유 파츠 가시 중앙값보다 25 이상 낮은 픽셀. **정지 렌더** = `effective_foreground.png`(각 파츠 `mask ∪ fillMask`를 아래에서 위로 그린 것 — 앱이 정지 포즈에서 그리는 것과 같은 구성). 가시만 합성(`foreground.png`)은 `fillMask`를 그리지 않으므로 오버레이로 옮긴 선이 빠져 보인다(참고용).
+
+| 원화 | 이미지 | 영역 | px | 평균 전 → 후 | p95 전 → 후 | >5 비율 전 → 후 | >10 비율 전 → 후 |
+| --- | --- | --- | ---: | --- | --- | --- | --- |
+| Himikan | **정지 렌더** | 전경 | 301,259 | 0.058 → 0.067 | 0.00 → 0.00 | 0.45% → 0.52% | 0.22% → 0.28% |
+| Himikan | **정지 렌더** | 림 ≤2px | 23,021 | 0.736 → 0.861 | 6.16 → 7.61 | 5.71% → 6.66% | 2.85% → 3.54% |
+| Himikan | **정지 렌더** | **이음새 외곽선** | 2,357 | **2.520 → 2.556** | 12.50 → 12.63 | 21.09% → 21.38% | 9.63% → 9.80% |
+| Himikan | **정지 렌더** | 내부 | 278,238 | 0.002 → 0.002 | 0.00 → 0.00 | 0.01% → 0.01% | 0.01% → 0.01% |
+| Himikan | 가시만 | 이음새 외곽선 | 2,357 | 0.038 → 4.575 | 0.00 → 29.06 | 0.17% → 17.69% | 0.17% → 16.80% |
+| Rritteang | **정지 렌더** | 전경 | 1,225,446 | 0.194 → 0.188 | 0.71 → 0.71 | 0.24% → 0.31% | 0.18% → 0.19% |
+| Rritteang | **정지 렌더** | 림 ≤2px | 78,515 | 0.840 → 0.830 | 1.05 → 2.69 | 2.92% → 4.14% | 2.07% → 2.53% |
+| Rritteang | **정지 렌더** | **이음새 외곽선** | 12,880 | **2.556 → 1.004** | 19.82 → 0.76 | 5.35% → 2.10% | 5.34% → 1.91% |
+| Rritteang | **정지 렌더** | 내부 | 1,146,931 | 0.150 → 0.144 | 0.70 → 0.71 | 0.06% → 0.05% | 0.05% → 0.03% |
+| Rritteang | 가시만 | 이음새 외곽선 | 12,880 | 2.279 → 4.970 | 19.84 → 41.38 | 5.26% → 14.81% | 5.26% → 13.73% |
+| Sutteang | **정지 렌더** | 전경 | 861,869 | 0.042 → 0.044 | 0.00 → 0.00 | 0.28% → 0.39% | 0.09% → 0.09% |
+| Sutteang | **정지 렌더** | 림 ≤2px | 74,781 | 0.212 → 0.310 | 0.00 → 0.00 | 1.33% → 2.93% | 0.42% → 0.72% |
+| Sutteang | **정지 렌더** | **이음새 외곽선** | 2,682 | **2.617 → 0.456** | 24.33 → 0.00 | 8.02% → 2.72% | 7.79% → 2.39% |
+| Sutteang | **정지 렌더** | 내부 | 787,088 | 0.025 → 0.019 | 0.00 → 0.00 | 0.18% → 0.15% | 0.06% → 0.03% |
+| Sutteang | 가시만 | 이음새 외곽선 | 2,682 | 2.599 → 4.572 | 24.33 → 32.93 | 7.79% → 15.55% | 7.79% → 14.84% |
+
+- **이음새 외곽선은 정지 렌더에서 원래 수준이거나 더 가깝다**: Himikan 2.52 → 2.56(같은 수준), Rritteang 2.56 → 1.00, Sutteang 2.62 → 0.46. 전 T9 정지 렌더의 외곽선 오차(Rritteang·Sutteang p95 20–24)는 상위 레이어의 부분 알파 가장자리 밑으로 하위 레이어의 숨은 합성 색이 비쳐 보이던 것이고, 지금은 그 자리에 원래 선 색 오버레이가 있어 줄었다. 확대 비교: `artifacts/t9/crops/rest_{chin_neck,strand_edge,collar_line}_src_before_t9a_t9b.png`(원화 · 전 · 수정 전 T9 · 수정 후 T9, 정지 렌더) — 수정 전 T9에서 얇아졌던 턱선·머리카락 외곽선이 원화 두께로 돌아왔다.
+- 정지 렌더의 남은 차이는 림의 **배경 후광 제거**(Himikan 1, Rritteang 3,753, Sutteang 295px)와 **상위 레이어 자기 림의 하위 쪽 혼합**(밝아지는 안티앨리어스, 223 / 1,848 / 2,015px; 어두운 외곽선 픽셀은 건드리지 않음)이다. 림 전체 평균은 Himikan +0.13, Rritteang −0.01, Sutteang +0.10. 내부는 변화 없음(±0.01).
+- 림 처리 집계(Himikan / Rritteang / Sutteang): 위로 넘긴 상위 선화 515 / 1,590 / 329, 상위 쪽 혼합 688 / 1,741 / 1,670, 얼굴 잔여 선화 0 / 517 / 269, 그대로 둔 것: 상위가 갖지 않는 선화 136 / 25 / 283, 4px 안에 깨끗한 시드가 없는 림 1,856 / 10,326 / 9,476.
+- **모션에서 이중 선화가 다시 생기지 않음**: `artifacts/t9/crops_auto/<원화>_{chin,neck_top,collar}_motion_turn.png`(원화 정지 · 전 · 후) — 턱선은 얼굴과 함께 움직이고 목 쪽에 두 번째 선이 남지 않는다. Sutteang 목 상단의 밝은 얼룩·흰 줄은 수정 후에도 사라진 상태다. 머리카락 아래 의상(`collar`)도 의상 쪽에 머리카락 외곽선 잔상이 없다.
+- 구현 중 육안으로 발견해 고친 회귀(최종 수치에는 없음): 공간상 가장 가까운 시드가 다른 셀 영역(남색 칼라)이라 흰 셔츠 림에 어두운 점이 찍힘 → 혼합은 색이 가장 가까운 4px 안 시드로; 하위 쪽 혼합 판정이 남색 위 머리카락 외곽선을 지움 → 어두워지는 혼합은 유지; 얼굴 잔여 선화 판정이 홍조 해칭을 통째로 흰 피부로 덮음 → L* 25 이상 어둡고 피부/홍조색이 아닐 때만; 특징 가드 안의 얼굴 림이 먼 흰 피부 색으로 바뀜 → 4px 안 시드 없으면 유지; 질감(안경테) 림 손상 → `flat_cel`만 림 처리.
+
+### 표 2 — T14 지표 전 → 후 (값이 바뀐 파츠, 노출 밴드)
+
+유형 = `fillRegion`(셀 = 스냅 판정), 합성 = `fillSynth`. σL* = 국소 L* 표준편차 합성/정답. 정답 비교의 표본(노출 텍셀)은 이음새 오버레이로 상위 메쉬가 넓어져 일부 줄었다(표본 열 전 → 후) — Himikan `clothes`·`neck`의 개선 폭 일부는 표본 변화 몫이고, `hair_side_R`의 악화(정답 σL* 6.69 → 7.38)도 표본 집합이 바뀐 결과다. 홀드아웃은 표본이 같고 노출 빈도 가중값만 조금 바뀐다.
+
+| 세트 | 파츠 | 유형 / 합성 | 표본(노출 px) | ΔE00 평균 / p95 | 가중 평균 | 팔레트 일치 | 그래디언트 불연속 | σL* 합성/정답 | 선화 끊김 |
+| --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- |
+| Himikan 정답 | neck | flat_cel(셀) / palette_levelset | 126 → 110 | 6.40 / 13.88 → **2.82 / 12.45** | 7.79 → 5.38 | 0.52 → 0.67 | 2.24 → 1.19 | 1.58/1.61 → 1.04/1.84 | 0/0 → 0/0 |
+| Himikan 정답 | clothes | flat_cel / local_field | 5,708 → 5,179 | 2.98 / 14.38 → **2.52 / 13.10** | 3.30 → 2.91 | 0.78 → 0.82 | 3.35 → 3.14 | 2.93/3.43 → 2.37/2.90 | 4/4 → 3/3 |
+| Himikan 정답 | hair_side_R | flat_cel / class_field | 155 → 154 | 5.21 / 32.05 → 5.74 / 32.05 | 5.95 → 6.90 | 0.70 → 0.68 | 1.13 → 1.19 | 1.99/6.69 → 2.14/7.38 | 0/0 → 0/0 |
+| Himikan 홀드아웃 | neck | flat_cel(셀) / palette_levelset | 88 | 3.25 / 10.23 → **1.43 / 5.69** | 3.25 → 1.43 | 0.69 → 0.88 | 2.58 → 1.23 | 2.05/1.30 → 1.29/1.30 | 0/0 → 0/0 |
+| Himikan 홀드아웃 | clothes_inner | flat_cel / local_field | 1,171 | 36.87 / 41.41 → **2.13 / 7.75** | – | 0.02 → 0.50 | 36.21 → 0.56 | 4.26/1.46 → 0.25/1.46 | 0/0 → 0/0 |
+| Himikan 홀드아웃 | clothes | flat_cel / local_field | 55,977 | 11.29 / 23.31 → 11.26 / 23.53 | 14.92 → 14.92 | 0.59 → 0.59 | 1.22 → 1.26 | 0.09/4.24 → 0.09/4.24 | 2/2 → 2/2 |
+| Sutteang 홀드아웃 | clothes | flat_cel / local_field | 200,615 | 7.66 / 20.35 → 7.72 / 20.67 | 10.59 → 10.36 | 0.36 → 0.37 | 2.48 → 2.63 | 0.15/3.34 → 0.13/3.34 | 2/2 → 2/2 |
+| Rritteang 홀드아웃 | acc_glasses | texture / (평가 전용) | 6,545 | 23.02 / 63.07 → 23.87 / 54.93 | – | 0.27 → 0.15 | 18.95 → 9.28 | 6.70/13.71 → 0.49/13.71 | 4/8 → 8/8 |
+
+- **바뀌지 않은 값**: Himikan 정답 `face`·`hair_back`·`hair_side_R/L`·눈·입, 홀드아웃 `face`·`hair_side_R/L`·홍채·`mouth_inner`, Rritteang·Sutteang의 나머지 홀드아웃 파츠는 전/후 같은 값이다(얼굴·머리카락은 스냅되지 않으면 기존 공용 필드를 유지하고, 눈·입·눈썹 합성은 T10 범위로 그대로 두었다). 전 층 홀드아웃 파츠(Rritteang `clothes`·`face`·`neck`·`hair_back`, Sutteang `neck`·`body`·`hair_back` 등)는 홀드아웃 시 자기 시드가 없어 공용 필드로 돌아가므로 값이 같고, **제품 경로 변경(Sutteang 목·몸통의 자기 그림자 연장 등)은 수치로 측정되지 않는다**(육안 비교 이미지만).
+- **나빠진 항목**: (1) Sutteang 홀드아웃 `clothes` ΔE 평균 +0.06, p95 +0.32, 그래디언트 불연속 +0.15(가중 평균은 −0.23, 팔레트 +0.01). 자기 시드 국소 필드가 기존 의상 필드(머리카락 증거·착용물·절대 기준 선화 제외)와 다른 시드 집합(상대 기준 가는 선화 제외)을 쓰기 때문이며, 이 파츠는 그라데이션 판정(셀 중심 비율 0.08)이라 스냅이 없다. (2) Himikan 홀드아웃 `clothes` p95 +0.22·불연속 +0.04(같은 이유; 칼라는 아래 판정). (3) Rritteang 홀드아웃 `acc_glasses`(평가 전용 — 제품에서는 숨은 영역 0px): 이전에는 착용물 분기가 홀드아웃 픽셀 자리의 치환 원본(덮는 레이어 색)을 그대로 복사해 테 모양이 우연히 남았고, 지금은 자기 국소 필드라 테 획이 끊긴다(끊김 4/8 → 8/8, 팔레트 0.27 → 0.15; p95·불연속은 개선). 덮는 레이어 색 복사는 결함 1과 같은 버그 유형이라 되돌리지 않았고, 안경테 같은 `texture`/`line` 착용물의 획 연장은 T15 범위다.
+- **`flat/cel` 개선 판정 — 부분 충족**: 스냅(팔레트 레벨셋)이 실제로 쓰인 `flat/cel` 밴드는 Himikan `neck` 하나이며 정답·홀드아웃 모두 ΔE·팔레트 일치·불연속이 개선됐다. 자기 시드 국소 필드를 쓴 `flat/cel` 밴드는 Himikan `clothes_inner`(대폭 개선)·`clothes` 정답(개선)·홀드아웃(거의 동일, p95 소폭 악화)·Sutteang `clothes` 홀드아웃(소폭 악화)이다. 원화 3종 대부분이 그라데이션 채색 판정(셀 중심 비율 0.08–0.71 < 0.75)이라 스냅이 꺼진다 — 기준대로의 동작이다.
+
+### 표 3 — 영역 유형 분류 (원화 3종, `stats.json` `partCoverage[].fillRegion`)
+
+기준(시드 = 가시 알파 ≥128, 가시 경계 2px 침식, 선화·다른 부위 증거·홀드아웃 제외; 밴드 = 숨은 영역에서 `clamp(0.06·hh, 12, 48)`px 이내 시드, 64개 미만이면 전체): 역할 `semantic`(홍채·`mouth_inner`)·`line`(눈썹·눈꺼풀) → 선화 비율 ≥ 0.30 또는 2px 침식 후 남는 비율 < 0.15이면 `line` → 5×5 국소 σL* 중앙값 ≥ 3.0이면 `texture` → 그 외 `flat_cel`. 셀(스냅) = 군집 ≥ 2이고 ρ < 0.15 시드 비율 ≥ 0.75. 자기 시드 < 32개 또는 < 숨은 텍셀 × 0.10이면 자기 필드를 쓰지 않는다.
+
+| 원화 | `flat_cel` (셀 = 스냅 판정) | `line` | `texture` | `semantic` |
+| --- | --- | --- | --- | --- |
+| Himikan | hair_back, body(셀), neck(셀), clothes, clothes_inner, face, face_detail(셀), clothes_hands, eyeR/L_white, hair_side_R/L, hair_front | eyeR/L_upper, eyeR/L_lower, browR/L, mouth_upper/lower | – | eyeR/L_iris, mouth_inner |
+| Rritteang | hair_back, neck, clothes, face(셀), eyeR/L_white, hair_side_R/L, hair_front, hat | body(가시 169px, 침식 후 0.11), eyeR/L_upper/lower, browR/L, mouth_lower | acc_glasses(σ 3.84), acc_hairpin(σ 3.13) | eyeR/L_iris, mouth_inner |
+| Sutteang | hair_back, body, neck, clothes, face, face_detail, clothes_hands, eyeR_white, hair_side_R/L, hair_front | eyeR/L_upper/lower, browR/L, mouth_upper/lower | eyeL_white(σ 3.86), acc_hairpin(σ 4.65) | eyeR/L_iris, mouth_inner |
+
+- 숨은 텍셀 합성(`fillSynth`): Himikan `neck` = `palette_levelset`, `clothes` = `local_field`, `body`(셀 판정이지만 시드 1,983 < 숨은 166,265 × 0.10)·`face`·머리카락 = `class_field`; Rritteang `clothes` = `local_field`, `neck`(시드 1,548 < 47,172 × 0.10)·`face`(셀 판정이지만 시드 비율 미달)·머리카락 = `class_field`; Sutteang `body`·`neck`·`clothes` = `local_field`, `face`·머리카락 = `class_field`; 눈·입·눈썹 = `procedural`.
+- Rritteang 목은 처음 구현(비율 규칙 없음)에서 가시 2,455px의 팔레트(어두운 보라 군집 포함)를 숨은 47,172px로 레벨셋 연장해 세로 줄무늬가 생겼다(`artifacts/t9/crops/ritteang_neck_tex_before_after.png`, 당시 결과). 비율 규칙과 목·몸통 시드의 피부 휘도 55% 미만 제외를 추가해 공용 필드로 되돌렸다.
+
+### 비교 이미지 (왼쪽 원화 · 가운데 전 · 오른쪽 후, `artifacts/t9/`, Git 제외)
+
+- 자동 크롭 `crops_auto/<원화>_{chin,neck_top,collar,eyeR_lids,eyeL_lids,mouth,hands}_{foreground,motion_turn,motion_blink}.png`(랜드마크 기준; `hands`는 Himikan·Sutteang `clothes_hands`). 육안 확인: Sutteang `neck_top_motion_turn` — 전에는 턱 밑 목 숨은 영역에 얼굴 피부색 밝은 얼룩과 흰 세로 줄이 보였고 후에는 목 그림자 톤으로 이어진다(**목 상단 밝은 얼룩 제거**). Himikan `crops/himikan_neck_turn_before_after.png`·`crops/himikan_collar_turn_before_after.png`(모션 전/후) — 목 아래 의상 숨은 영역의 흰 줄·밝은 띠가 사라지거나 약해졌다. 숨은 텍스처 자체: `crops/sutteang_{neck,body}_tex_before_after.png`.
+- 정지 포즈 확대: `crops/rest_{chin_neck,strand_edge,collar_line}_src_before_t9a_t9b.png`(Himikan 정지 렌더: 원화 · 전 · 수정 전 T9 · 수정 후 T9 — 외곽선 두께 원화와 같음). `crops/zoom_{collar_line,strand_edge,chin}.png`·`crops/zoom_ritteang_{eyeL_region,hat_top,hat_halo}.png`는 수정 전 T9의 가시 합성(외곽선 얇아짐 확인 당시 자료).
+- 눈꺼풀(`*_lids_motion_blink`): 감은 눈의 회색 반점(빈 픽셀)은 전/후 같다 — 클리핑·눈꺼풀 곡선은 T10 범위.
+
+### T14 기준선에서 드러난 결함 판정
+
+1. **Himikan 홀드아웃 `clothes_inner`가 머리카락 색을 복사(ΔE 36.87)** → **T9 범위, 수정함**. 원인: 착용물 분기(`hat` 외 `clothes_*`·`acc_*`)가 숨은 텍셀에 그 위치 원본 픽셀을 복사했다(홀드아웃에서는 치환된 덮는 레이어 색, 제품에서는 덮는 레이어의 실제 픽셀 — 같은 버그). 이제 자기 시드 팔레트/국소 필드(시드 부족 시 가시 평균색)를 쓴다: 2.13 / 7.75, 팔레트 0.50, 불연속 0.56. 제품에서는 현재 이 파츠의 숨은 영역이 0px이라, 같은 분기를 타는 다른 착용물의 숨은 영역에 해당한다.
+2. **Himikan 홀드아웃 `clothes` 세일러 칼라 회색 평탄화(σL* 0.09 vs 4.24)** → **T9 범위 아님, 미수정**. 원인: 홀드아웃 밴드(옆머리 아래 이음새 최대 노출 깊이 ≈85px)가 칼라 전체(남색 바탕·흰 줄·엠블럼·흰 앞판)를 덮어 남은 가시 맥락이 회색 재킷 몸통뿐이다(`artifacts/t9/after/himikan/fidelity/holdout_clothes.png`). 시드에 칼라 색이 없으므로 시드 통계 기반 필드(평균·국소·팔레트 어느 것이든)는 회색을 낸다 — 시드 오염·평균색 연장이 아니라 **구조·무늬 복원** 문제다. 해당: T15(선화·구조 연장), T16(조건부 예시 합성), T11(수동 보정). 수치 11.29 → 11.26(동일 수준). 제품 경로의 같은 부위(정답 비교, 옆머리 아래 의상 노출 텍셀)는 2.98 → 2.80으로 개선됐다.
+
+### T16 착수 조건 (갱신)
+
+- 영역 유형이 생겨 밴드를 나눌 수 있게 됐다. 원화 3종에서 `texture`로 분류된 파츠는 착용물(안경·핀)과 Sutteang `eyeL_white`뿐이며, 제품 숨은 영역이 있는 `texture` 파츠는 Sutteang `eyeL_white`(눈 = T10)뿐이다. 무늬 복원 한계가 드러난 Himikan 칼라는 파츠 단위로 `flat_cel`(그라데이션) 판정이다 — 파츠 단위 분류로는 칼라 같은 부분 무늬를 `semantic`으로 나누지 못한다. T15가 아직 없으므로 조건 판단은 **보류**(T15 후 다시 판단).
+
+### 남은 제한
+
+- (a) 정지 포즈: 이음새 외곽선은 오버레이로 원래 두께를 유지한다(표 1, 분할 변경 없음). 남은 차이는 배경 후광 제거와 상위 레이어 자기 림의 밝아지는 혼합 교정이다. 오버레이 텍셀은 상위 메쉬를 1–2px 넓혀 노출 합계를 0.3–1.0% 줄인다(숨은 텍셀 수는 그대로). Cubism PSD 인계에서는 상위 레이어에 이 선 텍셀이 포함되고 하위 레이어 림은 깨끗한 색이 된다(Cubism 가져오기 미검증).
+- (b) 분류의 "노출 밴드"는 합성 단계에 노출 맵이 없어 숨은 영역 인접 시드(반경 `clamp(0.06·hh, 12, 48)`)로 대신한다. 파츠 단위 분류라 한 파츠 안의 부분 무늬(칼라)는 구분하지 못한다.
+- (c) 셀 스냅은 원화 3종 중 Himikan 목에서만 숨은 텍셀에 쓰였다(그라데이션 판정·시드 비율 규칙). 레벨셋은 조화 보간한 군집 지시 함수의 argmax라 경계가 이음새에서 대체로 직선으로 이어지며 곡선 경계의 굽음은 따라가지 않는다.
+- (d) 전 층 홀드아웃 파츠의 제품 변경은 수치화되지 않는다(T14 제한 (a) 그대로). 수동 보완 `fill_occlusion`의 새 색 합성은 단위 테스트로만 확인했다(원화 실행 없음).
+- (e) 브라우저 대체 경로(`engine.ts` `expandFillSeparated`)는 고급 합성을 하지 않고 `diffusion`으로 표시만 한다(과제 지시대로 Rust 전용).
+- (f) 임계값(선화 L* −25·열림 2px, 질감 σ 3.0, 셀 ρ 0.15/0.75, 시드 비율 0.10, 혼합선 t ≥ 0.15·수직 잔차 12 + 0.2·|d|·ΔE ≥ 4, 상위 선화 L* −20·소유 탐색 3px, 하위 어두워짐 L* 3, F 창 4px)은 원화 3종 + Himikan 정답과 육안으로만 정했다.
+- (g) Windows 앱에서 모션·`유형` 칩·보완 배너 표시를 확인하지 않았다(`미검증`). PSD 인계는 이미지 레이어 텍스처 림 색만 바뀌며 Cubism 가져오기는 검증하지 않았다.

@@ -4,6 +4,8 @@ import {
   ALLOWED_BLEND_MODES,
   createDefaultProjectRigState,
   describeDynamicPart,
+  FILL_REGIONS,
+  FILL_SYNTHS,
   HAIR_ROLE_META,
   isHairStageLayer,
   PART_DEFS,
@@ -733,6 +735,9 @@ export function loadProject(bytes: Uint8Array): Project {
   const ids = new Set<string>();
   const validProvenances = ["model", "prompted", "geometry", "manual"];
   const validFillKinds = ["none", "neighbor", "external", "template"];
+  // T9 optional fields (schema stays v3: absent = unclassified; older readers ignore them).
+  const validFillRegions: readonly string[] = FILL_REGIONS;
+  const validFillSynths: readonly string[] = FILL_SYNTHS;
   for (let idx = 0; idx < p.parts.length; idx++) {
     const part = p.parts[idx];
     if (
@@ -747,6 +752,8 @@ export function loadProject(bytes: Uint8Array): Project {
       (part.texture && !validDataURL(part.texture)) ||
       (part.provenance && !validProvenances.includes(part.provenance)) ||
       (part.fillKind && !validFillKinds.includes(part.fillKind)) ||
+      (part.fillRegion !== undefined && !validFillRegions.includes(part.fillRegion)) ||
+      (part.fillSynth !== undefined && !validFillSynths.includes(part.fillSynth)) ||
       (part.blendMode && !ALLOWED_BLEND_MODES.includes(part.blendMode))
     )
       throw new Error("잘못된 파츠 정보입니다.");
@@ -1041,7 +1048,7 @@ export function handoff(project: Project, csv: boolean) {
           .map(([k, v]) => `${k}=${v.slice(0, 12)}`)
           .join(", ")
       : project.modelHash || "사용하지 않음";
-  return `# ${project.name} — Cubism 작업 인계\n\n- 캔버스: ${project.width} × ${project.height}px (원본 ${project.originalWidth} × ${project.originalHeight})\n- 생성 경로: ${project.provider}\n- 모델 SHA-256: ${modelHashesText}\n- 좌표: 원본 작업 캔버스 좌상단 (0,0), X 오른쪽, Y 아래. 좌우는 캐릭터 기준.\n- 미확인 파츠: ${unresolved.map((p) => p.id + " (" + p.status + ")").join(", ") || "없음"}\n\n## 가져오기\n1. character_import.psd를 Cubism Editor에서 열어 새 모델을 만듭니다. 레이어 순서와 알파를 확인합니다.\n2. ${csv ? "parameters.csv는 불러온 Cubism CSV 샘플의 형식으로 생성했습니다. 백업 후 파라미터 일괄 설정에서 UTF-8로 가져오고, 전체 삭제 옵션은 끕니다. 실제 버전 호환성은 확인이 필요합니다." : "parameters-reference.csv는 참고용 목록입니다. 공식 가져오기 파일이 아닙니다. Cubism에서 파라미터를 수동 생성하거나 flat2rig에 Editor의 CSV 샘플을 불러오세요."}\n3. guides/landmarks.png와 rig-draft.json의 파츠별 ArtMesh 토폴로지 초안을 참고하여 Cubism Editor에서 ArtMesh와 디포머를 정리합니다. 자체 JSON은 Editor로 직접 가져오지 않습니다.\n4. 목을 피벗으로 HeadRotation → HeadXY → Eyes/Mouth/Hair 디포머를 구성합니다. 눈 흰자를 클리핑 대상으로 활용하되 원화에 맞게 조정합니다.\n5. 눈 개폐 0/1, 입 개폐 0/1, 머리 X/Y -10/0/10, Z -15/0/15의 변형 키를 수동으로 작성합니다. 전체 -30~30 품질은 보장하지 않습니다.\n6. 작은 조합 입력부터 구멍, 눈꺼풀 경계, 입 안 노출을 확인하고 가림 영역을 보완합니다.\n7. 머리카락 흔들림 변형 키를 먼저 만든 뒤 Cubism에서 물리를 설정하고 .cmo3로 저장합니다.\n\n## 알려진 한계\n- 얼굴 검출(YOLOv3)·28점 랜드마크(HRNetV2)에서 crown 좌표는 기하 추정값입니다.\n- 파츠 분리는 한 레이어당 한 파츠 원칙과 움직임·가림 영역 기준의 MobileSAM + 랜드마크 하이브리드 분할 또는 기하 폴백이며, 수동 보정(브러시·클릭 프롬프트) 및 검토 상태(status)와 출처(provenance)를 분리해 기록합니다.\n- 가림 보완(template / neighbor)은 가시 마스크(\`mask\`)와 분리(\`fillMask\`) 저장되며, 실루엣 템플릿 투영 및 모션용 예비 형상(눈동자·눈꺼풀·입안)은 자동 생성되지 않는 원화 부위를 보강한 초안이므로 필요시 수동 보정하세요.\n- 레이어 합성 모드는 normal · multiply · additive 3종으로 제한되며, 현재 PSD 내보내기는 normal만 지원합니다. multiply/additive는 실제 Cubism Editor 가져오기 검증 전까지 지원 표시나 조용한 normal 변환을 하지 않습니다.\n- PSD는 이미지 레이어와 오프셋만 전달합니다. ArtMesh, 키폼, 클리핑, 물리는 자동 적용되지 않습니다.\n- 레이어 숨김/솔로는 편집기 표시 보조입니다. 내보내기는 미해당 파츠를 제외한 전체 파츠를 표시합니다.\n- 자동 PSD 재읽기는 통과했으나 실제 Cubism Editor에서의 가져오기는 별도 검증해야 합니다.\n\n## 파츠\n${orderedEntries(project.parts).map(({ part: p }, i) => `${i}. ${p.id} — ${p.name} [검토:${p.status}, 출처:${p.provenance ?? "geometry"}, 보완:${p.fillKind ?? "none"}, 합성:${p.blendMode ?? "normal"}]`).join("\n")}\n\n공식 참고: https://docs.live2d.com/en/cubism-editor-manual/psd-import/\n`;
+  return `# ${project.name} — Cubism 작업 인계\n\n- 캔버스: ${project.width} × ${project.height}px (원본 ${project.originalWidth} × ${project.originalHeight})\n- 생성 경로: ${project.provider}\n- 모델 SHA-256: ${modelHashesText}\n- 좌표: 원본 작업 캔버스 좌상단 (0,0), X 오른쪽, Y 아래. 좌우는 캐릭터 기준.\n- 미확인 파츠: ${unresolved.map((p) => p.id + " (" + p.status + ")").join(", ") || "없음"}\n\n## 가져오기\n1. character_import.psd를 Cubism Editor에서 열어 새 모델을 만듭니다. 레이어 순서와 알파를 확인합니다.\n2. ${csv ? "parameters.csv는 불러온 Cubism CSV 샘플의 형식으로 생성했습니다. 백업 후 파라미터 일괄 설정에서 UTF-8로 가져오고, 전체 삭제 옵션은 끕니다. 실제 버전 호환성은 확인이 필요합니다." : "parameters-reference.csv는 참고용 목록입니다. 공식 가져오기 파일이 아닙니다. Cubism에서 파라미터를 수동 생성하거나 flat2rig에 Editor의 CSV 샘플을 불러오세요."}\n3. guides/landmarks.png와 rig-draft.json의 파츠별 ArtMesh 토폴로지 초안을 참고하여 Cubism Editor에서 ArtMesh와 디포머를 정리합니다. 자체 JSON은 Editor로 직접 가져오지 않습니다.\n4. 목을 피벗으로 HeadRotation → HeadXY → Eyes/Mouth/Hair 디포머를 구성합니다. 눈 흰자를 클리핑 대상으로 활용하되 원화에 맞게 조정합니다.\n5. 눈 개폐 0/1, 입 개폐 0/1, 머리 X/Y -10/0/10, Z -15/0/15의 변형 키를 수동으로 작성합니다. 전체 -30~30 품질은 보장하지 않습니다.\n6. 작은 조합 입력부터 구멍, 눈꺼풀 경계, 입 안 노출을 확인하고 가림 영역을 보완합니다.\n7. 머리카락 흔들림 변형 키를 먼저 만든 뒤 Cubism에서 물리를 설정하고 .cmo3로 저장합니다.\n\n## 알려진 한계\n- 얼굴 검출(YOLOv3)·28점 랜드마크(HRNetV2)에서 crown 좌표는 기하 추정값입니다.\n- 파츠 분리는 한 레이어당 한 파츠 원칙과 움직임·가림 영역 기준의 MobileSAM + 랜드마크 하이브리드 분할 또는 기하 폴백이며, 수동 보정(브러시·클릭 프롬프트) 및 검토 상태(status)와 출처(provenance)를 분리해 기록합니다.\n- 가림 보완(template / neighbor)은 가시 마스크(\`mask\`)와 분리(\`fillMask\`) 저장되며, 실루엣 템플릿 투영 및 모션용 예비 형상(눈동자·눈꺼풀·입안)은 자동 생성되지 않는 원화 부위를 보강한 초안이므로 필요시 수동 보정하세요.\n- 레이어 합성 모드는 normal · multiply · additive 3종으로 제한되며, 현재 PSD 내보내기는 normal만 지원합니다. multiply/additive는 실제 Cubism Editor 가져오기 검증 전까지 지원 표시나 조용한 normal 변환을 하지 않습니다.\n- PSD는 이미지 레이어와 오프셋만 전달합니다. ArtMesh, 키폼, 클리핑, 물리는 자동 적용되지 않습니다.\n- 레이어 숨김/솔로는 편집기 표시 보조입니다. 내보내기는 미해당 파츠를 제외한 전체 파츠를 표시합니다.\n- 자동 PSD 재읽기는 통과했으나 실제 Cubism Editor에서의 가져오기는 별도 검증해야 합니다.\n\n## 파츠\n${orderedEntries(project.parts).map(({ part: p }, i) => `${i}. ${p.id} — ${p.name} [검토:${p.status}, 출처:${p.provenance ?? "geometry"}, 보완:${p.fillKind ?? "none"}, 유형:${p.fillRegion ?? "미분류"}, 합성:${p.blendMode ?? "normal"}]`).join("\n")}\n\n공식 참고: https://docs.live2d.com/en/cubism-editor-manual/psd-import/\n`;
 }
 export async function exportBundle(
   project: Project,
@@ -1145,6 +1152,8 @@ export async function exportBundle(
     .map((p) => ({
       id: p.id,
       fillKind: p.fillKind ?? "neighbor",
+      fillRegion: p.fillRegion ?? null,
+      fillSynth: p.fillSynth ?? null,
       filledPixels: p.fillMask ? p.fillMask.filter((v) => v > 0).length : 0,
     }));
   const meshWarnings = rig.flatMap((p) => {

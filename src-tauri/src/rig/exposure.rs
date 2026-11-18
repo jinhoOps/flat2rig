@@ -54,6 +54,10 @@ pub struct LayerExposure {
     pub p95_depth_px: Option<f64>,
     /// Hidden texels already exposed at rest (mesh coverage gaps of upper layers).
     pub rest_exposed_px: usize,
+    /// T9 overlay texels: `fillMask` texels lying over a *lower* layer's visible pixel (seam
+    /// outline / anti-alias pixels handed up from the lower rim). They are drawn at rest by design,
+    /// so they are not hidden texels and are excluded from every hidden / exposure count.
+    pub overlay_px: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -347,11 +351,34 @@ where
     let eff: Vec<Vec<u8>> = (0..layers)
         .map(|p| effective_part_mask(&visible[p], fill.get(p).map(|f| f.as_slice())))
         .collect();
+    // Rest-pose visible owner (top-most layer with a visible pixel).
+    let mut vis_owner = vec![-1i32; n];
+    for (p, m) in visible.iter().enumerate() {
+        for (o, &a) in vis_owner.iter_mut().zip(m) {
+            if a > 0 {
+                *o = p as i32;
+            }
+        }
+    }
+    let is_overlay = |p: usize, i: usize| vis_owner[i] >= 0 && (vis_owner[i] as usize) < p;
+    let overlay_px: Vec<usize> = (0..layers)
+        .map(|p| {
+            let f = fill.get(p);
+            (0..n)
+                .filter(|&i| visible[p][i] == 0 && f.is_some_and(|f| f[i] > 0) && is_overlay(p, i))
+                .count()
+        })
+        .collect();
     let hidden: Vec<Vec<bool>> = (0..layers)
         .map(|p| {
             let f = fill.get(p);
             (0..n)
-                .map(|i| visible[p][i] == 0 && f.is_some_and(|f| f[i] > 0) && eff[p][i] > OPAQUE)
+                .map(|i| {
+                    visible[p][i] == 0
+                        && f.is_some_and(|f| f[i] > 0)
+                        && eff[p][i] > OPAQUE
+                        && !is_overlay(p, i)
+                })
                 .collect()
         })
         .collect();
@@ -433,6 +460,7 @@ where
             role: Some(infer_part_role(&ids[p], None)),
             hidden_px,
             rest_exposed_px: rest_exposed[p],
+            overlay_px: overlay_px[p],
             ..Default::default()
         };
         let has_visible = visible[p].iter().any(|&a| a > 0);
@@ -649,6 +677,28 @@ mod tests {
         assert_eq!(map.holes.hole_px_total, 0, "{:?}", map.holes);
         // The clothes layer has no hidden texels.
         assert_eq!(map.layer("clothes").unwrap().hidden_px, 0);
+    }
+
+    #[test]
+    fn overlay_fill_over_a_lower_visible_seam_is_not_a_hidden_texel() {
+        // T9: the upper layer (`clothes`) receives the lower layer's seam column x = 19 as overlay
+        // fill. It is drawn at rest above `neck`, so it is reported as overlay, never as a hidden
+        // texel (no rest exposure, no frequency), and the lower layer's hidden texels are unchanged.
+        let (ids, vis, mut fill, mut meshes) = two_layer(30);
+        let (w, h) = (48usize, 16usize);
+        for y in 0..h {
+            fill[1][y * w + 19] = 255;
+        }
+        meshes[1] = rect_mesh(19.0, 0.0, 40.0, h as f64);
+        let env = poses(&[0.0, 0.5, 1.0]);
+        let map = compute_exposure_map_with(&ids, &vis, &fill, &meshes, w, h, &env, slide);
+        let clothes = map.layer("clothes").unwrap();
+        assert_eq!(clothes.overlay_px, h);
+        assert_eq!(clothes.hidden_px, 0);
+        assert_eq!(clothes.rest_exposed_px, 0);
+        let neck = map.layer("neck").unwrap();
+        assert_eq!(neck.hidden_px, 10 * 16);
+        assert_eq!(neck.overlay_px, 0);
     }
 
     #[test]

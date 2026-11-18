@@ -321,6 +321,7 @@ struct ProposePartsResponse {
     masks: Vec<String>,
     fill_masks: Vec<Option<String>>,
     fill_kinds: Vec<String>,
+    fill_regions: Vec<Option<analysis::region_fill::RegionReport>>,
     textures: Vec<Option<String>>,
     metas: Vec<PartProposalMeta>,
     provider: String,
@@ -472,6 +473,7 @@ async fn propose_parts(
                 .map(|fm| fm.as_ref().map(|m| STANDARD.encode(m)))
                 .collect(),
             fill_kinds: out.fill_kinds,
+            fill_regions: out.fill_regions,
             textures: out.textures,
             metas: out.metas,
             provider: out.provider,
@@ -754,6 +756,7 @@ struct FillOcclusionResult {
     combined_mask: String,
     filled_pixels: usize,
     fill_kind: String,
+    fill_region: Option<analysis::region_fill::RegionReport>,
     warning: Option<String>,
 }
 
@@ -799,6 +802,7 @@ async fn fill_part_occlusion(
             combined_mask: STANDARD.encode(out.combined_mask),
             filled_pixels: out.filled_pixels,
             fill_kind: out.fill_kind,
+            fill_region: out.fill_region,
             warning: out.warning,
         })
     })

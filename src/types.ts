@@ -6,6 +6,27 @@ export type LandmarkProvenance = Record<LandmarkId, LandmarkSource>;
 export type PartStatus = "draft" | "approved" | "missing";
 export type PartProvenance = "model" | "prompted" | "geometry" | "manual";
 export type FillKind = "none" | "neighbor" | "external" | "template";
+/** T9: region type of the part's exposure band, from clean inner-seed statistics (Rust
+ * `analysis::region_fill`). Separate from `fillKind`, which is the fill *source*. */
+export type FillRegion = "flat_cel" | "line" | "texture" | "semantic";
+export const FILL_REGIONS: readonly FillRegion[] = ["flat_cel", "line", "texture", "semantic"];
+/** T9: how the hidden colours were made. `diffusion` = neighbour-averaging draft (browser fallback
+ * `expandFillSeparated` or a Rust part without own seeds) — lower quality, type unclassified. */
+export type FillSynth =
+  | "palette_levelset"
+  | "local_field"
+  | "class_field"
+  | "procedural"
+  | "diffusion"
+  | "none";
+export const FILL_SYNTHS: readonly FillSynth[] = [
+  "palette_levelset",
+  "local_field",
+  "class_field",
+  "procedural",
+  "diffusion",
+  "none",
+];
 export type BlendMode = "normal" | "multiply" | "additive";
 export const ALLOWED_BLEND_MODES: readonly BlendMode[] = [
   "normal",
@@ -229,6 +250,10 @@ export interface Part {
   generated?: boolean;
   provenance?: PartProvenance;
   fillKind?: FillKind;
+  /** T9 region type (absent = unclassified, e.g. browser fallback or projects saved before T9). */
+  fillRegion?: FillRegion;
+  /** T9 hidden-colour synthesis method (absent = unknown / saved before T9). */
+  fillSynth?: FillSynth;
   compositeOrder?: number;
   prompts?: PromptPoint[];
   confidence?: number;

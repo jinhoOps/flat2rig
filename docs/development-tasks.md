@@ -142,7 +142,7 @@
 | 1 | T8 | 부위별 모션 비례 겹침 여유분 | 1차 구현(`79610ec`), Windows 미검증 | 틈 방지의 최소 조건 |
 | 2 | T13 | 이음새 계약(`SeamGraph`)·노출 맵(`ExposureMap`)·결합 변형 | T13a 구현(이음새 계약·포즈 포락선·수치 여유분·커버리지 검사, 테스트 통과, Windows 원화 모션 미검증) · T13b 구현(노출 맵·이음새 결합 변형·CLI/고급 화면 오버레이·눈썹/윗눈꺼풀 숨은 영역, 테스트 통과, 원화 3종 CLI 수치 기록, 원화 이음새 `holes` 0 미충족(결합 전부터 있던 구멍), 숨은 영역은 결합 전/후 max 요구량으로 생성, Windows 앱 모션·오버레이 GUI 미검증) | T8 상수 복제를 대체하고, 이후 모든 작업의 기준 영역(노출 밴드)을 제공 |
 | 3 | T14 | 원본감 평가 하네스(정답 PSD·자기 지도 홀드아웃) | 구현·기준선 기록(CLI `--eval-holdout`/`--eval-truth`, `stats.json` `fidelity`, 원화 3종 홀드아웃 + Himikan 정답 비교 수치·비교 이미지, 기본 실행 출력 불변 확인, 테스트 통과; 임계값 미정 → 판정 없음, Windows 앱 `미검증`) | 합성기를 바꾸기 전에 현 기준선을 측정해야 개선을 판정할 수 있음 |
-| 4 | T9 | 경계 후광 제거·`fillKind` 분류·`flat/cel` 팔레트 필드 | 계획 | 넓어진 T8 밴드가 오염된 시드로 칠해지는 문제를 먼저 해소 |
+| 4 | T9 | 경계 후광 제거·영역 유형 분류(`fillRegion`)·`flat/cel` 팔레트 필드 | 구현 · 부분 충족(`cargo test` 63/63, `clippy`, `npm test` 45/45, `tsc` 통과; 원화 3종 + Himikan 정답 전/후 수치·비교 이미지 기록; 분할·숨은 영역 불변(상위 레이어 이음새 오버레이 `fillMask`만 증가), 정지 렌더 이음새 외곽선 원래 수준 유지; `flat/cel` 개선은 목·`clothes_inner`·의상 정답에 한정, Sutteang 홀드아웃 의상 소폭 악화, 세일러 칼라 평탄화는 T15/T16 범위로 판정; Windows 앱 `미검증`) | 넓어진 T8 밴드가 오염된 시드로 칠해지는 문제를 먼저 해소 |
 | 5 | T10 | 눈·입 클리핑 밀폐 | 계획 | T9 텍스처 위에서 클리핑 정합 |
 | 6 | T15 | 선화·구조 연장 | 계획 | 색 필드가 안정된 뒤 선 레이어를 얹음 |
 | 7 | T11 | 노출 영역 중심 수동 보정 | 계획 | 자동 결과의 유형·신뢰도가 정해진 뒤 보정 UI가 의미를 가짐 |
@@ -247,6 +247,19 @@
 
 선행: T8, T13(노출 맵), T14(기준선). 주요 파일: `src-tauri/src/analysis/templates.rs`, `src-tauri/src/core.rs`, `src/engine.ts`.
 
+상태 (2026-11-18): **구현 · 부분 충족 · `cargo test` 63/63, `cargo clippy --all-targets -D warnings`, `npm test` 45/45, `tsc` 통과 · Windows 앱 `미검증`**. 수치·이미지·판정은 [validation.md](validation.md) T9 절.
+
+- **신규 모듈** `src-tauri/src/analysis/region_fill.rs`(`t9-v1`): 내측 시드(가시 알파 ≥128, 가시 경계에서 2px 침식, 레이어 중앙 L* − 25 이하이면서 2px 열림 연산에 사라지는 가는 획 = 선화 제외, 다른 부위 증거·홀드아웃 제외) → 영역 유형 분류 → `flat/cel` 팔레트 레벨셋 필드 → 경계 림 디컨태미네이션. 임계값은 모듈 상수와 문서 주석에 명시.
+- **영역 유형**(`fillRegion`, 출처 `fillKind`와 별도 필드): 역할 기반 `semantic`(홍채·입안)·`line`(눈썹·눈꺼풀), 그 외 숨은 영역에서 `max(12, min(48, 0.06·hh))`px 이내 시드 통계로 `line`(선화 비율 ≥ 0.30 또는 2px 침식 후 남는 비율 < 0.15) → `texture`(5×5 국소 σL* 중앙값 ≥ 3.0) → `flat_cel`. 노출 맵(`ExposureMap`)은 합성 단계에서 아직 없으므로 숨은 영역 인접 시드를 노출 밴드의 대리로 쓴다(제한).
+- **`flat/cel` 팔레트 필드**: 밴드 시드 k-means(≤4, ΔE00 < 6 병합, 3% 미만 제거). 시드의 75% 이상이 군집 중심에 붙어 있으면(ρ = d1/(d1+d2) < 0.15) 셀 채색으로 보고 스냅: 군집 지시 함수를 조화 보간해 argmax 레벨셋으로 군집을 고르고, 그 군집 시드만의 국소 조화 필드 색을 쓴다(군집 내 명암 유지). 그 외(그라데이션 채색)는 스냅을 끄고 전체 시드 국소 필드. 자기 레이어 시드가 숨은 텍셀의 10% 미만이면(작은 가시 조각을 큰 숨은 영역으로 외삽하면 줄무늬가 생김 — Rritteang 목에서 확인) 기존 부위 공용 필드를 유지.
+- **적용 범위**: 목·몸통·의상·착용물(`hat`·`acc_*`·`clothes_*`)은 자기 시드 필드(목·몸통은 얼굴 피부 + 그린 그림자 대신 자기 그림자 연장, 목·몸통 시드는 머리카락 증거와 피부 휘도 55% 미만 제외), 얼굴·머리카락은 스냅될 때만 자기(머리카락은 머리카락 전 레이어) 시드 팔레트, 아니면 기존 공용 필드(측정상 자기 시드 국소 필드가 얼굴 정답 ΔE 2.34→3.26으로 나빠져 되돌림). 착용물 숨은 텍셀은 더 이상 그 위치 원본 픽셀(= 덮는 레이어 색)을 복사하지 않는다. 눈·입·눈썹 숨은 영역 합성은 그대로(T10).
+- **이음새 오버레이**(리뷰 수정): 하위 림에서 지우는 상위 외곽선 절반·상위 쪽 혼합·얼굴 잔여 선화는 원래 색을 상위 레이어 텍스처에, 그 픽셀을 상위 `fillMask`에 넣는다(제품 분할·원본으로 텍스처 단계 전에 한 번 계획 → 홀드아웃 불변). 정지 렌더 이음새 외곽선 ΔE00 Himikan 2.52 → 2.56, Rritteang 2.56 → 1.00, Sutteang 2.62 → 0.46; 모션 크롭에서 이중 선화 없음. `rig/exposure.rs`는 더 아래 레이어가 가시인 픽셀 위의 `fillMask`를 `overlayPx`로 따로 세고 숨은 텍셀에서 뺀다. CLI가 `owner.png`(정지 포즈 가시 소유자)를 쓴다.
+- **경계 림 디컨태미네이션**(`flat_cel` 레이어만, `mask` 불변·텍스처 색만): 가시 최외곽 2px에서 배경 쪽은 F→배경색(불투명 입력은 배경 중앙값, 투명 입력은 흰색) 혼합선 위 픽셀 → F, 상위 레이어 쪽은 F보다 L* 20 이상 어두운 선화를 상위 레이어가 3px 안에 비슷한 어두운 픽셀로 갖고 있을 때만 제거(아니면 정지 포즈에서 선이 사라지므로 유지), 하위 레이어 쪽은 밝아지거나 색상이 섞인 혼합만 제거(어두운 픽셀은 이 레이어의 이음새 외곽선일 수 있어 유지). F는 혼합이면 4px 안 시드 중 색이 가장 가까운 것, 선화면 공간상 가장 가까운 시드, 4px 안에 시드가 없으면 건드리지 않음. 그 뒤에 2px 패딩.
+- **얼굴 잔여 선화**(`auto` 포함): 눈·눈썹·입 증거 안의 얼굴 가시 픽셀 중 깨끗한 피부보다 L* 25 이상 어둡고 홍조/피부색이 아닌 성분이, 3px 안에서 비슷하게 어두운 특징 레이어 픽셀과 이어질 때 그 성분 전체를 국소 피부 필드로 덮는다(Rritteang 517px, Sutteang 269px, Himikan 0px).
+- **수동 보완** `core::fill_occlusion`: 채움 모양(BFS 반경)은 그대로, 색은 같은 영역 유형·팔레트/국소 필드, 가시 림 디컨태미네이션 적용, 결과에 `fillRegion` 보고. TS `expandFillSeparated`(브라우저 대체)는 고급 합성 없이 `fillSynth: "diffusion"`으로 표시하고 유형은 비워 둔다(UI: `유형·미분류`, "확산 초안(브라우저/저품질)").
+- **데이터 계약**: `Part.fillRegion?: "flat_cel"|"line"|"texture"|"semantic"`, `Part.fillSynth?: "palette_levelset"|"local_field"|"class_field"|"procedural"|"diffusion"|"none"`. 선택 필드라 schema v3 유지(v4 불필요): T9 이전 v3·v1·v2 프로젝트는 미분류로 읽히고, 알 수 없는 값은 `fillKind`처럼 거부한다(테스트). Rust `RegionReport`(통계·림 집계 포함)는 `propose_parts`/`fill_part_occlusion` 응답과 CLI `stats.json` `partCoverage[].fillRegion`에 실린다.
+- 남은 제한: (a) 정지 렌더 차이는 배경 후광 제거와 상위 레이어 자기 림의 밝아지는 혼합 교정만 남는다(이음새 외곽선은 오버레이로 유지); 오버레이 텍셀이 상위 메쉬를 1–2px 넓혀 노출 합계가 0.3–1.0% 줄었다(숨은 텍셀 수 동일). (b) 세일러 칼라 같은 무늬·구조는 시드 통계로 복원되지 않는다(T15/T16/T11). (c) 분류는 노출 맵이 아니라 숨은 영역 인접 시드 기준. (d) 홀드아웃이 전 층인 파츠(Rritteang·Sutteang 목·몸통 등)는 변경 효과가 측정되지 않는다. (e) 임계값은 원화 3종 + Himikan으로만 확인. (f) Windows 앱 모션·UI 표시 `미검증`.
+
 작업:
 
 - `m_vis`의 최외곽 경계(배경 흰색·이웃 파츠 선화·옷깃 색이 반투명하게 섞인 `1~2px` 림)가 `orig_rgb` 그대로 복사되고 `pad_texture_rgb`로 바깥에 번지는 문제를 막기 위해, 경계 혼입 픽셀을 침식 내측 시드 기반 `build_color_field` 색상으로 디컨태미네이션한 뒤 2px 패딩을 수행한다.
@@ -335,7 +348,7 @@
 | 2a | `fix(T8): role-based fill radius dispatch with Rust/TS parity test` (구현됨 · `cargo test`/`npm test` 통과) | Rust/TS 동일 입력 동일 반경 (공유 fixture 통과, Windows 원화 모션 `미검증`) |
 | 3 | `feat(T13): derive seam contracts, pose envelope margins, and exposure map` (T13a `2ba7adc` · T13b 구현됨, 커밋 전) | 변형 상수 복제 0(여유분 경로 충족, `part_overlap_margins` 폴백 복제는 잔존), 이음새 커버리지 위반 0(1024px 합성 fixture `holes` 0 충족 · 원화 3종 `holes` Himikan 52 / Rritteang 11,907 / Sutteang 1,974, 결합 전후 동일 → **미충족**), 결합으로 숨은 영역이 줄지 않음(테스트 고정), 노출 면적 기록(합성 fixture + 원화 3종 결합 전/후 기록), Windows 앱 모션·오버레이 GUI `미검증` |
 | 4 | `test(T14): add hidden-area fidelity harness (PSD ground truth + holdout)` (구현됨 · 커밋 전) | 현 합성기 기준선 수치·비교 이미지(원화 3종 홀드아웃 + Himikan 정답 비교 기록, 기본 실행 출력 불변 확인, `cargo test`/`clippy`/`npm test`/`tsc` 통과; 임계값 미정 → 통과/미통과 판정 없음, Windows 앱 `미검증`) |
-| 5 | `feat(T9): decontaminate rim halos, classify fillKind, palette-snapped cel field` | 경계 흰 테두리·목 얼룩 제거 + T14 지표 개선 |
+| 5 | `feat(T9): decontaminate rim halos, classify fill region type, palette-snapped cel field` (구현됨 · 커밋 전) | 경계 흰 테두리·목 얼룩 제거 + T14 지표 개선 → 원화 CLI 모션 미리보기에서 목 상단 밝은 얼룩·흰 줄 제거 확인, `flat/cel` 개선은 Himikan 목(정답 6.40→2.66, 홀드아웃 3.25→1.43)·`clothes_inner`(홀드아웃 36.87→2.13)·의상 정답(2.98→2.80)에 한정, Sutteang 홀드아웃 의상 7.66→7.72(악화), 나머지 동일; 분할 불변, 숨은 영역은 상위 이음새 오버레이만 증가; 정지 렌더 이음새 외곽선 원래 수준(Himikan 2.52→2.56, Rritteang 2.56→1.00, Sutteang 2.62→0.46); `cargo test`/`clippy`/`npm test`/`tsc` 통과; Windows 앱 `미검증` |
 | 6 | `feat(T10): seal eye clipping and closed-lid curves across expressions` | 감은 눈·슬픔·시선 극값 홍채/흰자 누출 0 |
 | 7 | `feat(T15): separate line art and extend strokes/contours into exposure bands` | 선화 끊김 감소, 이중 선화 신규 0 |
 | 8 | `feat(T11): add exposure-aware hidden-area (fillMask) retouch workflow` | 원화 `mask` 불변 + 노출 포즈 미리보기 + 보정 왕복 |

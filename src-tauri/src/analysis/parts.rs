@@ -33,6 +33,9 @@ pub struct PartsProposalOutput {
     pub masks: Vec<Vec<u8>>,
     pub fill_masks: Vec<Option<Vec<u8>>>,
     pub fill_kinds: Vec<String>,
+    /// T9 region type / hidden-colour synthesis per part (`None` = not classified).
+    #[serde(default)]
+    pub fill_regions: Vec<Option<crate::analysis::region_fill::RegionReport>>,
     pub textures: Vec<Option<String>>,
     pub metas: Vec<PartProposalMeta>,
     pub provider: String,
@@ -3654,6 +3657,8 @@ fn finalize_part_proposal(
 
     let mut fill_masks: Vec<Option<Vec<u8>>> = vec![None; final_ids.len()];
     let mut fill_kinds: Vec<String> = vec!["none".into(); final_ids.len()];
+    let mut fill_regions: Vec<Option<crate::analysis::region_fill::RegionReport>> =
+        vec![None; final_ids.len()];
     let mut textures: Vec<Option<String>> = vec![None; final_ids.len()];
     let mut style_match: Option<StyleMatchReport> = None;
     let mut effective_postprocess = postprocess_version.to_string();
@@ -3691,6 +3696,7 @@ fn finalize_part_proposal(
             .map(|m| m.iter().any(|&v| v > 0).then_some(m))
             .collect();
         fill_kinds = tpl.fill_kinds;
+        fill_regions = tpl.fill_regions;
         textures = tpl.textures;
         style_match = Some(tpl.style_match);
         effective_postprocess = "template-hybrid-v2".to_string();
@@ -3707,6 +3713,7 @@ fn finalize_part_proposal(
         final_confidences = keep_idx.iter().map(|&i| final_confidences[i]).collect();
         fill_masks = keep_idx.iter().map(|&i| fill_masks[i].clone()).collect();
         fill_kinds = keep_idx.iter().map(|&i| fill_kinds[i].clone()).collect();
+        fill_regions = keep_idx.iter().map(|&i| fill_regions[i].clone()).collect();
         textures = keep_idx.iter().map(|&i| textures[i].clone()).collect();
     }
 
@@ -3747,6 +3754,7 @@ fn finalize_part_proposal(
         masks: final_masks,
         fill_masks,
         fill_kinds,
+        fill_regions,
         textures,
         metas,
         provider: provider.into(),

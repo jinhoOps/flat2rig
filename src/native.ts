@@ -7,9 +7,13 @@ import {
   PARENT_TO_DETAIL_IDS,
   PART_DEFS,
   stageIncludesLayer,
+  FILL_REGIONS,
+  FILL_SYNTHS,
   type AnalysisStatus,
   type FaceCandidate,
   type FillKind,
+  type FillRegion,
+  type FillSynth,
   type Landmark28Point,
   type LandmarkProvenance,
   type Landmarks,
@@ -35,6 +39,18 @@ import {
 import { REST, PARAM_DEFS } from "./types";
 export type { MeshQualityReport } from "./engine";
 export const desktop = isTauri();
+/** T9: validated `{ fillRegion, fillSynth }` from a Rust `RegionReport` (unknown values dropped). */
+export function parseFillRegion(
+  raw: { kind?: string; synth?: string } | null | undefined,
+): { fillRegion?: FillRegion; fillSynth?: FillSynth } {
+  if (!raw) return {};
+  const out: { fillRegion?: FillRegion; fillSynth?: FillSynth } = {};
+  if (raw.kind && (FILL_REGIONS as readonly string[]).includes(raw.kind))
+    out.fillRegion = raw.kind as FillRegion;
+  if (raw.synth && (FILL_SYNTHS as readonly string[]).includes(raw.synth))
+    out.fillSynth = raw.synth as FillSynth;
+  return out;
+}
 export function base64(bytes: Uint8Array | Uint8ClampedArray) {
   let text = "";
   for (let i = 0; i < bytes.length; i += 32768)
@@ -163,6 +179,9 @@ export interface FillOcclusionResult {
   combinedMask: Uint8Array;
   filledPixels: number;
   fillKind: FillKind;
+  /** T9 (Rust only): region type; absent from the browser diffusion fallback. */
+  fillRegion?: FillRegion;
+  fillSynth?: FillSynth;
   warning?: string;
 }
 
@@ -233,6 +252,7 @@ export async function proposeParts(
       masks: string[];
       fillMasks?: (string | null)[];
       fillKinds?: string[];
+      fillRegions?: ({ kind: string; synth: string } | null)[];
       textures?: (string | null)[];
       metas: {
         id: string;
@@ -282,6 +302,7 @@ export async function proposeParts(
         const rawKind = res.fillKinds?.[i];
         const fillKind: FillKind =
           rawKind && validFillKinds.has(rawKind) ? (rawKind as FillKind) : "none";
+        const region = parseFillRegion(res.fillRegions?.[i]);
         const tex = res.textures?.[i];
         return {
           id,
@@ -294,6 +315,7 @@ export async function proposeParts(
           mask: unbase64(res.masks[i]),
           ...(rawFill ? { fillMask: unbase64(rawFill) } : {}),
           fillKind,
+          ...region,
           ...(tex ? { texture: tex } : {}),
           provenance: meta?.provenance ?? "geometry",
           confidence: meta?.confidence,
@@ -437,6 +459,7 @@ function fillBrowserFallbackParts(
       ...part,
       fillMask: filled.fillMask,
       fillKind: filled.fillKind,
+      fillSynth: filled.fillSynth,
       ...(texture ? { texture } : {}),
       generated: true,
     };
@@ -545,6 +568,8 @@ export interface ExposureLayerSummary {
   maxDepthPx: number | null;
   p95DepthPx: number | null;
   restExposedPx: number;
+  /** T9: overlay texels (upper-layer fill over a lower layer's visible seam pixel), not hidden. */
+  overlayPx?: number;
 }
 
 export interface ExposureOverlayResult {
@@ -615,6 +640,7 @@ export async function fillOcclusionNative(
     combinedMask: string;
     filledPixels: number;
     fillKind: FillKind;
+    fillRegion?: { kind: string; synth: string } | null;
     warning?: string | null;
   }>("fill_part_occlusion", {
     rgba: base64(data),
@@ -630,6 +656,7 @@ export async function fillOcclusionNative(
     combinedMask: unbase64(result.combinedMask),
     filledPixels: result.filledPixels,
     fillKind: result.fillKind,
+    ...parseFillRegion(result.fillRegion),
     warning: result.warning ?? undefined,
   };
 }

@@ -471,6 +471,57 @@ describe("persistent project and export contract", () => {
     expect(migratedV2.schemaVersion).toBe(3);
     expect(migratedV2.rigProfile.proportionMode).toBe("sd");
     expect(migratedV2.shapePresets.length).toBeGreaterThanOrEqual(15);
+    // T9: region type / synthesis are new optional fields — legacy parts stay unclassified.
+    expect(migratedV1.parts.every((part) => part.fillRegion === undefined)).toBe(true);
+    expect(migratedV2.parts.every((part) => part.fillSynth === undefined)).toBe(true);
+  });
+  it("keeps schema v3 for T9 region fields: pre-T9 v3 loads unclassified, values round-trip, unknown values are rejected", async () => {
+    // A v3 project saved before T9 (no fillRegion / fillSynth) still loads unchanged.
+    const pre = fixture();
+    pre.parts[0].fillKind = "template";
+    pre.parts[0].fillMask = new Uint8Array(pre.parts[0].mask.length).fill(64);
+    const restoredPre = loadProject(await saveProject(pre));
+    expect(restoredPre.schemaVersion).toBe(3);
+    expect(restoredPre.parts[0].fillKind).toBe("template");
+    expect(restoredPre.parts[0].fillRegion).toBeUndefined();
+    expect(restoredPre.parts[0].fillSynth).toBeUndefined();
+    // T9 values round-trip; `fillKind` (source) and `fillRegion` (type) stay separate fields.
+    const post = fixture();
+    post.parts[0].fillKind = "template";
+    post.parts[0].fillRegion = "flat_cel";
+    post.parts[0].fillSynth = "palette_levelset";
+    post.parts[1].fillKind = "neighbor";
+    post.parts[1].fillSynth = "diffusion";
+    const restoredPost = loadProject(await saveProject(post));
+    expect(restoredPost.schemaVersion).toBe(3);
+    expect(restoredPost.parts[0]).toMatchObject({
+      fillKind: "template",
+      fillRegion: "flat_cel",
+      fillSynth: "palette_levelset",
+    });
+    expect(restoredPost.parts[1].fillRegion).toBeUndefined();
+    expect(restoredPost.parts[1].fillSynth).toBe("diffusion");
+    // Unknown values are rejected like an unknown fillKind.
+    const files = unzipSync(await saveProject(post));
+    const meta = JSON.parse(strFromU8(files["project.json"]));
+    meta.parts[0].fillRegion = "gradient";
+    files["project.json"] = strToU8(JSON.stringify(meta));
+    expect(() => loadProject(zipSync(files))).toThrow();
+    meta.parts[0].fillRegion = "flat_cel";
+    meta.parts[0].fillSynth = "inpaint";
+    files["project.json"] = strToU8(JSON.stringify(meta));
+    expect(() => loadProject(zipSync(files))).toThrow();
+  });
+  it("marks the browser fallback fill as an unclassified diffusion draft (T9)", () => {
+    const w = 12;
+    const h = 12;
+    const rgba = new Uint8ClampedArray(w * h * 4).fill(200);
+    const visible = new Uint8Array(w * h);
+    for (let y = 3; y < 9; y++) for (let x = 3; x < 9; x++) visible[y * w + x] = 255;
+    const occ = expandFillSeparated(rgba, visible, w, h, 2, "neck");
+    expect(occ.fillKind).toBe("neighbor");
+    expect(occ.fillSynth).toBe("diffusion");
+    expect((occ as { fillRegion?: string }).fillRegion).toBeUndefined();
   });
   it("round-trips and strictly validates ZIP shape substitute assets and v3 guards", async () => {
     const p = fixture();

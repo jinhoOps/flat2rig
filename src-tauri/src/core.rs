@@ -1870,6 +1870,9 @@ pub struct OcclusionFillOutput {
     pub combined_mask: Vec<u8>,
     pub filled_pixels: usize,
     pub fill_kind: String,
+    /// T9: region type of the part and how the fill colours were made (Rust only; the browser
+    /// fallback `expandFillSeparated` leaves this unset = unclassified diffusion draft).
+    pub fill_region: Option<crate::analysis::region_fill::RegionReport>,
     pub warning: Option<String>,
 }
 
@@ -1995,6 +1998,70 @@ pub fn fill_occlusion(
         }
         frontier = next;
     }
+    // T9: colours of the grown fill (shape unchanged) from the part's own clean inner seeds —
+    // palette level set for tight cel palettes, local harmonic field otherwise — and outer-rim
+    // decontamination of the visible texels. Structured / stroke parts keep the diffusion colours.
+    let fill_region = if active_len == len && len > 0 {
+        use crate::analysis::region_fill as rf;
+        let role_kind = part_id.and_then(|id| {
+            if id.ends_with("_iris") || id == "mouth_inner" {
+                Some(rf::RegionKind::Semantic)
+            } else if id.starts_with("brow") || id.ends_with("_upper") || id.ends_with("_lower") {
+                Some(rf::RegionKind::Line)
+            } else {
+                None
+            }
+        });
+        let lab = rf::ImageLab::new(data, len);
+        let mut region = rf::analyze_layer(&rf::LayerInput {
+            rgba: data,
+            lab: &lab,
+            w,
+            h,
+            vis: visible_mask,
+            hidden: &fill_mask,
+            exclude: None,
+            band_radius: radius.clamp(12, 48),
+            role_kind,
+        });
+        let field_ok = matches!(region.kind(), rf::RegionKind::FlatCel | rf::RegionKind::Texture);
+        let rim_ok = region.kind() == rf::RegionKind::FlatCel;
+        let filler = if field_ok && filled_pixels > 0 {
+            rf::RegionFiller::new(&region, data, w, h)
+        } else {
+            None
+        };
+        region.report.synth = match &filler {
+            _ if filled_pixels == 0 => "none".into(),
+            Some(f) if f.snapped() => "palette_levelset".into(),
+            Some(_) => "local_field".into(),
+            None => "diffusion".into(),
+        };
+        if let Some(f) = &filler {
+            for i in 0..len {
+                if fill_mask[i] > 0 {
+                    let c = f.color_at(i % w, i / w);
+                    out[i * 4..i * 4 + 3].copy_from_slice(&c);
+                }
+            }
+        }
+        if rim_ok {
+            let owner: Vec<i32> = visible_mask.iter().map(|&v| if v > 0 { 0 } else { -1 }).collect();
+            let ctx = rf::RimContext {
+                rgba: data,
+                lab: &lab,
+                w,
+                h,
+                owner: &owner,
+                background: None,
+                use_outside_color: true,
+            };
+            region.report.rim = rf::decontaminate_rim(&mut out, visible_mask, 0, &region, &ctx, None).0;
+        }
+        Some(region.report)
+    } else {
+        None
+    };
     let hidden_feature_part = part_id
         .map(|id| id.starts_with("eye") || id.starts_with("mouth") || id.starts_with("hair"))
         .unwrap_or(false);
@@ -2012,6 +2079,7 @@ pub fn fill_occlusion(
         combined_mask,
         filled_pixels,
         fill_kind: "neighbor".to_string(),
+        fill_region,
         warning,
     }
 }

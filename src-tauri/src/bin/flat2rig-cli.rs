@@ -665,6 +665,7 @@ fn run_pipeline(
         let mask = &proposed.masks[idx];
         let fill = proposed.fill_masks.get(idx).and_then(|o| o.as_deref());
         let fill_kind = proposed.fill_kinds.get(idx).map(|s| s.as_str());
+        let fill_region = proposed.fill_regions.get(idx).and_then(|r| r.as_ref());
         let effective = core::effective_part_mask(mask, fill);
         let tex_src = decode_part_rgba(
             proposed.textures.get(idx).and_then(|o| o.as_deref()),
@@ -711,10 +712,24 @@ fn run_pipeline(
             "visiblePixels": visible_px,
             "fillPixels": fill_px,
             "fillKind": fill_kind,
+            "fillRegion": fill_region,
         }));
     }
     composite.save(output.join("foreground.png"))?;
     effective_composite.save(output.join("effective_foreground.png"))?;
+    // Rest-pose visible owner (layer index + 1, 0 = none; 16-bit) — the partition, independent of
+    // overlay `fillMask` texels that sit above a lower layer (T9).
+    {
+        let mut owner_img = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::new(w, h);
+        for (li, m) in proposed.masks.iter().enumerate() {
+            for (i, &a) in m.iter().enumerate() {
+                if a > 0 {
+                    owner_img.as_mut()[i] = li as u16 + 1;
+                }
+            }
+        }
+        owner_img.save(output.join("owner.png"))?;
+    }
     fill_only_composite.save(output.join("fill_only.png"))?;
     for (buf, (filename, _)) in motion_buffers.iter().zip(motion_poses.iter()) {
         buf.save(output.join(filename))?;

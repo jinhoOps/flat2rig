@@ -2,6 +2,7 @@ pub mod detector;
 pub mod landmarks;
 pub mod models;
 pub mod parts;
+pub mod region_fill;
 pub mod segmentation;
 pub mod state;
 pub mod templates;

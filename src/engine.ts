@@ -2087,6 +2087,9 @@ export function expandFillSeparated(
     combinedMask,
     filledPixels,
     fillKind: "neighbor" as const,
+    // T9: browser fallback = neighbour diffusion draft; the region type is not classified here
+    // (palette / local-field synthesis is Rust-only).
+    fillSynth: "diffusion" as const,
     warning: hiddenFeature
       ? "경계 2px 침식 내삽(neighbor)으로 외곽선 번짐을 줄였으나 가려진 눈·입·머리카락 내부 디테일은 자동 복원되지 않습니다."
       : undefined,

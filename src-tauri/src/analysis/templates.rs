@@ -6,6 +6,7 @@
 //! and behind-torso back hair) while keeping `masks` as a strict non-overlapping foreground partition.
 
 use crate::analysis::landmarks::Landmark28Point;
+use crate::analysis::region_fill::{self, RegionKind, RegionReport};
 use crate::core::{HeadFrame, Landmarks};
 use crate::rig::seams;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -115,6 +116,9 @@ pub struct TemplateSynthesisOutput {
     pub masks: Vec<Vec<u8>>,
     pub fill_masks: Vec<Vec<u8>>,
     pub fill_kinds: Vec<String>,
+    /// T9: region type (`flat_cel`/`line`/`texture`/`semantic`) and hidden-colour synthesis of
+    /// each layer (aligned with `part_ids`; `None` for layers without a texture).
+    pub fill_regions: Vec<Option<RegionReport>>,
     pub textures: Vec<Option<String>>,
     pub provenances: Vec<String>,
     pub confidences: Vec<f64>,
@@ -5472,6 +5476,8 @@ pub fn synthesize_template_bank_for_stage(
     }
     drop_holdout_seeds(&mut clothes_eroded, holdout_union.as_deref());
     let clothes_field = build_color_field(rgba, &clothes_eroded, w, h, ev.palette.clothes_primary);
+    // T9: per-pixel wearable flag kept for the per-layer seed exclusions of the texture stage.
+    let wearable_px: Vec<bool> = (0..n).map(is_wearable_px).collect();
 
     // Preserve any extra split hair strands (`hair_front_*`, `hair_side_R_*`, `hair_side_L_*`, `hair_back_*`) from upstream `hair_split`.
     let mut split_hair_extras: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
@@ -5889,8 +5895,11 @@ pub fn synthesize_template_bank_for_stage(
         }
         src
     });
+    // T9: the product source / skin field, used by the holdout-independent seam overlay plan.
+    let rgba_product: &[u8] = rgba;
+    let skin_field_product: &ColorField = &skin_field;
     let rgba: &[u8] = holdout_src.as_deref().unwrap_or(rgba);
-    let skin_field = holdout_skin_field.as_ref().unwrap_or(&skin_field);
+    let skin_field = holdout_skin_field.as_ref().unwrap_or(skin_field_product);
     // T14 holdout: palettes / iris fits used by hidden-texel branches are re-estimated from the
     // occluded source so they cannot carry held-out colours (product path: the same `ev`).
     let ev_product: &AnalyzedEvidence = &ev;
@@ -5907,7 +5916,268 @@ pub fn synthesize_template_bank_for_stage(
         )
     });
     let ev: &AnalyzedEvidence = holdout_ev.as_ref().unwrap_or(ev_product);
+    // T9: shared inputs of the per-layer region analysis (seeds / type / palette field) and the
+    // rim decontamination. `owner` is the rest-pose partition (product masks, holdout-independent).
+    let img_lab = region_fill::ImageLab::new(rgba, n);
+    let mut owner = vec![-1i32; n];
+    for (li, m) in final_visible_masks.iter().enumerate() {
+        for (o, &a) in owner.iter_mut().zip(m) {
+            if a > 0 {
+                *o = li as i32;
+            }
+        }
+    }
+    let background_rgb = region_fill::opaque_background_rgb(rgba, &ev_product.fg_alpha);
+    let rim_ctx = region_fill::RimContext {
+        rgba,
+        lab: &img_lab,
+        w,
+        h,
+        owner: &owner,
+        background: background_rgb,
+        use_outside_color: false,
+    };
+    let band_radius = (hh * 0.06).round().clamp(12.0, 48.0) as usize;
+    let hair_seed_excl: Vec<bool> = (0..n)
+        .map(|i| wearable_px[i] || ev_clothes[i] || ev_face[i] || luma(pix_rgb(rgba_product, i)) < 44.0)
+        .collect();
+    let clothes_seed_excl: Vec<bool> = (0..n).map(|i| ev_hair_all[i] || wearable_px[i]).collect();
+    // Neck / body seeds: skin only — hair evidence and pixels far darker than skin (collar or hair
+    // shadow left in the skin layer) never drive the skin field.
+    let skin_layer_seed_excl: Vec<bool> = (0..n)
+        .map(|i| ev_hair_all[i] || luma(pix_rgb(rgba_product, i)) < skin_base_luma * 0.55)
+        .collect();
+    let face_seed_excl: Vec<bool> = pure_face_seeds.iter().map(|&s| !s).collect();
+    // Hair class support: every hair layer's visible pixels (evaluation holdout pixels removed).
+    let hair_class_vis: Vec<u8> = (0..n)
+        .map(|i| {
+            if holdout_union.as_ref().is_some_and(|u| u[i]) {
+                return 0;
+            }
+            final_layer_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, lid)| lid.starts_with("hair_"))
+                .map(|(li, _)| final_visible_masks[li][i])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let feature_vis: Vec<bool> = (0..n)
+        .map(|i| {
+            final_layer_ids.iter().enumerate().any(|(li, lid)| {
+                (lid.starts_with("eye") || lid.starts_with("brow") || lid.starts_with("mouth"))
+                    && final_visible_masks[li][i] > 0
+            })
+        })
+        .collect();
+    let is_mannequin_stage = stage == "base_silhouette";
+    let role_kind_of = |id: &str| -> Option<RegionKind> {
+        match id {
+            "eyeR_iris" | "eyeL_iris" | "mouth_inner" => Some(RegionKind::Semantic),
+            "browR" | "browL" | "eyeR_upper" | "eyeL_upper" | "eyeR_lower" | "eyeL_lower" => {
+                Some(RegionKind::Line)
+            }
+            _ => None,
+        }
+    };
+    let seed_excl_of = |id: &str| -> Option<&[bool]> {
+        match id {
+            "face" => Some(&face_seed_excl),
+            "neck" | "body" => Some(&skin_layer_seed_excl),
+            "clothes" => Some(&clothes_seed_excl),
+            hid if hid.starts_with("hair_") => Some(&hair_seed_excl),
+            _ => None,
+        }
+    };
+    // T9 seam overlay plan (product partition and product source only, so an evaluation holdout
+    // can never change it): lower-rim pixels that carry the upper layer's outline half or the
+    // upper-side anti-alias mixture, and the face's eye / brow / mouth line residue, are cleaned
+    // in the lower texture AND handed to the upper layer as overlay `fillMask` texels with their
+    // original colour. The visible partition is unchanged; at rest the upper layer draws them over
+    // the lower one (original line width), in motion they travel with the upper layer (no double
+    // line left on the lower layer).
+    let lab_product_own;
+    let lab_product: &region_fill::ImageLab = if holdout_src.is_some() {
+        lab_product_own = region_fill::ImageLab::new(rgba_product, n);
+        &lab_product_own
+    } else {
+        &img_lab
+    };
+    let rim_ctx_product = region_fill::RimContext {
+        rgba: rgba_product,
+        lab: lab_product,
+        w,
+        h,
+        owner: &owner,
+        background: background_rgb,
+        use_outside_color: false,
+    };
+    let mut pre_regions: Vec<Option<region_fill::LayerRegion>> = (0..final_len).map(|_| None).collect();
+    let mut rim_plans: Vec<Option<Vec<i32>>> = vec![None; final_len];
+    // Per receiving (upper) layer: (pixel, original colour, alpha of the lower visible pixel).
+    let mut overlays: Vec<Vec<(usize, [u8; 3], u8)>> = vec![Vec::new(); final_len];
+    let mut face_residue: Vec<bool> = Vec::new();
+    if !is_mannequin_stage {
+        let mut scratch = rgba_product.to_vec();
+        for li in 0..final_len {
+            let lid = final_layer_ids[li].as_str();
+            let vis = &final_visible_masks[li];
+            if !vis.iter().any(|&v| v > 0) {
+                continue;
+            }
+            let region = region_fill::analyze_layer(&region_fill::LayerInput {
+                rgba: rgba_product,
+                lab: lab_product,
+                w,
+                h,
+                vis,
+                hidden: &fill_masks[li],
+                exclude: seed_excl_of(lid),
+                band_radius,
+                role_kind: role_kind_of(lid),
+            });
+            if region.kind() == RegionKind::FlatCel {
+                let (_, moved) =
+                    region_fill::decontaminate_rim(&mut scratch, vis, li, &region, &rim_ctx_product, None);
+                if !moved.is_empty() {
+                    let mut plan = vec![-1i32; n];
+                    for &(i, up) in &moved {
+                        plan[i] = up as i32;
+                        overlays[up].push((i, pix_rgb(rgba_product, i), vis[i]));
+                    }
+                    rim_plans[li] = Some(plan);
+                }
+            }
+            pre_regions[li] = Some(region);
+        }
+        // T9 item 2: eye / brow / mouth line residue that the partition left on `face` (inside
+        // feature evidence, line-dark against the skin field, not blush / skin) — components that
+        // touch a similarly dark pixel of a feature layer — moves to that feature layer.
+        if let Some(fi) = final_layer_ids.iter().position(|lid| lid == "face") {
+            if !explicit_face_override {
+                let fvis = &final_visible_masks[fi];
+                let near_feat = dilation_distance(&feature_vis, w, h, hole_guard_rad);
+                let cand: Vec<bool> = (0..n)
+                    .map(|i| {
+                        if fvis[i] == 0 || near_feat[i] == u16::MAX {
+                            return false;
+                        }
+                        let in_feature = ev_eye_r_all[i]
+                            || ev_eye_l_all[i]
+                            || ev_mouth_all[i]
+                            || ev_brow_r[i]
+                            || ev_brow_l[i];
+                        in_feature
+                            && lab_product.lab[i][0]
+                                < region_fill::srgb_l(skin_field_product.sample(i % w, i / w))
+                                    - region_fill::LINE_DROP_L
+                            && !is_warm_blush_or_skin(pix_rgb(rgba_product, i), ev_product.palette.skin_base)
+                    })
+                    .collect();
+                // Nearest feature-layer pixel (its layer receives the residue).
+                let mut feat_src = vec![u32::MAX; n];
+                let mut q = VecDeque::new();
+                for (i, &fv) in feature_vis.iter().enumerate() {
+                    if fv {
+                        feat_src[i] = i as u32;
+                        q.push_back(i);
+                    }
+                }
+                while let Some(i) = q.pop_front() {
+                    let (x, y) = (i % w, i / w);
+                    for nb in [
+                        (x > 0).then(|| i - 1),
+                        (x + 1 < w).then(|| i + 1),
+                        (y > 0).then(|| i - w),
+                        (y + 1 < h).then(|| i + w),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if feat_src[nb] == u32::MAX && near_feat[nb] != u16::MAX {
+                            feat_src[nb] = feat_src[i];
+                            q.push_back(nb);
+                        }
+                    }
+                }
+                let mut residue = vec![false; n];
+                let mut q = VecDeque::new();
+                for i in 0..n {
+                    if !cand[i] {
+                        continue;
+                    }
+                    let (x, y) = ((i % w) as i64, (i / w) as i64);
+                    let lo = luma(pix_rgb(rgba_product, i));
+                    let touches = (-3..=3i64).any(|dy| {
+                        (-3..=3i64).any(|dx| {
+                            let (nx, ny) = (x + dx, y + dy);
+                            nx >= 0
+                                && ny >= 0
+                                && (nx as usize) < w
+                                && (ny as usize) < h
+                                && {
+                                    let k = ny as usize * w + nx as usize;
+                                    feature_vis[k] && luma(pix_rgb(rgba_product, k)) <= lo + 20.0
+                                }
+                        })
+                    });
+                    if touches {
+                        residue[i] = true;
+                        q.push_back(i);
+                    }
+                }
+                while let Some(i) = q.pop_front() {
+                    let (x, y) = (i % w, i / w);
+                    for nb in [
+                        (x > 0).then(|| i - 1),
+                        (x + 1 < w).then(|| i + 1),
+                        (y > 0).then(|| i - w),
+                        (y + 1 < h).then(|| i + w),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if cand[nb] && !residue[nb] {
+                            residue[nb] = true;
+                            q.push_back(nb);
+                        }
+                    }
+                }
+                // Hand each residue pixel to the feature layer of its nearest feature pixel; a pixel
+                // whose receiving layer is not above `face` stays as drawn.
+                for (i, r) in residue.iter_mut().enumerate() {
+                    if !*r {
+                        continue;
+                    }
+                    let up = if feat_src[i] == u32::MAX { -1 } else { owner[feat_src[i] as usize] };
+                    if up > fi as i32 {
+                        overlays[up as usize].push((i, pix_rgb(rgba_product, i), fvis[i]));
+                    } else {
+                        *r = false;
+                    }
+                }
+                face_residue = residue;
+            }
+        }
+        // Overlay texels join the receiving layer's `fillMask` (fill stays disjoint from its own
+        // visible mask: the pixel belongs to a lower layer's visible mask).
+        for (up, list) in overlays.iter().enumerate() {
+            if list.is_empty() {
+                continue;
+            }
+            for &(i, _, a) in list {
+                debug_assert_eq!(final_visible_masks[up][i], 0);
+                fill_masks[up][i] = fill_masks[up][i].max(a.max(1));
+            }
+            if fill_kinds[up] == "none" {
+                fill_kinds[up] = "template".to_string();
+            }
+        }
+    }
+    let no_plan = vec![-1i32; n];
     let mut textures = Vec::with_capacity(final_len);
+    let mut fill_regions: Vec<Option<RegionReport>> = Vec::with_capacity(final_len);
     for layer_idx in 0..final_len {
         let id = final_layer_ids[layer_idx].as_str();
         let eff_nonzero = final_visible_masks[layer_idx]
@@ -5916,6 +6186,7 @@ pub fn synthesize_template_bank_for_stage(
             .any(|(&v, &f)| v > 0 || f > 0);
         if !eff_nonzero {
             textures.push(None);
+            fill_regions.push(None);
             continue;
         }
 
@@ -5938,11 +6209,98 @@ pub fn synthesize_template_bank_for_stage(
             None => (&final_visible_masks[layer_idx], &fill_masks[layer_idx]),
         };
 
-        let is_mannequin_stage = stage == "base_silhouette";
+        // T9: region type from this layer's clean inner seeds, and the palette / local field that
+        // colours its hidden texels (field-coloured layers only; eyes / mouth / brows keep their
+        // structured branches and are typed by role).
+        let role_kind = role_kind_of(id);
+        let field_layer = !is_mannequin_stage
+            && role_kind.is_none()
+            && !id.starts_with("eye")
+            && !id.starts_with("mouth")
+            && id != "face_detail";
+        let seed_excl = seed_excl_of(id);
+        // Hidden texels for analysis / synthesis exclude this layer's overlay texels (they carry
+        // the original seam pixels and are not synthesized).
+        let overlay_list = &overlays[layer_idx];
+        let hidden_no_overlay: Option<Vec<u8>> = (!overlay_list.is_empty()).then(|| {
+            let mut f = m_fill.clone();
+            for &(i, _, _) in overlay_list {
+                f[i] = 0;
+            }
+            f
+        });
+        let m_hidden: &[u8] = hidden_no_overlay.as_deref().unwrap_or(m_fill);
+        let mut own_rim: Option<region_fill::LayerRegion> = None;
+        let mut region = match (&held_masks, pre_regions[layer_idx].take()) {
+            (None, Some(r)) => r,
+            _ => region_fill::analyze_layer(&region_fill::LayerInput {
+                rgba,
+                lab: &img_lab,
+                w,
+                h,
+                vis: m_vis,
+                hidden: m_hidden,
+                exclude: seed_excl,
+                band_radius,
+                role_kind,
+            }),
+        };
+        let has_hidden = m_hidden.iter().any(|&v| v > 0);
+        // Hair layers are typed and filled from the hair class (all hair layers' clean seeds next
+        // to this layer's hidden area): back hair under side locks continues the neighbouring
+        // strands' colour, not only its own few visible pixels.
+        if field_layer && has_hidden && id.starts_with("hair_") {
+            let class_region = region_fill::analyze_layer(&region_fill::LayerInput {
+                rgba,
+                lab: &img_lab,
+                w,
+                h,
+                vis: &hair_class_vis,
+                hidden: m_hidden,
+                exclude: Some(&hair_seed_excl),
+                band_radius,
+                role_kind,
+            });
+            let own_rim_seeds = std::mem::replace(&mut region, class_region);
+            region.report.field_source = "class".into();
+            // Rim decontamination still uses this layer's own nearest clean colour.
+            own_rim = Some(own_rim_seeds);
+        }
+        // Own palette / local field: always for layers whose class field is not their own colour
+        // (neck, body: face skin + drawn shading) or that have none (wearables), and for clothes;
+        // for face / hair only when the palette snaps (cel level set) — otherwise their existing
+        // harmonic class field (same local scheme, wider seed set) is kept.
+        let own_field_preferred = !(id == "face" || id.starts_with("hair_"));
+        let filler = if field_layer && has_hidden {
+            region_fill::RegionFiller::new(&region, rgba, w, h)
+                .filter(|f| f.snapped() || own_field_preferred)
+        } else {
+            None
+        };
+        region.report.synth = if !has_hidden {
+            "none".into()
+        } else if let Some(f) = &filler {
+            if f.snapped() { "palette_levelset" } else { "local_field" }.into()
+        } else if field_layer {
+            "class_field".into()
+        } else {
+            "procedural".into()
+        };
+        if field_layer && has_hidden && filler.is_none() {
+            region.report.field_source = "class".into();
+        }
+        let mut feature_residue_px = 0usize;
         match id {
             "face" => {
                 // In Stage 1 (`base_silhouette`), emit pure spotless SD/LD bald head mannequin skin.
                 // In stacked/full runs, keep clean visible non-speck skin while `m_fill` underneath eyes/brows/blush/bangs stays canonical smooth skin.
+                let face_clean = |x: usize, y: usize| -> [u8; 3] {
+                    filler.as_ref().map_or_else(|| skin_field.sample(x, y), |f| f.color_at(x, y))
+                };
+                // T9 item 2: eye / brow / mouth line residue (planned before the texture loop on
+                // the product partition) is covered with the inner skin field here; its original
+                // colour went to the feature layer as overlay texels.
+                let feature_residue: &[bool] = &face_residue;
                 for y in 0..h {
                     for x in 0..w {
                         let i = y * w + x;
@@ -5954,7 +6312,7 @@ pub fn synthesize_template_bank_for_stage(
                         let clean = if is_mannequin_stage {
                             lerp_rgb(ev.palette.skin_base, skin_field.sample(x, y), 0.25)
                         } else {
-                            skin_field.sample(x, y)
+                            face_clean(x, y)
                         };
                         let forehead_t = smoothstep(
                             er_v.min(el_v) - er_ry * 0.85,
@@ -5993,13 +6351,20 @@ pub fn synthesize_template_bank_for_stage(
                                 || ev_mouth_all[i]
                                 || ev_brow_r[i]
                                 || ev_brow_l[i];
+                            let is_feature_residue = feature_residue.get(i).copied().unwrap_or(false);
+                            if is_feature_residue {
+                                feature_residue_px += 1;
+                            }
                             if !is_orphan_cavity_speck
                                 && !is_forehead_hair_speck
+                                && !is_feature_residue
                                 && (!explicit_face_override || (!is_hole_feature && ev_face[i]))
                             {
                                 orig_rgb
                             } else {
-                                smooth_clean
+                                // Visible replacement: the clean local skin colour itself (no
+                                // forehead shading lerp, which is for hidden texels).
+                                if is_feature_residue { clean } else { smooth_clean }
                             }
                         };
                         let k = i * 4;
@@ -6064,7 +6429,12 @@ pub fn synthesize_template_bank_for_stage(
                         };
                         let side_shade = (u.abs() / (eye_dist * 0.35)).clamp(0.0, 1.0) * 0.14;
                         let chin_shade = 0.56 * under_chin * (1.0 - (u.abs() / eye_dist).min(0.55));
-                        let smooth_neck = lerp_rgb(base, ev.palette.skin_shadow, (chin_shade + side_shade).min(0.68));
+                        // T9: with enough own seeds the neck's visible shading (chin shadow) is
+                        // extended by its own local field instead of face skin + a drawn shadow.
+                        let smooth_neck = match &filler {
+                            Some(f) => f.color_at(x, y),
+                            None => lerp_rgb(base, ev.palette.skin_shadow, (chin_shade + side_shade).min(0.68)),
+                        };
                         let rgb = if !is_mannequin_stage && m_vis[i] > 0 && !is_hair_speck {
                             orig
                         } else {
@@ -6095,7 +6465,10 @@ pub fn synthesize_template_bank_for_stage(
                         };
                         let vert_t = smoothstep(torso_top, torso_bot, v) * 0.12;
                         let side_t = ((u - ev.torso_cx_u).abs() / (eye_dist * 1.8).max(1.0)).clamp(0.0, 1.0) * 0.10;
-                        let clean_body = lerp_rgb(base, ev.palette.skin_shadow, (vert_t + side_t).min(0.30));
+                        let clean_body = match &filler {
+                            Some(f) => f.color_at(x, y),
+                            None => lerp_rgb(base, ev.palette.skin_shadow, (vert_t + side_t).min(0.30)),
+                        };
                         let rgb = if !is_mannequin_stage && m_vis[i] > 0 {
                             let k = i * 4;
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
@@ -6121,7 +6494,9 @@ pub fn synthesize_template_bank_for_stage(
                         let rgb = if m_vis[i] > 0 {
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
                         } else {
-                            clothes_field.sample(x, y)
+                            filler
+                                .as_ref()
+                                .map_or_else(|| clothes_field.sample(x, y), |f| f.color_at(x, y))
                         };
                         tex[k] = rgb[0];
                         tex[k + 1] = rgb[1];
@@ -6143,6 +6518,10 @@ pub fn synthesize_template_bank_for_stage(
                         let rgb = if m_vis[i] > 0 && !is_front_overridden {
                             let k = i * 4;
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
+                        } else if let Some(f) = filler.as_ref().filter(|_| m_vis[i] == 0) {
+                            // T9: this hair layer's own seeds (its own shading next to the hidden
+                            // area) instead of the shared hair field + drawn neck shade.
+                            f.color_at(x, y)
                         } else {
                             let base = hair_field.sample(x, y);
                             if behind_neck_tint && m_fill[i] > 0 {
@@ -6466,7 +6845,8 @@ pub fn synthesize_template_bank_for_stage(
             }
             _ => {
                 // Extracted wearable sub-layers (`hat`, `acc_*`, `clothes_*`): preserve original RGBA + fill occluded `hat` behind ribbons cleanly.
-                let hat_field = if id == "hat" && m_fill.iter().any(|&v| v > 0) {
+                let mut wear_mean: Option<[u8; 3]> = None;
+                let hat_field = if filler.is_none() && id == "hat" && m_fill.iter().any(|&v| v > 0) {
                     let hat_vis_b: Vec<bool> = m_vis.iter().map(|&v| v > 0).collect();
                     let hat_eroded = erode_mask(&hat_vis_b, w, h, 2);
                     let mut hat_seeds = vec![false; n];
@@ -6506,14 +6886,31 @@ pub fn synthesize_template_bank_for_stage(
                             continue;
                         }
                         let k = i * 4;
-                        let rgb = if let Some(ref hf) = hat_field {
-                            if m_vis[i] == 0 {
-                                hf.sample(x, y)
-                            } else {
-                                [rgba[k], rgba[k + 1], rgba[k + 2]]
-                            }
-                        } else {
+                        // T9: hidden texels never copy the source pixel there (that is the
+                        // occluding layer's colour); own palette / local field first.
+                        let rgb = if m_vis[i] > 0 {
                             [rgba[k], rgba[k + 1], rgba[k + 2]]
+                        } else if let Some(f) = &filler {
+                            f.color_at(x, y)
+                        } else if let Some(ref hf) = hat_field {
+                            hf.sample(x, y)
+                        } else {
+                            *wear_mean.get_or_insert_with(|| {
+                                let (mut s, mut c) = ([0u64; 3], 0u64);
+                                for (j, &mv) in m_vis.iter().enumerate() {
+                                    if mv >= 128 {
+                                        let p = pix_rgb(rgba, j);
+                                        for ch in 0..3 {
+                                            s[ch] += p[ch] as u64;
+                                        }
+                                        c += 1;
+                                    }
+                                }
+                                match (s[0].checked_div(c), s[1].checked_div(c), s[2].checked_div(c)) {
+                                    (Some(r), Some(g), Some(b)) => [r as u8, g as u8, b as u8],
+                                    _ => pix_rgb(rgba, i),
+                                }
+                            })
                         };
                         tex[k] = rgb[0];
                         tex[k + 1] = rgb[1];
@@ -6523,6 +6920,26 @@ pub fn synthesize_template_bank_for_stage(
                 }
             }
         }
+
+        // T9 item 1: clean the outer visible rim (background halo, the upper layer's outline,
+        // neighbour-colour mixtures) with the nearest clean inner seed colour BEFORE padding, so the
+        // 2px pad spreads clean colour. Only `flat_cel` layers: structured (`semantic`), stroke
+        // (`line`) and `texture` layers keep their rim (line art / pattern is the content).
+        if !is_mannequin_stage && region.kind() == RegionKind::FlatCel {
+            let rim_region = own_rim.as_ref().unwrap_or(&region);
+            let plan = rim_plans[layer_idx].as_deref().unwrap_or(&no_plan);
+            region.report.rim =
+                region_fill::decontaminate_rim(&mut tex, m_vis, layer_idx, rim_region, &rim_ctx, Some(plan)).0;
+        }
+        // Overlay texels received from lower rims: the original seam colour (rest pose unchanged).
+        for &(i, c, _) in overlay_list {
+            let k = i * 4;
+            tex[k..k + 3].copy_from_slice(&c);
+            tex[k + 3] = 255;
+        }
+        region.report.rim.overlay_px = overlay_list.len();
+        region.report.rim.feature_residue = feature_residue_px;
+        fill_regions.push(Some(region.report));
 
         // Pad 2px halo with opaque nearest texel color so downstream mesh sampling never pulls black transparent zero RGB!
         pad_texture_rgb(&mut tex, m_vis, m_fill, w, h);
@@ -6572,6 +6989,7 @@ pub fn synthesize_template_bank_for_stage(
         masks: final_visible_masks,
         fill_masks,
         fill_kinds,
+        fill_regions,
         textures,
         provenances,
         confidences,
@@ -7752,12 +8170,102 @@ mod tests {
                 }
             }
         }
-        for i in 0..n {
-            if rgba[i * 4 + 3] > 0 {
-                let k = i * 4;
-                assert_eq!(comp[k..k + 3], rgba[k..k + 3], "Rest-pose pixel altered at index {i}");
+        // T9: only the outer `RIM_PX` rim of a layer may be decontaminated (texture colour only);
+        // every other rest-pose pixel is preserved exactly, and every change is counted in a rim
+        // report (masks are untouched — the partition is compared elsewhere).
+        let mut owner = vec![-1i32; n];
+        for (li, m) in out.masks.iter().enumerate() {
+            for i in 0..n {
+                if m[i] > 0 {
+                    owner[i] = li as i32;
+                }
             }
         }
+        let mut changed = 0usize;
+        for i in 0..n {
+            if rgba[i * 4 + 3] == 0 {
+                continue;
+            }
+            let k = i * 4;
+            if comp[k..k + 3] == rgba[k..k + 3] {
+                continue;
+            }
+            changed += 1;
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            let near_seam = (-2..=2i64).any(|dy| {
+                (-2..=2i64).any(|dx| {
+                    dx.abs() + dy.abs() <= region_fill::RIM_PX as i64 && {
+                        let (nx, ny) = (x + dx, y + dy);
+                        nx < 0
+                            || ny < 0
+                            || nx >= w as i64
+                            || ny >= h as i64
+                            || owner[ny as usize * w + nx as usize] != owner[i]
+                    }
+                })
+            });
+            assert!(near_seam, "rest-pose pixel altered away from any seam at index {i}");
+        }
+        let reported: usize = out
+            .fill_regions
+            .iter()
+            .flatten()
+            .map(|r| {
+                r.rim.background_halo + r.rim.upper_line + r.rim.upper_mix + r.rim.lower_mix + r.rim.feature_residue
+            })
+            .sum();
+        assert!(changed <= reported, "{changed} rest pixels changed but only {reported} reported");
+
+        // T9 overlay: what the renderer draws at rest (effective `mask ∪ fillMask`, bottom → top)
+        // keeps every seam pixel handed to the upper layer (outline half, upper-side mixture, face
+        // feature residue). Only background halos and the upper layer's own rim mixtures may differ.
+        let mut rest = vec![0u8; n * 4];
+        for (idx, tex_opt) in out.textures.iter().enumerate() {
+            let Some(data_url) = tex_opt else {
+                continue;
+            };
+            let raw = STANDARD.decode(data_url.strip_prefix("data:image/png;base64,").unwrap()).unwrap();
+            let tex = image::load_from_memory(&raw).unwrap().to_rgba8();
+            for i in 0..n {
+                if out.masks[idx][i] > 0 || out.fill_masks[idx][i] > 0 {
+                    rest[i * 4..i * 4 + 3].copy_from_slice(&tex.as_raw()[i * 4..i * 4 + 3]);
+                }
+            }
+        }
+        let rest_changed = (0..n)
+            .filter(|&i| rgba[i * 4 + 3] > 0 && rest[i * 4..i * 4 + 3] != rgba[i * 4..i * 4 + 3])
+            .count();
+        let allowed: usize = out
+            .fill_regions
+            .iter()
+            .flatten()
+            .map(|r| r.rim.background_halo + r.rim.lower_mix)
+            .sum();
+        assert!(rest_changed <= allowed, "{rest_changed} rest-render pixels changed, only {allowed} halo / lower-mix allowed");
+        // Overlay texels lie over a lower layer's visible pixel, never over the layer's own mask.
+        let mut vis_owner = vec![-1i32; n];
+        for (li, m) in out.masks.iter().enumerate() {
+            for i in 0..n {
+                if m[i] > 0 {
+                    vis_owner[i] = li as i32;
+                }
+            }
+        }
+        for (f, m) in out.fill_masks.iter().zip(&out.masks) {
+            assert!(f.iter().zip(m).all(|(&fv, &mv)| !(fv > 0 && mv > 0)), "fill overlaps own mask");
+        }
+        let overlay_total: usize = out.fill_regions.iter().flatten().map(|r| r.rim.overlay_px).sum();
+        let handed_up: usize = out
+            .fill_regions
+            .iter()
+            .flatten()
+            .map(|r| r.rim.upper_line + r.rim.upper_mix + r.rim.feature_residue)
+            .sum();
+        assert_eq!(overlay_total, handed_up, "every handed-up seam pixel is an overlay texel of the upper layer");
+        let overlay_fill = (0..out.fill_masks.len())
+            .map(|li| (0..n).filter(|&i| out.fill_masks[li][i] > 0 && vis_owner[i] >= 0 && (vis_owner[i] as usize) < li).count())
+            .sum::<usize>();
+        assert!(overlay_fill >= overlay_total);
     }
 
     #[test]

@@ -43,6 +43,8 @@ import {
 import type {
   BlendMode,
   FillKind,
+  FillRegion,
+  FillSynth,
   HairRole,
   LandmarkId,
   LandmarkProvenance,
@@ -178,6 +180,41 @@ function countStyleOverrides(sel?: TemplateStyleSelection): number {
 }
 
 type AppTab = "prepare" | "expressions" | "adjust" | "play" | "advanced";
+
+/** T9: region type label (absent = unclassified, e.g. browser diffusion draft or pre-T9 project). */
+function fillRegionLabel(r?: FillRegion): string {
+  switch (r) {
+    case "flat_cel":
+      return "평면/셀";
+    case "line":
+      return "선화";
+    case "texture":
+      return "질감";
+    case "semantic":
+      return "구조(의미)";
+    default:
+      return "미분류";
+  }
+}
+/** T9: hidden-colour synthesis label; the browser fallback is a lower-quality diffusion draft. */
+function fillSynthLabel(s?: FillSynth): string {
+  switch (s) {
+    case "palette_levelset":
+      return "팔레트 레벨셋(셀 경계 연장)";
+    case "local_field":
+      return "내측 시드 국소 필드";
+    case "class_field":
+      return "부위 공용 국소 필드";
+    case "procedural":
+      return "부위 전용 합성(눈·입·눈썹)";
+    case "diffusion":
+      return "확산 초안(브라우저/저품질, 유형 미분류)";
+    case "none":
+      return "숨은 영역 없음";
+    default:
+      return "알 수 없음(T9 이전 결과)";
+  }
+}
 
 export default function App() {
   const [project, setProject] = useState<Project | null>(null),
@@ -1423,6 +1460,8 @@ export default function App() {
                 ...t,
                 fillMask: result.fillMask,
                 fillKind: result.fillKind,
+                fillRegion: result.fillRegion,
+                fillSynth: result.fillSynth,
                 texture,
                 generated: true,
                 status: "draft",
@@ -1450,7 +1489,13 @@ export default function App() {
     void task("얼굴·목·뒷머리 가림 영역 일괄 보완 중", async (signal) => {
       const updates = new Map<
         string,
-        { fillMask: Uint8Array; fillKind: FillKind; texture: string }
+        {
+          fillMask: Uint8Array;
+          fillKind: FillKind;
+          fillRegion?: FillRegion;
+          fillSynth?: FillSynth;
+          texture: string;
+        }
       >();
       for (const target of targets) {
         signal.throwIfAborted();
@@ -1473,6 +1518,8 @@ export default function App() {
         updates.set(target.id, {
           fillMask: result.fillMask,
           fillKind: result.fillKind,
+          fillRegion: result.fillRegion,
+          fillSynth: result.fillSynth,
           texture,
         });
       }
@@ -1486,6 +1533,8 @@ export default function App() {
                 ...t,
                 fillMask: u.fillMask,
                 fillKind: u.fillKind,
+                fillRegion: u.fillRegion,
+                fillSynth: u.fillSynth,
                 texture: u.texture,
                 generated: true,
                 status: t.status === "approved" ? "approved" : "draft",
@@ -1503,6 +1552,8 @@ export default function App() {
     patchPart({
       fillMask: undefined,
       fillKind: "none",
+      fillRegion: undefined,
+      fillSynth: undefined,
       texture: undefined,
       generated: false,
       status: "draft",
@@ -1528,6 +1579,8 @@ export default function App() {
         mask,
         fillMask: undefined,
         fillKind: "external",
+        fillRegion: undefined,
+        fillSynth: undefined,
         provenance: "manual",
         texture: replacement.source,
         generated: true,
@@ -3046,6 +3099,14 @@ export default function App() {
                             보완·{part.fillKind === "external" ? "외부PNG" : "인접외삽"}
                           </span>
                         )}
+                        {part.fillMask && part.fillKind !== "external" && (
+                          <span
+                            className={`prov-chip ${part.fillSynth === "diffusion" || !part.fillRegion ? "prov-danger" : "prov-estimated"}`}
+                            title={fillSynthLabel(part.fillSynth)}
+                          >
+                            유형·{fillRegionLabel(part.fillRegion)}
+                          </span>
+                        )}
                         {part.diagnostics?.map((diag) => (
                           <span key={diag} className="prov-chip prov-danger">
                             {diagnosticLabel(diag)}
@@ -3231,6 +3292,10 @@ export default function App() {
                               <strong>가림 보완({part.fillKind ?? "neighbor"})</strong>{" "}
                               가시 마스크와 분리 저장됨
                             </div>
+                            <small>
+                              영역 유형: {fillRegionLabel(part.fillRegion)} · 숨은 색 합성:{" "}
+                              {fillSynthLabel(part.fillSynth)}
+                            </small>
                             {(part.id.startsWith("eye") ||
                               part.id.startsWith("mouth") ||
                               part.id.startsWith("hair")) && (
