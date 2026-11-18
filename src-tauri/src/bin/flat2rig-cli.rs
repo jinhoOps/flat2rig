@@ -274,6 +274,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut rest_gate = true;
     let mut eval = EvalOptions::default();
     let mut from_layers: Option<PathBuf> = None;
+    let mut pose_renders = false;
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -305,6 +306,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else if arg == "--lineart-no-rest-gate" {
             // T15 measurement only: synthesized lines without the bit-exact rest composite gate.
             rest_gate = false;
+        } else if arg == "--pose-renders" {
+            // Envelope extremes rendered with the motion-preview rasterizer (`poses/`).
+            pose_renders = true;
         } else if arg == "--no-lineart" {
             // T15 baseline (measurement only): hidden texels keep the T9 colour layer, no
             // synthesized line layer.
@@ -335,7 +339,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
-    const USAGE: &str = "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--legacy-eye] [--no-lineart] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --from-layers LAYER_DIR [--uncoupled] [--legacy-eye] OUTPUT_DIR [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]";
+    const USAGE: &str = "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--legacy-eye] [--no-lineart] [--pose-renders] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --from-layers LAYER_DIR [--uncoupled] [--legacy-eye] [--pose-renders] OUTPUT_DIR [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]";
     let input = if let Some(dir) = from_layers {
         // Finished part layers: segmentation and hidden-area synthesis do not run, so the flags
         // that only steer them (or re-run them for evaluation) do not apply.
@@ -351,6 +355,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             source: PartSource::Layers(dir),
             output: positional[0],
             landmarks: positional.get(1).copied(),
+            pose_renders,
         }
     } else {
         if positional.len() < 2 {
@@ -363,6 +368,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
             output: positional[1],
             landmarks: positional.get(3).copied(),
+            pose_renders,
         }
     };
     core::with_legacy_eye_rig(legacy_eye, || {
@@ -387,6 +393,79 @@ struct PipelineInput<'a> {
     source: PartSource<'a>,
     output: &'a str,
     landmarks: Option<&'a str>,
+    /// Write `poses/` (`POSE_RENDERS`); off by default so the default run's outputs are unchanged.
+    pose_renders: bool,
+}
+
+/// Envelope poses rendered by `--pose-renders`: the range extremes of head / body / hair / eyes /
+/// mouth, head-body opposite and same-direction turns, and hair phase extremes. Never narrowed to
+/// hide a defect.
+const POSE_RENDERS: &[&str] = &[
+    "rest",
+    "angleX=-30",
+    "angleX=30",
+    "angleY=-30",
+    "angleY=30",
+    "angleZ=-30",
+    "angleZ=30",
+    "opp:angleX+/bodyX-",
+    "opp:angleX-/bodyX+",
+    "opp:angleY+/bodyY-",
+    "opp:angleY-/bodyY+",
+    "opp:angleZ+/bodyZ-",
+    "opp:angleZ-/bodyZ+",
+    "same3:head+--/breath1",
+    "same3:head--+/breath1",
+    "hair=-1",
+    "hair=1",
+    "hairSide=-1",
+    "hairSide=1",
+    "hairBack=-1",
+    "hairBack=1",
+    "hairSign:+++",
+    "hairSign:---",
+    "headHairBody:head+-/hair-",
+    "headHairBody:head--/hair+",
+    "seal:closed/gaze:00",
+    "eyesClosedSmile",
+    "mouth=1",
+    "mouthOpen/form+",
+];
+
+/// `--pose-renders`: each `POSE_RENDERS` envelope pose drawn like the motion previews
+/// (`draw_deformed_part`, every layer bottom → top) into `poses/<pose>.png`.
+#[allow(clippy::too_many_arguments)]
+fn render_pose_set(
+    output: &std::path::Path,
+    ids: &[String],
+    meshes: &[core::Mesh],
+    textures: &[Vec<u8>],
+    landmarks: &core::Landmarks,
+    w: u32,
+    h: u32,
+    env: &[seams::EnvelopePose],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let dir = output.join("poses");
+    std::fs::create_dir_all(&dir)?;
+    let mut rows = Vec::new();
+    for &name in POSE_RENDERS {
+        let pe = env
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| format!("pose envelope has no '{name}'"))?;
+        let mut buf = image::RgbaImage::new(w, h);
+        for ((id, mesh), tex) in ids.iter().zip(meshes).zip(textures) {
+            let tex = image::RgbaImage::from_raw(w, h, tex.clone()).ok_or("pose texture size mismatch")?;
+            draw_deformed_part(&mut buf, &tex, mesh, id, landmarks, &pe.pose);
+        }
+        let file = format!(
+            "{}.png",
+            name.replace([':', '/', '='], "_").replace('+', "p").replace('-', "m")
+        );
+        buf.save(dir.join(&file))?;
+        rows.push(json!({ "pose": name, "group": pe.group, "file": format!("poses/{file}") }));
+    }
+    Ok(serde_json::Value::Array(rows))
 }
 
 /// T14 evaluation flags. Both off = the product run (outputs unchanged, no `fidelity` key).
@@ -1221,6 +1300,18 @@ fn run_pipeline(
         "elapsedMs": start.elapsed().as_millis(),
         "engine": "Rust / ort / delaunator / glam"
     });
+    if input.pose_renders {
+        stats["poseRenders"] = render_pose_set(
+            &output,
+            &proposed.part_ids,
+            &part_meshes,
+            &layer_textures,
+            &landmarks,
+            w,
+            h,
+            env,
+        )?;
+    }
     stats["lineart"] = lineart_outputs(
         &output,
         &proposed,
