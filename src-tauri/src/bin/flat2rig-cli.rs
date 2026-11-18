@@ -10,7 +10,7 @@ use flat2rig_lib::analysis::{
     templates::{with_eval_holdout, TemplateStyleSelection},
 };
 use flat2rig_lib::core;
-use flat2rig_lib::rig::{exposure, eye_seal, fidelity, seams};
+use flat2rig_lib::rig::{exposure, eye_seal, fidelity, raster, seams};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -33,63 +33,19 @@ fn alpha_blend_layer(dst: &mut image::RgbaImage, src: &image::RgbaImage) {
     }
 }
 
-fn draw_deformed_part(
-    dst: &mut image::RgbaImage,
-    src_tex: &image::RgbaImage,
-    mesh: &core::Mesh,
-    id: &str,
+/// One pose of the rig drawn by the shared renderer (`rig::raster`, the app WebGL rules).
+#[allow(clippy::too_many_arguments)]
+fn render_rig_pose(
+    ids: &[String],
+    meshes: &[core::Mesh],
+    textures: &[raster::Texture],
+    clip: &[Option<usize>],
     lm: &core::Landmarks,
     pose: &core::Pose,
-) {
-    let (w, h) = (dst.width() as i32, dst.height() as i32);
-    let src_raw = src_tex.as_raw();
-    let stride = dst.width() as usize;
-    let dst_raw = dst.as_mut();
-
-    for tri in mesh.triangles.as_chunks::<3>().0 {
-        let s0 = mesh.vertices[tri[0]];
-        let s1 = mesh.vertices[tri[1]];
-        let s2 = mesh.vertices[tri[2]];
-        let d0 = core::deform(s0, id, lm, pose);
-        let d1 = core::deform(s1, id, lm, pose);
-        let d2 = core::deform(s2, id, lm, pose);
-
-        let denom = (d1.y - d2.y) * (d0.x - d2.x) + (d2.x - d1.x) * (d0.y - d2.y);
-        if denom.abs() < 1e-4 {
-            continue;
-        }
-        let min_x = d0.x.min(d1.x).min(d2.x).floor().max(0.0) as i32;
-        let max_x = d0.x.max(d1.x).max(d2.x).ceil().min((w - 1) as f64) as i32;
-        let min_y = d0.y.min(d1.y).min(d2.y).floor().max(0.0) as i32;
-        let max_y = d0.y.max(d1.y).max(d2.y).ceil().min((h - 1) as f64) as i32;
-
-        for y in min_y..=max_y {
-            let py = y as f64 + 0.5;
-            for x in min_x..=max_x {
-                let px = x as f64 + 0.5;
-                let w0 = ((d1.y - d2.y) * (px - d2.x) + (d2.x - d1.x) * (py - d2.y)) / denom;
-                let w1 = ((d2.y - d0.y) * (px - d2.x) + (d0.x - d2.x) * (py - d2.y)) / denom;
-                let w2 = 1.0 - w0 - w1;
-                if w0 < -1e-3 || w1 < -1e-3 || w2 < -1e-3 {
-                    continue;
-                }
-                let sx = (w0 * s0.x + w1 * s1.x + w2 * s2.x).floor() as i32;
-                let sy = (w0 * s0.y + w1 * s1.y + w2 * s2.y).floor() as i32;
-                if sx < 0 || sy < 0 || sx >= w || sy >= h {
-                    continue;
-                }
-                let si = (sy as usize * stride + sx as usize) * 4;
-                if src_raw[si + 3] <= 2 {
-                    continue;
-                }
-                let di = (y as usize * stride + x as usize) * 4;
-                core::blend_straight_pixel(
-                    &mut dst_raw[di..di + 4],
-                    [src_raw[si], src_raw[si + 1], src_raw[si + 2], src_raw[si + 3]],
-                );
-            }
-        }
-    }
+    w: u32,
+    h: u32,
+) -> image::RgbaImage {
+    raster::render_pose(ids, meshes, textures, clip, lm, pose, w as usize, h as usize).to_image()
 }
 
 fn main() {
@@ -433,13 +389,14 @@ const POSE_RENDERS: &[&str] = &[
 ];
 
 /// `--pose-renders`: each `POSE_RENDERS` envelope pose drawn like the motion previews
-/// (`draw_deformed_part`, every layer bottom → top) into `poses/<pose>.png`.
+/// (`render_rig_pose`: shared `rig::raster` renderer, app WebGL rules) into `poses/<pose>.png`.
 #[allow(clippy::too_many_arguments)]
 fn render_pose_set(
     output: &std::path::Path,
     ids: &[String],
     meshes: &[core::Mesh],
-    textures: &[Vec<u8>],
+    textures: &[raster::Texture],
+    clip: &[Option<usize>],
     landmarks: &core::Landmarks,
     w: u32,
     h: u32,
@@ -453,11 +410,7 @@ fn render_pose_set(
             .iter()
             .find(|p| p.name == name)
             .ok_or_else(|| format!("pose envelope has no '{name}'"))?;
-        let mut buf = image::RgbaImage::new(w, h);
-        for ((id, mesh), tex) in ids.iter().zip(meshes).zip(textures) {
-            let tex = image::RgbaImage::from_raw(w, h, tex.clone()).ok_or("pose texture size mismatch")?;
-            draw_deformed_part(&mut buf, &tex, mesh, id, landmarks, &pe.pose);
-        }
+        let buf = render_rig_pose(ids, meshes, textures, clip, landmarks, &pe.pose, w, h);
         let file = format!(
             "{}.png",
             name.replace([':', '/', '='], "_").replace('+', "p").replace('-', "m")
@@ -1039,8 +992,6 @@ fn run_pipeline(
             },
         ),
     ];
-    let mut motion_buffers: Vec<image::RgbaImage> =
-        (0..motion_poses.len()).map(|_| image::RgbaImage::new(w, h)).collect();
     let mut part_meshes: Vec<core::Mesh> = Vec::with_capacity(proposed.part_ids.len());
     let mut layer_textures: Vec<Vec<u8>> = Vec::with_capacity(proposed.part_ids.len());
 
@@ -1093,9 +1044,6 @@ fn run_pipeline(
 
         let mesh = core::art_mesh_for_part(&effective, w as usize, h as usize, 14, id, &landmarks);
         let quality = core::check_mesh_quality(&mesh, &effective, w as usize, h as usize, id, &landmarks);
-        for (buf, (_, pose)) in motion_buffers.iter_mut().zip(motion_poses.iter()) {
-            draw_deformed_part(buf, &eff_part, &mesh, id, &landmarks, pose);
-        }
         meshes.push(json!({"id": id, "mesh": mesh}));
         part_meshes.push(mesh);
         mesh_quality.push(quality);
@@ -1123,11 +1071,6 @@ fn run_pipeline(
         owner_img.save(output.join("owner.png"))?;
     }
     fill_only_composite.save(output.join("fill_only.png"))?;
-    for (buf, (filename, _)) in motion_buffers.iter().zip(motion_poses.iter()) {
-        buf.save(output.join(filename))?;
-    }
-    // T13b: seam contracts with coupling, numeric requirements, coverage, and the exposure map over
-    // the shared pose envelope, using the same ArtMeshes as the motion previews.
     let (wu, hu) = (w as usize, h as usize);
     let n = wu * hu;
     let fill_full: Vec<Vec<u8>> = (0..proposed.part_ids.len())
@@ -1139,6 +1082,20 @@ fn run_pipeline(
                 .unwrap_or_else(|| vec![0u8; n])
         })
         .collect();
+    // B4: motion previews (and `--pose-renders`) through the shared renderer with the app's WebGL
+    // rules — bilinear premultiplied sampling, top-left fill rule, per-frame eye/mouth opacity and
+    // the app's clipping rule.
+    let raster_textures: Vec<raster::Texture> = layer_textures
+        .iter()
+        .map(|t| raster::Texture::from_straight_rgba8(wu, hu, t))
+        .collect();
+    let clip_targets = exposure::default_clip_targets(&proposed.part_ids, &fill_full);
+    for (filename, pose) in &motion_poses {
+        render_rig_pose(&proposed.part_ids, &part_meshes, &raster_textures, &clip_targets, &landmarks, pose, w, h)
+            .save(output.join(filename))?;
+    }
+    // T13b: seam contracts with coupling, numeric requirements, coverage, and the exposure map over
+    // the shared pose envelope, using the same ArtMeshes as the motion previews.
     let fg_alpha: Vec<u8> = (0..n)
         .map(|i| proposed.masks.iter().map(|m| m[i]).max().unwrap_or(0))
         .collect();
@@ -1305,7 +1262,8 @@ fn run_pipeline(
             &output,
             &proposed.part_ids,
             &part_meshes,
-            &layer_textures,
+            &raster_textures,
+            &clip_targets,
             &landmarks,
             w,
             h,
