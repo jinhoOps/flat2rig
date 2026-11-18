@@ -860,6 +860,94 @@ async fn save_artifact(
     .await
     .map_err(|e| e.to_string())?
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PastedPathFile {
+    name: String,
+    bytes: String,
+}
+
+const PASTED_IMAGE_MAX_BYTES: u64 = 60 * 1024 * 1024;
+const PASTED_PROJECT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Validates a path pasted from the clipboard: an existing regular file whose extension is one the
+/// app opens (PNG / JPEG illustration or `.flat2rig` project) within the input size limits.
+/// Returns the file name and the size limit; never reads other file types.
+fn validate_pasted_path(path: &std::path::Path) -> Result<(String, u64), String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let limit = match ext.as_str() {
+        "png" | "jpg" | "jpeg" => PASTED_IMAGE_MAX_BYTES,
+        "flat2rig" => PASTED_PROJECT_MAX_BYTES,
+        _ => return Err("PNG, JPG 이미지 또는 .flat2rig 파일 경로만 붙여넣을 수 있습니다.".into()),
+    };
+    if !path.is_absolute() {
+        return Err("붙여넣은 경로는 전체 경로여야 합니다.".into());
+    }
+    let meta = std::fs::metadata(path).map_err(|_| "붙여넣은 경로의 파일을 찾을 수 없습니다.".to_string())?;
+    if !meta.is_file() {
+        return Err("붙여넣은 경로가 파일이 아닙니다.".into());
+    }
+    if meta.len() > limit {
+        return Err(format!(
+            "파일이 너무 큽니다(최대 {}MB).",
+            limit / (1024 * 1024)
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "파일 이름을 읽을 수 없습니다.".to_string())?
+        .to_string();
+    Ok((name, limit))
+}
+
+/// Reads a PNG / JPEG / `.flat2rig` file whose path the user pasted (Ctrl+V of a path or
+/// "Copy as path"). The webview cannot read arbitrary paths itself.
+#[tauri::command]
+async fn read_pasted_path(path: String) -> Result<PastedPathFile, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(path.trim());
+        let (name, limit) = validate_pasted_path(&p)?;
+        let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > limit {
+            return Err("파일이 너무 큽니다.".into());
+        }
+        Ok(PastedPathFile {
+            name,
+            bytes: STANDARD.encode(bytes),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod pasted_path_tests {
+    use super::validate_pasted_path;
+
+    #[test]
+    fn pasted_path_accepts_only_existing_images_and_projects() {
+        let dir = std::env::temp_dir().join(format!("flat2rig-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("art.PNG");
+        std::fs::write(&png, b"x").unwrap();
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"x").unwrap();
+        assert_eq!(validate_pasted_path(&png).unwrap().0, "art.PNG");
+        assert!(validate_pasted_path(&txt).is_err());
+        assert!(validate_pasted_path(&dir.join("missing.png")).is_err());
+        assert!(validate_pasted_path(std::path::Path::new("relative.png")).is_err());
+        let folder = dir.join("folder.png");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(validate_pasted_path(&folder).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -888,6 +976,7 @@ pub fn run() {
             fill_part,
             fill_part_occlusion,
             save_artifact,
+            read_pasted_path,
             get_model_status,
             set_model_path,
             download_model,

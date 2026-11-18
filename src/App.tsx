@@ -77,6 +77,12 @@ import {
 } from "./engine";
 import { loadImage, pixels, pixelsCanvas, readImage } from "./images";
 import {
+  clipboardFile,
+  isTextEditingTarget,
+  parseClipboardPath,
+  readClipboardPath,
+} from "./clipboard";
+import {
   analyzeFace,
   buildRig,
   cancelAnalysis,
@@ -720,6 +726,42 @@ export default function App() {
       notify(res.message);
     });
   };
+  /** Routes one dropped or pasted file to the project or illustration loader. */
+  const openIncomingFile = (file: File) => {
+    if (/\.flat2rig$/i.test(file.name)) {
+      openProjectFile(file);
+      return;
+    }
+    if (
+      !/^image\/(png|jpeg)$/.test(file.type) &&
+      !/\.(png|jpe?g)$/i.test(file.name)
+    ) {
+      setError("PNG, JPG 이미지 또는 .flat2rig 파일만 불러올 수 있습니다.");
+      return;
+    }
+    openImage(file);
+  };
+  const pasteRef = useRef<(e: ClipboardEvent) => void>(() => {});
+  pasteRef.current = (e: ClipboardEvent) => {
+    if (busy || modal || isTextEditingTarget(e.target)) return;
+    const file = clipboardFile(e.clipboardData);
+    if (file) {
+      e.preventDefault();
+      openIncomingFile(file);
+      return;
+    }
+    const path = parseClipboardPath(e.clipboardData?.getData("text/plain") ?? "");
+    if (!path) return;
+    e.preventDefault();
+    void readClipboardPath(path)
+      .then(openIncomingFile)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => pasteRef.current(e);
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, []);
   const generate = (
     overrideMode?: "detail" | "parent",
     overrideStyles?: TemplateStyleSelection,
@@ -1705,19 +1747,7 @@ export default function App() {
           setError("PNG, JPG 이미지 또는 .flat2rig 파일 한 개를 놓으세요.");
           return;
         }
-        const file = files[0];
-        if (/\.flat2rig$/i.test(file.name)) {
-          openProjectFile(file);
-          return;
-        }
-        if (
-          !/^image\/(png|jpeg)$/.test(file.type) &&
-          !/\.(png|jpe?g)$/i.test(file.name)
-        ) {
-          setError("PNG, JPG 이미지 또는 .flat2rig 파일만 불러올 수 있습니다.");
-          return;
-        }
-        openImage(file);
+        openIncomingFile(files[0]);
       }}
     >
       {dragging && (
@@ -2362,7 +2392,9 @@ export default function App() {
                   <BrandLoop />
                   <h1>일러스트 가져오기</h1>
                   <p>
-                    PNG 또는 JPG 파일 한 장을 끌어 놓으세요.
+                    PNG 또는 JPG 파일 한 장을 끌어 놓거나 Ctrl+V로 붙여넣으세요.
+                    <br />
+                    (복사한 이미지 · 파일 · 파일 경로)
                     <br />
                     정면 캐릭터 흉상 (일반 LD · SD 치비) · 최대 2,048px
                   </p>
