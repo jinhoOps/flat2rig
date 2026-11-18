@@ -144,7 +144,7 @@
 | 3 | T14 | 원본감 평가 하네스(정답 PSD·자기 지도 홀드아웃) | 구현·기준선 기록(CLI `--eval-holdout`/`--eval-truth`, `stats.json` `fidelity`, 원화 3종 홀드아웃 + Himikan 정답 비교 수치·비교 이미지, 기본 실행 출력 불변 확인, 테스트 통과; 임계값 미정 → 판정 없음, Windows 앱 `미검증`) | 합성기를 바꾸기 전에 현 기준선을 측정해야 개선을 판정할 수 있음 |
 | 4 | T9 | 경계 후광 제거·영역 유형 분류(`fillRegion`)·`flat/cel` 팔레트 필드 | 구현 · 부분 충족(`cargo test` 63/63, `clippy`, `npm test` 45/45, `tsc` 통과; 원화 3종 + Himikan 정답 전/후 수치·비교 이미지 기록; 분할·숨은 영역 불변(상위 레이어 이음새 오버레이 `fillMask`만 증가), 정지 렌더 이음새 외곽선 원래 수준 유지; `flat/cel` 개선은 목·`clothes_inner`·의상 정답에 한정, Sutteang 홀드아웃 의상 소폭 악화, 세일러 칼라 평탄화는 T15/T16 범위로 판정; Windows 앱 `미검증`) | 넓어진 T8 밴드가 오염된 시드로 칠해지는 문제를 먼저 해소 |
 | 5 | T10 | 눈·입 클리핑 밀폐 | 구현 · 부분 충족(단일 눈 변형장·클리핑 단일 규칙·누출 검사기·포락선 `eyeSeal` 51포즈·정지 불변 합성·속눈썹 선 연장, 테스트 통과; 원화 3종 누출 98–99.5% 감소·틈 98–100% 감소했으나 0건 미달(눈 끝·현 조각, 위치는 validation.md), 윗눈꺼풀 선 끊김 0, 정지 기본 포즈 합성 HEAD와 0px 차이; Windows 앱 표시 `미검증`) | T9 텍스처 위에서 클리핑 정합 |
-| 6 | T15 | 선화·구조 연장 | 계획 | 색 필드가 안정된 뒤 선 레이어를 얹음 |
+| 6 | T15 | 선화·구조 연장 | 구현 · 부분 충족(선화/채색 분리·획 연장·숨은 윤곽선·이중 선화 가드, 병합 뒤 실행·정지 합성 HEAD와 0px·`fillMask` 감소 0·T10 눈 검사기 동일, 교차 레이어 이중 선화 원화 3종 0px; 연장 획 0/8/3·숨은 윤곽선 37/296/0px로 제품 효과 작음, T14 홀드아웃 선화 끊김 Himikan 9→7·Sutteang 10→7·Rritteang 11→11·Himikan 정답 129→129; Windows 앱 `미검증`) | 색 필드가 안정된 뒤 선 레이어를 얹음 |
 | 7 | T11 | 노출 영역 중심 수동 보정 | 계획 | 자동 결과의 유형·신뢰도가 정해진 뒤 보정 UI가 의미를 가짐 |
 | 8 | T12 | 5대 결함 + 원본감 게이트 | 계획 | 최종 회귀 기준 |
 | 9 | T16 | (조건부) 질감 예시 합성 / 생성형 인페인팅 연구 | 보류 | T14 수치가 `texture`/`semantic` 한계를 보일 때만 착수 |
@@ -302,6 +302,15 @@
 
 목적: 조화 보간 색상 필드가 만들 수 없는 선 구조(얼굴 윤곽선, 목 옆선, 머리카락 결, 옷깃 테두리)를 노출 밴드 안에서 원화 규칙대로 잇는다.
 
+상태 (2026-11-19): **구현 · 부분 충족 · `cargo test` 75/75, `cargo clippy --all-targets -D warnings`, `npm test` 51/51, `tsc` 통과 · Windows 앱 `미검증`**. 수치·이미지·제한은 [validation.md](validation.md) T15 절.
+
+- **신규 모듈** `src-tauri/src/analysis/lineart.rs`(`t15-v1`): 파츠 텍스처를 채색 레이어(T9 텍스처)와 선화 레이어로 나누고, 숨은 텍셀에 선 레이어(획 연장·숨은 윤곽선)를 합성해 `α·line + (1−α)·colour`로 합친다. 선화 = 가시 증거(알파 ≥ 128, T9 오버레이 텍셀 포함, 홀드아웃 제외)에서 L* ≤ 중앙값 − 25(약 선화 −15 히스테리시스)이면서 반경 2 열림에 사라지는 가는 획. 선 생성은 덮는 상위 레이어와의 T13 이음새 `maxExposureDepthPx`(+2px) 안의 숨은 텍셀로 제한하고, 눈·눈썹·입 아래는 T10 영역이라 그리지 않는다. 확신 판정(`short`·`fitResidual`·`crossing`)·이중 선화 가드·윤곽선 판정의 수치는 모듈 상수와 문서 주석, validation.md에 있다.
+- **배치**: `templates::synthesize_template_bank_for_stage`에서 T10 `merge_rest_invariant` **뒤**에 `apply_lineart_pass`로 실행한다(병합 안에서 돌리면 기준 실행의 숨은 텍셀 색으로 되돌려져 94포즈 깊이로 선이 잘림 → 병합이 버린 T15 텍셀 0). 자체 정지 합성 게이트(8-bit 동일, 아니면 색 직선 위 클램프)로 정지 기본 포즈 합성은 HEAD와 0px 차이. `mask`·`fillMask`는 바꾸지 않는다(원화 3종 파츠별 `fillMask` 동일, 감소 0). `--no-lineart` 출력은 HEAD와 파일 단위 동일.
+- **이중 선화**: 상위 외곽선 위치(공유 실루엣)에 외곽선을 복사하지 않고, 상위 가장자리 잔여 성분(`seamOutline`)을 연장하지 않으며, 자기 이음새·상위 외곽선과 평행하게 달리는 선을 진행·텍셀 단위에서 막는다. 포락선 20포즈 래스터 검사에서 교차 레이어 이중 선화 원화 3종 0px(원화 선화의 같은 패턴 159 / 3,909 / 1,145px는 HEAD에도 있음).
+- **결과**: 연장된 획 0 / 8 / 3개, 건너뜀 1 / 3 / 2개(모두 `fitResidual`), 숨은 윤곽선 37 / 296 / 0px(Himikan / Rritteang / Sutteang). 숨은 영역이 실루엣을 넓힌 고리 중 윤곽선이 생긴 곳이 적은 이유는 대부분 파츠의 가시 실루엣에 T14 기준 선화가 없어서다(`outlineCoverage` < 0.5). T14 홀드아웃 선화 끊김 Himikan 9 → 7, Sutteang 10 → 7, Rritteang 11 → 11, Himikan 정답 129 → 129. T10 눈 검사기 누출·틈·끊김 원화 3종 동일. 얼굴·목 가장자리 비교 이미지에서 전/후 차이는 거의 보이지 않는다 → 완료 조건 **부분 충족**.
+- **데이터 계약**: `Part.fillLines?: "extended" | "none"`(선택 필드, schema v3 유지, 구 프로젝트는 미상으로 읽힘, 알 수 없는 값 거부). Rust `RegionReport.lineart`(획·윤곽선 통계, `semantic` 획 플래그). 브라우저 대체 경로(`engine.ts`)·수동 보완은 선 합성을 하지 않고 `none`으로 표시한다.
+- 남은 제한: Rritteang(원화 알파 ≤ 253)은 정지 게이트 때문에 선이 대부분 흐려진다(클램프 261). 공유 실루엣 뒷머리 외곽선·옆머리 아래 뒷머리 가닥선(Himikan 정답 끊김 125)은 이중 선화 규칙과 충돌해 잇지 않았다. Sutteang 턱선은 분할에서 `clothes`에 배정되어 얼굴 윤곽선으로 쓰이지 않는다(T11). 숨은 텍셀 단위 `semantic` 표시는 보고에만 있고 프로젝트 마스크로 저장하지 않는다. 이중 선화 검사는 20포즈 하드 래스터 기준이다.
+
 작업:
 
 - 파츠 텍스처를 **선화 레이어**(어둡고 가는 획)와 **채색 레이어**로 분리한다. 채색 레이어는 T9 필드로, 선화 레이어는 별도로 합성한 뒤 다시 합친다.
@@ -363,7 +372,7 @@
 | 4 | `test(T14): add hidden-area fidelity harness (PSD ground truth + holdout)` (`6eb8e41`) | 현 합성기 기준선 수치·비교 이미지(원화 3종 홀드아웃 + Himikan 정답 비교 기록, 기본 실행 출력 불변 확인, `cargo test`/`clippy`/`npm test`/`tsc` 통과; 임계값 미정 → 통과/미통과 판정 없음, Windows 앱 `미검증`) |
 | 5 | `feat(T9): decontaminate rim halos, classify fill region type, palette-snapped cel field` (`7434d0d`) | 경계 흰 테두리·목 얼룩 제거 + T14 지표 개선 → 원화 CLI 모션 미리보기에서 목 상단 밝은 얼룩·흰 줄 제거 확인, `flat/cel` 개선은 Himikan 목(정답 6.40→2.66, 홀드아웃 3.25→1.43)·`clothes_inner`(홀드아웃 36.87→2.13)·의상 정답(2.98→2.80)에 한정, Sutteang 홀드아웃 의상 7.66→7.72(악화), 나머지 동일; 분할 불변, 숨은 영역은 상위 이음새 오버레이만 증가; 정지 렌더 이음새 외곽선 원래 수준(Himikan 2.52→2.56, Rritteang 2.56→1.00, Sutteang 2.62→0.46); `cargo test`/`clippy`/`npm test`/`tsc` 통과; Windows 앱 `미검증` |
 | 6 | `feat(T10): seal eye clipping and closed-lid curves across expressions` (구현됨) | 감은 눈·슬픔·시선 극값 홍채/흰자 누출 0 → **미충족**: 누출(휴지 초과 px, legacy → T10) 1024 fixture 29,456 → 395, Himikan 25,144 → 557, Rritteang 344,081 → 1,700, Sutteang 48,873 → 198, 틈 23,811/8,370/87,301/36,245 → 180/180/0/144, 윗눈꺼풀 선 끊김 Rritteang 18 → 0(나머지 0 → 0); 시선 극값 홍채 이동 동일·감김 하강 비감소, `fillMask` 감소 0, 정지 기본 포즈 합성(가시·유효) HEAD와 0px; `cargo test` 69/69·`clippy`·`npm test` 50/50·`tsc` 통과; Windows 앱 `미검증` |
-| 7 | `feat(T15): separate line art and extend strokes/contours into exposure bands` | 선화 끊김 감소, 이중 선화 신규 0 |
+| 7 | `feat(T15): separate line art and extend strokes/contours into exposure bands` | 선화 끊김 감소, 이중 선화 신규 0 → **부분 충족**(구현됨): 홀드아웃 선화 끊김 Himikan 9→7·Sutteang 10→7 감소, Rritteang 11→11·Himikan 정답 129→129 그대로; 교차 레이어 이중 선화 신규 0px(20포즈 래스터, 원화 3종); `fillMask` 감소 0·정지 합성(가시·유효) HEAD와 0px·T10 눈 검사기 동일; 얼굴·목 가장자리 윤곽선 연속은 대부분 파츠가 윤곽선 판정 미달이라 미충족; `cargo test` 75/75·`clippy`·`npm test` 51/51·`tsc` 통과; Windows 앱 `미검증` |
 | 8 | `feat(T11): add exposure-aware hidden-area (fillMask) retouch workflow` | 원화 `mask` 불변 + 노출 포즈 미리보기 + 보정 왕복 |
 | 9 | `test(T12): automate 5-point defect + fidelity verification gate` | 5대 검증 + 원본감 지표 CLI/단위/WebView2 E2E 결과 기록 |
 | 10 | (조건부) `feat(T16): exemplar texture synthesis / inpainting study` | 착수 조건 충족 시에만 |

@@ -27,6 +27,11 @@ export const FILL_SYNTHS: readonly FillSynth[] = [
   "diffusion",
   "none",
 ];
+/** T15: whether the hidden texels carry a synthesized line layer (stroke extension / hidden contour,
+ * Rust only) over the colour layer. `none` = colour only (browser diffusion draft, manual fill, or no
+ * line reached the exposure band). Absent = unknown (projects saved before T15). */
+export type FillLines = "extended" | "none";
+export const FILL_LINES: readonly FillLines[] = ["extended", "none"];
 export type BlendMode = "normal" | "multiply" | "additive";
 export const ALLOWED_BLEND_MODES: readonly BlendMode[] = [
   "normal",
@@ -254,6 +259,8 @@ export interface Part {
   fillRegion?: FillRegion;
   /** T9 hidden-colour synthesis method (absent = unknown / saved before T9). */
   fillSynth?: FillSynth;
+  /** T15 hidden line layer (absent = unknown / saved before T15). */
+  fillLines?: FillLines;
   compositeOrder?: number;
   prompts?: PromptPoint[];
   confidence?: number;

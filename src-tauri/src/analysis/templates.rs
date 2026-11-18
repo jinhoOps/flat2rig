@@ -6,6 +6,7 @@
 //! and behind-torso back hair) while keeping `masks` as a strict non-overlapping foreground partition.
 
 use crate::analysis::landmarks::Landmark28Point;
+use crate::analysis::lineart;
 use crate::analysis::region_fill::{self, RegionKind, RegionReport};
 use crate::core::{HeadFrame, Landmarks};
 use crate::rig::seams;
@@ -123,6 +124,11 @@ pub struct TemplateSynthesisOutput {
     pub provenances: Vec<String>,
     pub confidences: Vec<f64>,
     pub style_match: StyleMatchReport,
+    /// T13 seam requirements measured for this synthesis (the hidden-area generator's table; ids,
+    /// not indices, are authoritative after stage filtering). Used by the T15 line pass.
+    pub seam_requirements: Vec<seams::SeamRequirement>,
+    /// Head height (`HeadFrame.hh`, px) of the synthesis.
+    pub head_height_px: f64,
 }
 
 struct PaletteInfo {
@@ -3929,10 +3935,85 @@ pub fn synthesize_template_bank_for_stage(
     };
     let current = run();
     if crate::core::legacy_eye_rig_enabled() || seams::base_envelope_enabled() {
-        return current;
+        let mut out = current;
+        apply_lineart_pass(&mut out, rgba, w, h, None);
+        return out;
     }
     let base = crate::core::with_legacy_eye_rig(true, || seams::with_base_envelope(run));
-    merge_rest_invariant(base, current, w, h)
+    let base_hidden = (base.part_ids.clone(), base.fill_masks.clone());
+    let mut out = merge_rest_invariant(base, current, w, h);
+    // T15 runs after the merge: the merge keeps the baseline run's texel colours for every hidden
+    // texel the baseline already had, so lines drawn inside the raw synthesis would be capped at the
+    // baseline (94-pose) exposure depth there. The pass applies its own rest-composite gate.
+    apply_lineart_pass(&mut out, rgba, w, h, Some((&base_hidden.0, &base_hidden.1)));
+    out
+}
+
+/// T15 (`analysis::lineart`): line-art / colour separation and stroke / contour extension into the
+/// exposure bands of the hidden texels, merged over the T9 colour layer with a bit-exact rest
+/// composite gate. `mask` / `fillMask` are unchanged; only textures of layers that received kept
+/// line texels are re-padded and re-encoded (other textures stay byte-identical). The evaluation
+/// holdout (T14) is honoured: held-out pixels are hidden texels here and never read as evidence.
+fn apply_lineart_pass(
+    out: &mut TemplateSynthesisOutput,
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    base_hidden: Option<(&[String], &[Vec<u8>])>,
+) {
+    if !lineart::lineart_enabled() || out.part_ids.is_empty() {
+        return;
+    }
+    let n = w * h;
+    let roles: Vec<crate::core::PartRole> =
+        out.part_ids.iter().map(|id| crate::core::infer_part_role(id, None)).collect();
+    let holdout = current_eval_holdout();
+    let held: Vec<Option<&[bool]>> = out
+        .part_ids
+        .iter()
+        .map(|id| holdout.as_ref().and_then(|hd| hd.layers.get(id)).map(|v| v.as_slice()))
+        .collect();
+    let mut textures: Vec<Option<Vec<u8>>> = out.textures.iter().map(|t| decode_texture_rgba(t, n)).collect();
+    let scene = lineart::LineArtScene {
+        ids: &out.part_ids,
+        roles: &roles,
+        masks: &out.masks,
+        fills: &out.fill_masks,
+        rgba,
+        w,
+        h,
+        held,
+        seam_requirements: &out.seam_requirements,
+        hh: out.head_height_px,
+    };
+    let reports = lineart::synthesize_lineart(&scene, &mut textures);
+    for (p, rep) in reports.into_iter().enumerate() {
+        let Some(mut rep) = rep else { continue };
+        if let Some((ids, fills)) = base_hidden {
+            if ids == out.part_ids.as_slice() {
+                let kept = rep.texels.iter().filter(|t| t.kept);
+                let (mut in_base, mut cur_only) = (0usize, 0usize);
+                for t in kept {
+                    if fills[p][t.i as usize] > 0 {
+                        in_base += 1;
+                    } else {
+                        cur_only += 1;
+                    }
+                }
+                rep.texels_in_base_hidden = Some(in_base);
+                rep.texels_in_current_only_hidden = Some(cur_only);
+            }
+        }
+        if rep.texels.iter().any(|t| t.kept) {
+            if let Some(tex) = textures[p].as_mut() {
+                pad_texture_rgb(tex, &out.masks[p], &out.fill_masks[p], w, h);
+                out.textures[p] = encode_texture_rgba(tex, w, h);
+            }
+        }
+        if let Some(Some(region)) = out.fill_regions.get_mut(p) {
+            region.lineart = Some(rep);
+        }
+    }
 }
 
 fn decode_texture_rgba(t: &Option<String>, n: usize) -> Option<Vec<u8>> {
@@ -5935,7 +6016,7 @@ fn synthesize_template_bank_for_stage_raw(
     // pose envelope (T13a); `margins` (`core::part_overlap_margins`) is only the no-seam fallback.
     // T13b: each seam uses max(coupled, uncoupled) requirement so runtime coupling never shrinks a
     // hidden area (Cubism deformers move independently; PSD hand-off continuity).
-    apply_motion_proportional_underlaps(
+    let seam_requirements = apply_motion_proportional_underlaps(
         &final_layer_ids,
         &final_visible_masks,
         &mut final_tpl_masks,
@@ -7128,6 +7209,8 @@ fn synthesize_template_bank_for_stage_raw(
         textures,
         provenances,
         confidences,
+        seam_requirements,
+        head_height_px: frame.hh,
         style_match: StyleMatchReport {
             resolved: ev.resolved.clone(),
             match_score: ev.match_score,
@@ -7234,10 +7317,10 @@ fn apply_motion_proportional_underlaps(
     w: usize,
     h: usize,
     stage: &str,
-) {
+) -> Vec<seams::SeamRequirement> {
     use crate::core::PartRole as R;
     if stage == "base_silhouette" {
-        return;
+        return Vec::new();
     }
     let final_len = final_layer_ids.len();
     let n = w * h;
@@ -7805,6 +7888,7 @@ fn apply_motion_proportional_underlaps(
             }
         }
     }
+    table.requirements
 }
 
 /// Extends valid texel RGB by 2px around effective mask edges to prevent bilinear dark-fringing.
@@ -8122,6 +8206,103 @@ mod tests {
         assert!((smoothstep(1.2, -1.2, 0.0) - 0.5).abs() < 1e-9);
         assert!((smoothstep(1.2, -1.2, 1.5) - 0.0).abs() < 1e-9);
         assert!((smoothstep(1.2, -1.2, -1.5) - 1.0).abs() < 1e-9);
+    }
+
+    /// T15: the line pass changes hidden texel colours only — the partition, every `fillMask` and the
+    /// rest composite (`mask ∪ fillMask`) are identical with the pass on and off; visible texels never
+    /// change; the report is attached only when the pass runs. (Stroke extension itself is covered by
+    /// the `analysis::lineart` unit tests.)
+    #[test]
+    fn t15_lineart_keeps_partition_fill_and_rest_composite() {
+        let (w, h) = (256usize, 256usize);
+        let n = w * h;
+        let lm = Landmarks {
+            eye_r: Point { x: 96.0, y: 84.0 },
+            eye_l: Point { x: 160.0, y: 84.0 },
+            mouth: Point { x: 128.0, y: 118.0 },
+            chin: Point { x: 128.0, y: 140.0 },
+            crown: Point { x: 128.0, y: 24.0 },
+            eye_frames: None,
+        };
+        let mut rgba = vec![0u8; n * 4];
+        let (mut face_m, mut hair_m, mut clothes_m) = (vec![0u8; n], vec![0u8; n], vec![0u8; n]);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let k = i * 4;
+                if (x as f64 - 128.0).hypot((y as f64 - 88.0) * 0.9) < 58.0 {
+                    if y < 60 {
+                        rgba[k..k + 4].copy_from_slice(&[70, 58, 88, 255]);
+                        hair_m[i] = 255;
+                    } else {
+                        // A 3px dark stroke on the forehead running up under the bangs.
+                        let c = if (127..130).contains(&x) && y < 76 { [170, 90, 80] } else { [245, 222, 208] };
+                        rgba[k..k + 3].copy_from_slice(&c);
+                        rgba[k + 3] = 255;
+                        face_m[i] = 255;
+                    }
+                } else if y > 165 && (x as f64 - 128.0).abs() < 76.0 {
+                    rgba[k..k + 4].copy_from_slice(&[210, 212, 224, 255]);
+                    clothes_m[i] = 255;
+                }
+            }
+        }
+        let ids = vec!["hair_front".to_string(), "face".to_string(), "clothes".to_string()];
+        let masks = vec![hair_m, face_m, clothes_m];
+        let provs = vec!["model".to_string(); 3];
+        let confs = vec![0.9; 3];
+        let run = || {
+            synthesize_template_bank(
+                &rgba,
+                w,
+                h,
+                &lm,
+                &[],
+                &ids,
+                &masks,
+                &provs,
+                &confs,
+                &TemplateStyleSelection::default(),
+            )
+        };
+        let on = run();
+        let off = lineart::with_lineart(false, run);
+        assert_eq!(on.part_ids, off.part_ids);
+        assert_eq!(on.masks, off.masks, "T15 must not change the visible partition");
+        assert_eq!(on.fill_masks, off.fill_masks, "T15 must not change any fillMask");
+        let tex = |o: &TemplateSynthesisOutput| -> Vec<Option<Vec<u8>>> {
+            o.textures.iter().map(|t| decode_texture_rgba(t, n)).collect()
+        };
+        let (t_on, t_off) = (tex(&on), tex(&off));
+        let composite = |t: &[Option<Vec<u8>>], i: usize| {
+            let mut out = [0u8; 4];
+            for (p, tp) in t.iter().enumerate().take(on.part_ids.len()) {
+                let a = on.masks[p][i].max(on.fill_masks[p][i]);
+                if let (Some(tx), true) = (tp.as_ref(), a > 0) {
+                    crate::core::blend_straight_pixel(&mut out, [tx[i * 4], tx[i * 4 + 1], tx[i * 4 + 2], a]);
+                }
+            }
+            out
+        };
+        for i in 0..n {
+            assert_eq!(composite(&t_on, i), composite(&t_off, i), "rest composite changed at {i}");
+        }
+        let face = on.part_ids.iter().position(|id| id == "face").unwrap();
+        // Visible texels of every layer are identical (only hidden texels may take lines).
+        for p in 0..on.part_ids.len() {
+            if let (Some(a), Some(b)) = (t_on[p].as_ref(), t_off[p].as_ref()) {
+                for i in 0..n {
+                    if on.masks[p][i] > 0 {
+                        assert_eq!(&a[i * 4..i * 4 + 3], &b[i * 4..i * 4 + 3], "visible texel of {} changed at {i}", on.part_ids[p]);
+                    }
+                }
+            }
+        }
+        let rep = on.fill_regions[face].as_ref().and_then(|r| r.lineart.as_ref()).expect("face line report");
+        assert_eq!(rep.version, lineart::LINEART_VERSION);
+        let gated = rep.rest_gate.rejected + rep.rest_gate.clamped + rep.rest_gate.accepted;
+        assert!(gated >= rep.texels.iter().filter(|t| t.kept && t.alpha > 0.0).count().min(gated));
+        assert!(off.fill_regions[face].as_ref().is_some_and(|r| r.lineart.is_none()));
     }
 
     /// T14: the evaluation holdout must not touch the product path. Without `with_eval_holdout` (and

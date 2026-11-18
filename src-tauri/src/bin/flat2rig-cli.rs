@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use flat2rig_lib::analysis::{
     detector::{detect_faces, DEFAULT_FACE_SCORE_THRESHOLD},
     landmarks::detect_landmarks,
+    lineart,
     models::{ModelRegistry, ModelRole},
     parts::{propose_parts_auto_with_template_stage, propose_parts_with_sam_with_options},
     state::AnalysisState,
@@ -268,6 +269,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut stage: Option<String> = None;
     let mut coupled = true;
     let mut legacy_eye = false;
+    let mut line_art = true;
+    let mut rest_gate = true;
     let mut eval = EvalOptions::default();
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
@@ -297,6 +300,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // T10 baseline (measurement only): the whole pipeline with the pre-T10 per-layer eye
             // formulas and clipping rule.
             legacy_eye = true;
+        } else if arg == "--lineart-no-rest-gate" {
+            // T15 measurement only: synthesized lines without the bit-exact rest composite gate.
+            rest_gate = false;
+        } else if arg == "--no-lineart" {
+            // T15 baseline (measurement only): hidden texels keep the T9 colour layer, no
+            // synthesized line layer.
+            line_art = false;
         } else if arg == "--eval-holdout" {
             // T14 (evaluation only): seam holdout re-synthesized by the hidden-texel path.
             eval.holdout = true;
@@ -317,12 +327,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if positional.len() < 2 {
         return Err(
-            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--legacy-eye] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
+            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--legacy-eye] [--no-lineart] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
         );
     }
     core::with_legacy_eye_rig(legacy_eye, || {
         core::with_seam_coupling(coupled, || {
-            run_pipeline(&positional, proportion, stage, coupled, legacy_eye, &eval)
+            lineart::with_lineart(line_art, || {
+                let go = || run_pipeline(&positional, proportion, stage, coupled, legacy_eye, &eval);
+                if rest_gate { go() } else { lineart::without_rest_gate(go) }
+            })
         })
     })
 }
@@ -474,6 +487,238 @@ where
     }
     fid.insert("imageDir".into(), json!("fidelity"));
     Ok(serde_json::Value::Object(fid))
+}
+
+/// Envelope poses rendered for the T15 face / neck edge comparison (side-hair sway and head
+/// rotation extremes, head/body opposite turns).
+const LINEART_RENDER_POSES: &[&str] = &[
+    "hairSide=-1",
+    "hairSide=1",
+    "angleX=-30",
+    "angleX=30",
+    "angleZ=-30",
+    "angleZ=30",
+    "opp:angleX+/bodyX-",
+    "opp:angleX-/bodyX+",
+    "hairSign:+++",
+    "hairSign:---",
+];
+
+/// T15 outputs: per-part line-art reports (+ seam-parallel texels), the posed double-line check,
+/// hard renders of the extreme poses (`lineart/pose_*.png`) and crops of skipped strokes
+/// (`lineart/skip_*.png`: original · texture, ×4, contact point marked).
+#[allow(clippy::too_many_arguments)]
+fn lineart_outputs(
+    output: &std::path::Path,
+    proposed: &flat2rig_lib::analysis::parts::PartsProposalOutput,
+    meshes: &[core::Mesh],
+    layer_textures: &[Vec<u8>],
+    landmarks: &core::Landmarks,
+    img: &image::RgbaImage,
+    env: &[seams::EnvelopePose],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let t0 = std::time::Instant::now();
+    let (w, h) = img.dimensions();
+    let (wu, hu) = (w as usize, h as usize);
+    let n = wu * hu;
+    let dir = output.join("lineart");
+    std::fs::create_dir_all(&dir)?;
+    let ids = &proposed.part_ids;
+    let reps: Vec<Option<&lineart::LineArtReport>> = (0..ids.len())
+        .map(|p| {
+            proposed
+                .fill_regions
+                .get(p)
+                .and_then(|r| r.as_ref())
+                .and_then(|r| r.lineart.as_ref())
+        })
+        .collect();
+    let fills: Vec<Vec<u8>> = (0..ids.len())
+        .map(|p| {
+            proposed
+                .fill_masks
+                .get(p)
+                .and_then(|o| o.clone())
+                .unwrap_or_else(|| vec![0u8; n])
+        })
+        .collect();
+    let mut parts = Vec::new();
+    let mut totals = lineart::StrokeCounts::default();
+    let (mut contour_len, mut stroke_tex, mut contour_tex, mut seam_par_total) = (0usize, 0usize, 0usize, 0usize);
+    let mut gate = lineart::RestGate::default();
+    for (p, id) in ids.iter().enumerate() {
+        let Some(r) = reps[p] else { continue };
+        let seam_par = lineart::seam_parallel_texels(p, r, &proposed.masks, wu, hu);
+        seam_par_total += seam_par;
+        let s = &r.strokes;
+        totals.touching_hidden += s.touching_hidden;
+        totals.extended += s.extended;
+        totals.extended_by_field += s.extended_by_field;
+        totals.joined += s.joined;
+        totals.skipped_short += s.skipped_short;
+        totals.skipped_fit_residual += s.skipped_fit_residual;
+        totals.skipped_crossing += s.skipped_crossing;
+        totals.unexposed += s.unexposed;
+        totals.feature_seam += s.feature_seam;
+        totals.parallel += s.parallel;
+        totals.contour += s.contour;
+        totals.seam_parallel += s.seam_parallel;
+        totals.seam_outline += s.seam_outline;
+        totals.no_room += s.no_room;
+        contour_len += r.contour_length_px;
+        stroke_tex += r.stroke_texels;
+        contour_tex += r.contour_texels;
+        gate.accepted += r.rest_gate.accepted;
+        gate.clamped += r.rest_gate.clamped;
+        gate.rejected += r.rest_gate.rejected;
+        gate.held_out += r.rest_gate.held_out;
+        parts.push(json!({ "id": id, "report": r, "seamParallelTexels": seam_par }));
+    }
+    let check_poses: Vec<seams::EnvelopePose> = env
+        .iter()
+        .filter(|p| {
+            LINEART_RENDER_POSES.contains(&p.name.as_str())
+                || p.name.starts_with("hairSign:")
+                || p.name.starts_with("opp:")
+        })
+        .cloned()
+        .collect();
+    let tex_refs: Vec<&[u8]> = layer_textures.iter().map(|t| t.as_slice()).collect();
+    let doubles = lineart::posed_double_lines(
+        ids,
+        &proposed.masks,
+        &fills,
+        meshes,
+        &reps,
+        &tex_refs,
+        landmarks,
+        wu,
+        hu,
+        &check_poses,
+    );
+    // Line layer diagnostic: dimmed artwork, visible line art (blue), kept T15 strokes (red) and
+    // contours (green), gate-rejected T15 texels (yellow).
+    {
+        let mut ov: Vec<u8> = img
+            .as_raw()
+            .chunks(4)
+            .flat_map(|c| {
+                let a = c[3] as f64 / 255.0;
+                let mix = |v: u8| (255.0 - (255.0 - v as f64 * 0.35 - 255.0 * 0.65) * a) as u8;
+                [mix(c[0]), mix(c[1]), mix(c[2]), 255]
+            })
+            .collect();
+        let owner = lineart::rest_owner(&proposed.masks, n);
+        for (p, r) in reps.iter().enumerate() {
+            if r.is_none() {
+                continue;
+            }
+            let ev: Vec<bool> = (0..n)
+                .map(|i| proposed.masks[p][i] >= lineart::EVIDENCE_ALPHA_MIN || lineart::is_overlay_texel(&fills[p], &owner, p, i))
+                .collect();
+            let tex = layer_textures[p].as_slice();
+            let (line, _) = lineart::detect_line_pixels(&|g| lineart::lstar_px(tex, g), &ev, wu, hu);
+            for (i, &b) in line.iter().enumerate() {
+                if b {
+                    ov[i * 4..i * 4 + 3].copy_from_slice(&[40, 90, 255]);
+                }
+            }
+        }
+        for r in reps.iter().flatten() {
+            for t in &r.texels {
+                if t.alpha < 0.5 {
+                    continue;
+                }
+                let c = if !t.kept {
+                    [255, 220, 0]
+                } else if t.stroke >= lineart::CONTOUR_ID_BASE {
+                    [0, 200, 60]
+                } else {
+                    [255, 30, 30]
+                };
+                let i = t.i as usize;
+                ov[i * 4..i * 4 + 3].copy_from_slice(&c);
+            }
+        }
+        image::RgbaImage::from_raw(w, h, ov)
+            .ok_or("line layer size mismatch")?
+            .save(dir.join("line_layer.png"))?;
+    }
+    let textures: Vec<&[u8]> = layer_textures.iter().map(|t| t.as_slice()).collect();
+    let mut renders = Vec::new();
+    for pe in env.iter().filter(|p| LINEART_RENDER_POSES.contains(&p.name.as_str())) {
+        let (rgba, _) = eye_seal::render_pose_rgba(ids, &proposed.masks, &fills, meshes, &textures, landmarks, wu, hu, &pe.pose);
+        let file = format!(
+            "pose_{}.png",
+            pe.name.replace([':', '/', '='], "_").replace('+', "p").replace('-', "m")
+        );
+        image::RgbaImage::from_raw(w, h, rgba)
+            .ok_or("lineart render size mismatch")?
+            .save(dir.join(&file))?;
+        renders.push(json!({ "pose": pe.name, "file": format!("lineart/{file}") }));
+    }
+    // Skipped-stroke crops (≤ 2 per reason per part, ≤ 24 total).
+    let mut crops = Vec::new();
+    for (p, id) in ids.iter().enumerate() {
+        let Some(r) = reps[p] else { continue };
+        let mut per_reason: std::collections::HashMap<&str, usize> = Default::default();
+        for f in &r.semantic {
+            let c = per_reason.entry(f.reason.as_str()).or_insert(0);
+            if *c >= 2 || crops.len() >= 24 {
+                continue;
+            }
+            *c += 1;
+            const R: i64 = 20;
+            const S: u32 = 4;
+            let side = (2 * R) as u32;
+            let mut im = image::RgbaImage::new(side * S * 2 + 4, side * S);
+            let tex = &layer_textures[p];
+            for dy in 0..2 * R {
+                for dx in 0..2 * R {
+                    let x = f.x as i64 - R + dx;
+                    let y = f.y as i64 - R + dy;
+                    let inside = x >= 0 && y >= 0 && x < w as i64 && y < h as i64;
+                    let k = if inside { (y as usize * wu + x as usize) * 4 } else { 0 };
+                    let orig = if inside { [img.as_raw()[k], img.as_raw()[k + 1], img.as_raw()[k + 2], 255] } else { [0, 0, 0, 255] };
+                    let t = if inside && tex[k + 3] > 0 {
+                        [tex[k], tex[k + 1], tex[k + 2], 255]
+                    } else if (dx / 4 + dy / 4) % 2 == 0 {
+                        [200, 200, 200, 255]
+                    } else {
+                        [150, 150, 150, 255]
+                    };
+                    let mark = dx == R && dy == R;
+                    for sy in 0..S {
+                        for sx in 0..S {
+                            let (px, py) = (dx as u32 * S + sx, dy as u32 * S + sy);
+                            let red = image::Rgba([255, 0, 0, 255]);
+                            im.put_pixel(px, py, if mark { red } else { image::Rgba(orig) });
+                            im.put_pixel(px + side * S + 4, py, if mark { red } else { image::Rgba(t) });
+                        }
+                    }
+                }
+            }
+            let file = format!("skip_{}_{}_{}.png", id, f.reason, c);
+            im.save(dir.join(&file))?;
+            crops.push(json!({ "id": id, "reason": f.reason, "x": f.x, "y": f.y, "file": format!("lineart/{file}") }));
+        }
+    }
+    Ok(json!({
+        "version": lineart::LINEART_VERSION,
+        "enabled": lineart::lineart_enabled(),
+        "strokes": totals,
+        "strokesSkipped": totals.skipped(),
+        "contourLengthPx": contour_len,
+        "strokeTexels": stroke_tex,
+        "contourTexels": contour_tex,
+        "restGate": gate,
+        "seamParallelTexels": seam_par_total,
+        "doubleLines": doubles,
+        "renders": renders,
+        "skippedCrops": crops,
+        "parts": parts,
+        "elapsedMs": t0.elapsed().as_millis(),
+    }))
 }
 
 fn run_pipeline(
@@ -902,6 +1147,16 @@ fn run_pipeline(
         "elapsedMs": start.elapsed().as_millis(),
         "engine": "Rust / ort / delaunator / glam"
     });
+    stats["lineart"] = lineart_outputs(
+        &output,
+        &proposed,
+        &part_meshes,
+        &layer_textures,
+        &landmarks,
+        &img,
+        env,
+    )?;
+    stats["elapsedMs"] = json!(start.elapsed().as_millis());
     if eval.any() {
         // T14 (evaluation only): nothing below changes the product outputs computed above.
         stats["fidelity"] = run_fidelity(

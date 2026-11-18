@@ -1,5 +1,6 @@
 pub mod detector;
 pub mod landmarks;
+pub mod lineart;
 pub mod models;
 pub mod parts;
 pub mod region_fill;

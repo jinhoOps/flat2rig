@@ -159,6 +159,10 @@ pub struct RegionReport {
     pub cel_core_frac: f64,
     pub residual_mean_de: f64,
     pub rim: RimReport,
+    /// T15 line layer of the hidden texels (stroke extension / hidden contour statistics, semantic
+    /// stroke flags). `None` for layers T15 does not draw on and for pre-T15 reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineart: Option<crate::analysis::lineart::LineArtReport>,
 }
 
 /// Inclusive-exclusive pixel box.
@@ -634,6 +638,7 @@ pub fn analyze_layer(inp: &LayerInput<'_>) -> LayerRegion {
             cel_core_frac: 0.0,
             residual_mean_de: 0.0,
             rim: RimReport::default(),
+            lineart: None,
         },
     };
     let Some(bbox) = Bbox::of(w, h, margin, |i| inp.vis[i] > 0 || inp.hidden[i] > 0) else {
@@ -783,6 +788,7 @@ pub fn analyze_layer(inp: &LayerInput<'_>) -> LayerRegion {
             cel_core_frac,
             residual_mean_de,
             rim: RimReport::default(),
+            lineart: None,
         },
         seeds,
         labels,

@@ -31,6 +31,7 @@ import {
   type EyeFrames,
   type RigLandmarks,
 } from "../src/engine";
+import { parseFillRegion } from "../src/native";
 import {
   cubismCsv,
   exportBundle,
@@ -535,6 +536,40 @@ describe("persistent project and export contract", () => {
     expect(occ.fillKind).toBe("neighbor");
     expect(occ.fillSynth).toBe("diffusion");
     expect((occ as { fillRegion?: string }).fillRegion).toBeUndefined();
+  });
+  it("keeps T15 hidden line-layer provenance: optional, round-trips, rejects unknown, browser = none", async () => {
+    // Pre-T15 projects load with the field absent (unknown).
+    const pre = fixture();
+    pre.parts[0].fillKind = "template";
+    pre.parts[0].fillMask = new Uint8Array(pre.parts[0].mask.length).fill(64);
+    const restoredPre = loadProject(await saveProject(pre));
+    expect(restoredPre.schemaVersion).toBe(3);
+    expect(restoredPre.parts[0].fillLines).toBeUndefined();
+    const post = fixture();
+    post.parts[0].fillKind = "template";
+    post.parts[0].fillLines = "extended";
+    post.parts[1].fillKind = "neighbor";
+    post.parts[1].fillLines = "none";
+    const restored = loadProject(await saveProject(post));
+    expect(restored.parts[0].fillLines).toBe("extended");
+    expect(restored.parts[1].fillLines).toBe("none");
+    const files = unzipSync(await saveProject(post));
+    const meta = JSON.parse(strFromU8(files["project.json"]));
+    meta.parts[0].fillLines = "generated";
+    files["project.json"] = strToU8(JSON.stringify(meta));
+    expect(() => loadProject(zipSync(files))).toThrow();
+    // Browser fallback: colour-only diffusion draft, no line layer.
+    const w = 12;
+    const h = 12;
+    const visible = new Uint8Array(w * h);
+    for (let y = 3; y < 9; y++) for (let x = 3; x < 9; x++) visible[y * w + x] = 255;
+    const occ = expandFillSeparated(new Uint8ClampedArray(w * h * 4).fill(200), visible, w, h, 2, "neck");
+    expect(occ.fillLines).toBe("none");
+    // Rust reports: kept T15 texels → extended; report without kept texels or without `lineart` → none.
+    expect(parseFillRegion({ kind: "flat_cel", synth: "local_field", lineart: { restGate: { accepted: 3, clamped: 0 } } }).fillLines).toBe("extended");
+    expect(parseFillRegion({ kind: "flat_cel", synth: "local_field", lineart: { restGate: { accepted: 0, clamped: 0 } } }).fillLines).toBe("none");
+    expect(parseFillRegion({ kind: "line", synth: "procedural" }).fillLines).toBe("none");
+    expect(parseFillRegion(null)).toEqual({});
   });
   it("round-trips and strictly validates ZIP shape substitute assets and v3 guards", async () => {
     const p = fixture();

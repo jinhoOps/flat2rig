@@ -6,6 +6,7 @@ import {
   describeDynamicPart,
   FILL_REGIONS,
   FILL_SYNTHS,
+  FILL_LINES,
   HAIR_ROLE_META,
   isHairStageLayer,
   PART_DEFS,
@@ -738,6 +739,7 @@ export function loadProject(bytes: Uint8Array): Project {
   // T9 optional fields (schema stays v3: absent = unclassified; older readers ignore them).
   const validFillRegions: readonly string[] = FILL_REGIONS;
   const validFillSynths: readonly string[] = FILL_SYNTHS;
+  const validFillLines: readonly string[] = FILL_LINES;
   for (let idx = 0; idx < p.parts.length; idx++) {
     const part = p.parts[idx];
     if (
@@ -754,6 +756,7 @@ export function loadProject(bytes: Uint8Array): Project {
       (part.fillKind && !validFillKinds.includes(part.fillKind)) ||
       (part.fillRegion !== undefined && !validFillRegions.includes(part.fillRegion)) ||
       (part.fillSynth !== undefined && !validFillSynths.includes(part.fillSynth)) ||
+      (part.fillLines !== undefined && !validFillLines.includes(part.fillLines)) ||
       (part.blendMode && !ALLOWED_BLEND_MODES.includes(part.blendMode))
     )
       throw new Error("잘못된 파츠 정보입니다.");
@@ -1154,6 +1157,7 @@ export async function exportBundle(
       fillKind: p.fillKind ?? "neighbor",
       fillRegion: p.fillRegion ?? null,
       fillSynth: p.fillSynth ?? null,
+      fillLines: p.fillLines ?? null,
       filledPixels: p.fillMask ? p.fillMask.filter((v) => v > 0).length : 0,
     }));
   const meshWarnings = rig.flatMap((p) => {

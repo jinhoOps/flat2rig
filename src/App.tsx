@@ -45,6 +45,7 @@ import type {
   FillKind,
   FillRegion,
   FillSynth,
+  FillLines,
   HairRole,
   LandmarkId,
   LandmarkProvenance,
@@ -200,6 +201,17 @@ function fillRegionLabel(r?: FillRegion): string {
       return "구조(의미)";
     default:
       return "미분류";
+  }
+}
+/** T15: hidden line layer label (absent = unknown, saved before T15). */
+function fillLinesLabel(l?: FillLines): string {
+  switch (l) {
+    case "extended":
+      return "선화 연장(획·숨은 윤곽선, 노출 깊이 안)";
+    case "none":
+      return "선화 없음(색 레이어만)";
+    default:
+      return "알 수 없음(T15 이전 결과)";
   }
 }
 /** T9: hidden-colour synthesis label; the browser fallback is a lower-quality diffusion draft. */
@@ -1504,6 +1516,7 @@ export default function App() {
                 fillKind: result.fillKind,
                 fillRegion: result.fillRegion,
                 fillSynth: result.fillSynth,
+                fillLines: result.fillLines,
                 texture,
                 generated: true,
                 status: "draft",
@@ -1536,6 +1549,7 @@ export default function App() {
           fillKind: FillKind;
           fillRegion?: FillRegion;
           fillSynth?: FillSynth;
+          fillLines?: FillLines;
           texture: string;
         }
       >();
@@ -1562,6 +1576,7 @@ export default function App() {
           fillKind: result.fillKind,
           fillRegion: result.fillRegion,
           fillSynth: result.fillSynth,
+          fillLines: result.fillLines,
           texture,
         });
       }
@@ -1577,6 +1592,7 @@ export default function App() {
                 fillKind: u.fillKind,
                 fillRegion: u.fillRegion,
                 fillSynth: u.fillSynth,
+                fillLines: u.fillLines,
                 texture: u.texture,
                 generated: true,
                 status: t.status === "approved" ? "approved" : "draft",
@@ -1596,6 +1612,7 @@ export default function App() {
       fillKind: "none",
       fillRegion: undefined,
       fillSynth: undefined,
+      fillLines: undefined,
       texture: undefined,
       generated: false,
       status: "draft",
@@ -3134,7 +3151,7 @@ export default function App() {
                         {part.fillMask && part.fillKind !== "external" && (
                           <span
                             className={`prov-chip ${part.fillSynth === "diffusion" || !part.fillRegion ? "prov-danger" : "prov-estimated"}`}
-                            title={fillSynthLabel(part.fillSynth)}
+                            title={`${fillSynthLabel(part.fillSynth)} · ${fillLinesLabel(part.fillLines)}`}
                           >
                             유형·{fillRegionLabel(part.fillRegion)}
                           </span>
@@ -3326,7 +3343,8 @@ export default function App() {
                             </div>
                             <small>
                               영역 유형: {fillRegionLabel(part.fillRegion)} · 숨은 색 합성:{" "}
-                              {fillSynthLabel(part.fillSynth)}
+                              {fillSynthLabel(part.fillSynth)} · 숨은 선화:{" "}
+                              {fillLinesLabel(part.fillLines)}
                             </small>
                             {(part.id.startsWith("eye") ||
                               part.id.startsWith("mouth") ||

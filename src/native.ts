@@ -14,6 +14,7 @@ import {
   type FillKind,
   type FillRegion,
   type FillSynth,
+  type FillLines,
   type Landmark28Point,
   type LandmarkProvenance,
   type Landmarks,
@@ -39,12 +40,27 @@ import {
 import { REST, PARAM_DEFS } from "./types";
 export type { MeshQualityReport } from "./engine";
 export const desktop = isTauri();
-/** T9: validated `{ fillRegion, fillSynth }` from a Rust `RegionReport` (unknown values dropped). */
+/** T15 line-layer summary inside a Rust `RegionReport` (`lineart`; absent = no line synthesis). */
+export interface RawLineArt {
+  strokeTexels?: number;
+  contourTexels?: number;
+  restGate?: { accepted?: number; clamped?: number };
+}
+/** Raw Rust `RegionReport` fields the app reads. */
+export interface RawRegionReport {
+  kind?: string;
+  synth?: string;
+  lineart?: RawLineArt | null;
+}
+/** T9: validated `{ fillRegion, fillSynth }` from a Rust `RegionReport` (unknown values dropped);
+ * T15: `fillLines` = `extended` when the line pass kept synthesized line texels, else `none`. */
 export function parseFillRegion(
-  raw: { kind?: string; synth?: string } | null | undefined,
-): { fillRegion?: FillRegion; fillSynth?: FillSynth } {
+  raw: RawRegionReport | null | undefined,
+): { fillRegion?: FillRegion; fillSynth?: FillSynth; fillLines?: FillLines } {
   if (!raw) return {};
-  const out: { fillRegion?: FillRegion; fillSynth?: FillSynth } = {};
+  const out: { fillRegion?: FillRegion; fillSynth?: FillSynth; fillLines?: FillLines } = {};
+  const kept = (raw.lineart?.restGate?.accepted ?? 0) + (raw.lineart?.restGate?.clamped ?? 0);
+  out.fillLines = kept > 0 ? "extended" : "none";
   if (raw.kind && (FILL_REGIONS as readonly string[]).includes(raw.kind))
     out.fillRegion = raw.kind as FillRegion;
   if (raw.synth && (FILL_SYNTHS as readonly string[]).includes(raw.synth))
@@ -182,6 +198,8 @@ export interface FillOcclusionResult {
   /** T9 (Rust only): region type; absent from the browser diffusion fallback. */
   fillRegion?: FillRegion;
   fillSynth?: FillSynth;
+  /** T15: manual / browser fills carry no synthesized line layer (`none`). */
+  fillLines?: FillLines;
   warning?: string;
 }
 
@@ -252,7 +270,7 @@ export async function proposeParts(
       masks: string[];
       fillMasks?: (string | null)[];
       fillKinds?: string[];
-      fillRegions?: ({ kind: string; synth: string } | null)[];
+      fillRegions?: (RawRegionReport | null)[];
       textures?: (string | null)[];
       metas: {
         id: string;
@@ -460,6 +478,7 @@ function fillBrowserFallbackParts(
       fillMask: filled.fillMask,
       fillKind: filled.fillKind,
       fillSynth: filled.fillSynth,
+      fillLines: filled.fillLines,
       ...(texture ? { texture } : {}),
       generated: true,
     };
@@ -640,7 +659,7 @@ export async function fillOcclusionNative(
     combinedMask: string;
     filledPixels: number;
     fillKind: FillKind;
-    fillRegion?: { kind: string; synth: string } | null;
+    fillRegion?: RawRegionReport | null;
     warning?: string | null;
   }>("fill_part_occlusion", {
     rgba: base64(data),
