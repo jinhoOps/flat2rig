@@ -55,6 +55,12 @@ interface Props {
   onMove: (point: Point) => void;
   onEnd: (point: Point) => void;
   onCommitMask?: (partId: string, mask: Uint8Array, fillMask?: Uint8Array) => void;
+  /**
+   * T11a navigation tools. `hand`: left-drag pans (as Space+drag does). `zoom`: click calls
+   * `onZoomStep(+1)`, Alt+click `onZoomStep(-1)`. Absent/null leaves every existing gesture as is.
+   */
+  navTool?: "hand" | "zoom" | null;
+  onZoomStep?: (direction: 1 | -1) => void;
 }
 const landmarkLabels: Record<LandmarkId, string> = {
   eyeL: "L · 눈",
@@ -623,7 +629,8 @@ export default function Viewport(props: Props) {
     };
   };
   const useLocalBrush = !preview && !!props.onCommitMask && (tool === "add" || tool === "erase");
-  const isPanCursor = (!preview && spaceHeld) || panDragging;
+  const navTool = props.navTool ?? null;
+  const isPanCursor = (!preview && spaceHeld) || panDragging || navTool === "hand";
   return (
     <div className="viewport" ref={root}>
       <div className="canvas-space">
@@ -650,7 +657,9 @@ export default function Viewport(props: Props) {
                 ? "grabbing"
                 : isPanCursor
                   ? "grab"
-                  : preview
+                  : navTool === "zoom"
+                    ? "zoom-in"
+                    : preview
                     ? "default"
                     : tool === "select"
                       ? "default"
@@ -660,7 +669,16 @@ export default function Viewport(props: Props) {
               if (tool === "prompt") e.preventDefault();
             }}
             onPointerDown={(e) => {
-              if (e.button === 1 || (!preview && spaceHeld)) {
+              if (navTool === "zoom" && e.button === 0 && !(!preview && spaceHeld)) {
+                e.preventDefault();
+                props.onZoomStep?.(e.altKey ? -1 : 1);
+                return;
+              }
+              if (
+                e.button === 1 ||
+                (!preview && spaceHeld) ||
+                (navTool === "hand" && e.button === 0)
+              ) {
                 e.preventDefault();
                 const sc = root.current;
                 e.currentTarget.setPointerCapture(e.pointerId);

@@ -763,6 +763,35 @@ export async function cancelAnalysis(): Promise<void> {
   await invoke("cancel_analysis");
 }
 
+/** T11a: stage-boundary progress emitted by long Rust commands (`task-progress`). */
+export interface TaskProgressEvent {
+  job: number;
+  step: string;
+  done: number;
+  total: number;
+}
+
+/**
+ * Subscribes to `task-progress`. The browser fallback has no such events, so long tasks there stay
+ * indeterminate. Returns an unsubscribe function.
+ */
+export function listenTaskProgress(cb: (ev: TaskProgressEvent) => void): () => void {
+  if (!desktop) return () => {};
+  let unlisten: (() => void) | null = null;
+  let stopped = false;
+  void import("@tauri-apps/api/event")
+    .then(({ listen }) => listen<TaskProgressEvent>("task-progress", (e) => cb(e.payload)))
+    .then((fn) => {
+      if (stopped) fn();
+      else unlisten = fn;
+    })
+    .catch(() => {});
+  return () => {
+    stopped = true;
+    unlisten?.();
+  };
+}
+
 export async function analyzeFace(
   pixels: Uint8ClampedArray,
   width: number,

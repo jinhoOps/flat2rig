@@ -1,31 +1,23 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowDown,
   ArrowUp,
   Box,
   Check,
-  CheckCircle2,
   ChevronRight,
   CircleHelp,
   Crosshair,
   Download,
   Eraser,
-  Eye,
-  EyeOff,
   FileImage,
   FolderOpen,
-  GripVertical,
   ImagePlus,
   Layers,
-  Loader2,
-  Maximize,
   MousePointer2,
-  Move,
   Pause,
   Play,
   Plus,
-  Redo2,
   RefreshCw,
   Save,
   ScanFace,
@@ -33,12 +25,9 @@ import {
   SlidersHorizontal,
   Smile,
   Sparkles,
-  Undo2,
   Upload,
   WandSparkles,
   X,
-  ZoomIn,
-  ZoomOut,
 } from "lucide-react";
 import type {
   BlendMode,
@@ -97,6 +86,7 @@ import {
   getAppVersion,
   getModelStatus,
   installAppUpdate,
+  listenTaskProgress,
   proposeParts,
   refinePartPrompt,
   relaunchApp,
@@ -144,8 +134,32 @@ import {
   downloadSpriteGuide,
   renderSpriteGuideCanvas,
 } from "./demo";
-import { BrandMark, BrandWordmark } from "./brand/Brand";
+import { BrandMark } from "./brand/Brand";
 import BrandLoop from "./brand/BrandLoop";
+import CatProgress from "./workspace/CatProgress";
+import LayersPanel, { DYNAMIC_LAYER_KINDS } from "./workspace/LayersPanel";
+import MenuBar, { type MenuDef } from "./workspace/MenuBar";
+import OptionsBar from "./workspace/OptionsBar";
+import StatusBar from "./workspace/StatusBar";
+import Toolbox from "./workspace/Toolbox";
+import {
+  layerRows,
+  partHasFill,
+  selectLayerRow,
+  selectLayerThumb,
+  type EditTarget,
+} from "./workspace/layers";
+import { combineProgress, type StepProgress } from "./workspace/progress";
+import { resolveShortcut, stepBrushRadius, type NavTool } from "./workspace/shortcuts";
+
+const THEME_KEY = "flat2rig.theme";
+function loadTheme(): "dark" | "light" {
+  try {
+    return window.localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+}
 
 const ROLE_LABELS: Record<string, string> = {
   face_detector: "얼굴 검출 (YOLOv3)",
@@ -238,7 +252,37 @@ export default function App() {
   const [project, setProject] = useState<Project | null>(null),
     projectRef = useRef<Project | null>(null);
   const [selected, setSelected] = useState("face"),
-    [tool, setTool] = useState<Tool>("landmark");
+    [tool, setToolState] = useState<Tool>("landmark");
+  /** T11a: hand / zoom sit beside the edit tool; picking an edit tool leaves navigation mode. */
+  const [navTool, setNavTool] = useState<NavTool | null>(null);
+  const setTool = (t: Tool) => {
+    setToolState(t);
+    setNavTool(null);
+  };
+  /** T11a: which mask the brush is meant for (layer thumbnails pick it; T11b routes strokes). */
+  const [editTarget, setEditTarget] = useState<EditTarget>("visible");
+  const [theme, setTheme] = useState<"dark" | "light">(loadTheme);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      /* per-viewer convenience only */
+    }
+  }, [theme]);
+  const [dockOpen, setDockOpen] = useState(true);
+  const [propsOpen, setPropsOpen] = useState(true);
+  const [layersOpen, setLayersOpen] = useState(true);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(max-width: 960px)");
+    const apply = () => setDockOpen(!mq.matches);
+    apply();
+    mq.addEventListener?.("change", apply);
+    return () => mq.removeEventListener?.("change", apply);
+  }, []);
+  /** T11a: front-end steps (outer) and Rust `task-progress` events (inner) for the cat bar. */
+  const [outerProgress, setOuterProgress] = useState<StepProgress | null>(null);
+  const [innerProgress, setInnerProgress] = useState<StepProgress | null>(null);
   const [tab, setTab] = useState<AppTab>("prepare");
   const [advancedPreview, setAdvancedPreview] = useState(false);
   const projectTextures = useProjectTextures(project);
@@ -504,17 +548,27 @@ export default function App() {
   };
   const task = async (
     label: string,
-    run: (signal: AbortSignal) => Promise<void>,
+    run: (
+      signal: AbortSignal,
+      report: (done: number, total: number, step?: string) => void,
+    ) => Promise<void>,
   ) => {
     if (controller.current) return;
     const abort = new AbortController();
     controller.current = abort;
     setBusy(label);
+    setOuterProgress(null);
+    setInnerProgress(null);
     setError("");
     setMessage("");
+    const report = (done: number, total: number, step?: string) => {
+      if (controller.current !== abort) return;
+      setOuterProgress({ done, total, step });
+      setInnerProgress(null);
+    };
     try {
       await new Promise((r) => setTimeout(r, 30));
-      await run(abort.signal);
+      await run(abort.signal, report);
     } catch (e) {
       if (abort.signal.aborted)
         setMessage("작업을 취소했습니다. 생성 결과를 적용하지 않았습니다.");
@@ -522,8 +576,19 @@ export default function App() {
     } finally {
       controller.current = null;
       setBusy("");
+      setOuterProgress(null);
+      setInnerProgress(null);
     }
   };
+  useEffect(
+    () =>
+      listenTaskProgress((ev) => {
+        // Only while a task runs; a late event from a finished job must not revive the bar.
+        if (!controller.current) return;
+        setInnerProgress({ done: ev.done, total: ev.total, step: ev.step });
+      }),
+    [],
+  );
   const reset = (p: Project) => {
     dragSnapshot.current = null;
     history.current = [];
@@ -723,11 +788,13 @@ export default function App() {
     }
     setPendingDrop(null);
     const jobId = ++analysisJobSeq.current;
-    void task("이미지 준비 · 얼굴 검출 중", async (signal) => {
+    void task("이미지 준비 · 얼굴 검출 중", async (signal, report) => {
+      report(0, 2, "이미지 준비");
       const p = await readImage(file);
       signal.throwIfAborted();
       reset(p);
       const data = pixels(await loadImage(p.source), p.width, p.height);
+      report(1, 2, "얼굴 검출");
       const res = await analyzeFace(data, p.width, p.height, null, jobId, signal);
       signal.throwIfAborted();
       const current = projectRef.current;
@@ -828,13 +895,14 @@ export default function App() {
       stagesToRun.length > 1
         ? `1→${stageIdx + 1}단계 순차 실루엣 적층 중`
         : `${stageLabels[stage]} 생성 중`;
-    void task(taskTitle, async (signal) => {
+    void task(taskTitle, async (signal, report) => {
       const data = pixels(await loadImage(p.source), p.width, p.height);
       const faceCand = p.faceCandidates?.[p.selectedFaceId ?? 0];
       let workingParts = p.parts.slice();
       let totalPreserved = 0;
       let lastResult: Awaited<ReturnType<typeof proposeParts>> | null = null;
-      for (const stepStage of stagesToRun) {
+      for (const [stepIdx, stepStage] of stagesToRun.entries()) {
+        report(stepIdx, stagesToRun.length, stageLabels[stepStage]);
         const jobId = ++analysisJobSeq.current;
         const result = await proposeParts(
           data,
@@ -971,42 +1039,40 @@ export default function App() {
   };
   useEffect(() => {
     const keyboard = (e: KeyboardEvent) => {
-      const targetEl = e.target instanceof Element ? e.target : null;
-      if (targetEl?.matches("input,textarea,select") || controller.current)
-        return;
-      if (e.ctrlKey || e.metaKey) {
-        const key = e.key.toLowerCase();
-        if (key === "z") {
+      const cur = projectRef.current;
+      const action = resolveShortcut(e, {
+        busy: !!controller.current,
+        hasProject: !!cur,
+        hasParts: !!cur?.parts.length,
+        editTools: tab === "prepare" || (tab === "advanced" && !advancedPreview),
+        rigStage: tab === "expressions" || tab === "adjust" || tab === "play",
+        modal: !!modal,
+      });
+      if (!action) return;
+      switch (action.type) {
+        case "undo":
           e.preventDefault();
-          e.shiftKey ? redo() : undo();
-        }
-        if (key === "y") {
+          undo();
+          return;
+        case "redo":
           e.preventDefault();
           redo();
-        }
-        if (key === "s") {
+          return;
+        case "save":
           e.preventDefault();
           document
             .querySelector<HTMLButtonElement>('[data-action="save"]')
             ?.click();
-        }
-        return;
-      }
-      if (
-        (tab === "expressions" || tab === "adjust" || tab === "play") &&
-        projectRef.current?.parts.length &&
-        !modal
-      ) {
-        if (e.code === "Space" && !targetEl?.matches("button,a")) {
+          return;
+        case "togglePlay":
           e.preventDefault();
           setPlaying((v) => !v);
           return;
-        }
-        if (/^[1-9]$/.test(e.key)) {
-          const cur = projectRef.current;
-          const idx = Number(e.key) - 1;
+        case "expression": {
+          if (!cur) return;
+          const idx = Number(action.key) - 1;
           const exp =
-            cur.expressions.find((item) => item.shortcutKey === e.key) ??
+            cur.expressions.find((item) => item.shortcutKey === action.key) ??
             cur.expressions[idx];
           if (exp) {
             e.preventDefault();
@@ -1014,27 +1080,27 @@ export default function App() {
               selectExpressionPreset(cur, exp.id),
               `표정 '${exp.name}' 전환`,
             );
-            if (e.key === "1" || exp.id === "neutral") {
+            if (action.key === "1" || exp.id === "neutral") {
               setParameters({ ...(cur.rigProfile?.neutralParameters ?? REST) });
             }
           }
           return;
         }
-      }
-      if (tab === "prepare" || (tab === "advanced" && !advancedPreview)) {
-        const keys: Record<string, Tool> = {
-          v: "select",
-          b: "add",
-          e: "erase",
-          p: "prompt",
-          l: "landmark",
-          f: "face",
-        };
-        if (keys[e.key]) setTool(keys[e.key]);
-      }
-      if (e.key === "Escape") {
-        setModal(null);
-        setPlaying(false);
+        case "tool":
+          setToolState(action.tool);
+          setNavTool(null);
+          return;
+        case "nav":
+          setNavTool(action.nav);
+          return;
+        case "brush":
+          e.preventDefault();
+          setRadius((r) => stepBrushRadius(r, action.delta));
+          return;
+        case "escape":
+          setModal(null);
+          setPlaying(false);
+          return;
       }
     };
     const unload = (e: BeforeUnloadEvent) => {
@@ -1541,7 +1607,7 @@ export default function App() {
         t.mask.some((v) => v > 0),
     );
     if (!targets.length) return;
-    void task("얼굴·목·뒷머리 가림 영역 일괄 보완 중", async (signal) => {
+    void task("얼굴·목·뒷머리 가림 영역 일괄 보완 중", async (signal, report) => {
       const updates = new Map<
         string,
         {
@@ -1553,8 +1619,9 @@ export default function App() {
           texture: string;
         }
       >();
-      for (const target of targets) {
+      for (const [targetIdx, target] of targets.entries()) {
         signal.throwIfAborted();
+        report(targetIdx, targets.length, target.name);
         const data = pixels(
           await loadImage(target.texture ?? p.source),
           p.width,
@@ -1716,11 +1783,15 @@ export default function App() {
     approved =
       project?.parts.filter((p) => p.status === "approved").length ?? 0;
   const total = project?.parts.length ?? 0;
-  const showLayers = tab === "prepare" || tab === "advanced";
+  useEffect(() => {
+    // A hidden-area target only makes sense on a part that has hidden pixels.
+    if (editTarget === "hidden" && !(part && partHasFill(part))) setEditTarget("visible");
+  }, [editTarget, part]);
   const isRigStage = tab === "expressions" || tab === "adjust" || tab === "play";
   const preview = isRigStage || (tab === "advanced" && advancedPreview);
   const changeTab = (t: AppTab) => {
     setTab(t);
+    setLayersOpen(t === "prepare" || t === "advanced");
     if (t === "expressions" || t === "adjust" || t === "play") {
       setOriginal(false);
       setOverlay(false);
@@ -1735,9 +1806,155 @@ export default function App() {
       setPlaying(false);
     }
   };
+  // ---- T11a workspace shell helpers -------------------------------------------------------
+  const rows = project ? layerRows(project.parts) : [];
+  const taskProgress = combineProgress(outerProgress, innerProgress);
+  const zoomIn = () => setZoom((z) => clamp(z + 0.25, 0.25, 4));
+  const zoomOut = () => setZoom((z) => clamp(z - 0.25, 0.25, 4));
+  const addEmptyPart = () => {
+    if (!project) return;
+    const p = newPart(project.width, project.height);
+    commit({ ...project, parts: [...project.parts, p] });
+    setSelected(p.id);
+    setTool("add");
+  };
+  const openUpdates = () => {
+    if (!updateInfo && !checkingUpdate) void runUpdateCheck();
+    setModal("updates");
+  };
+  const openModels = () => {
+    if (desktop) void getModelStatus().then(setModelStatus).catch(() => {});
+    setModal("models");
+  };
+  const openSample = () => {
+    void demoFile().then(openImage);
+  };
+  const openSpriteGuide = () => {
+    setGuideZoom("fit");
+    setModal("spriteGuide");
+  };
+  const captionMode = !project
+    ? ""
+    : original
+      ? "ORIGINAL"
+      : tab === "play"
+        ? playing
+          ? "LIVE PLAYBACK"
+          : "CLEAN STAGE"
+        : tab === "expressions"
+          ? `EXPRESSION · ${project.expressions.find((e) => e.id === project.activeExpressionId)?.name ?? "기본"}`
+          : preview
+            ? "MOTION PREVIEW"
+            : "WORKING CANVAS";
+  const viewToggles = [
+    {
+      key: "original",
+      label: "원본",
+      checked: original,
+      disabled: !project || preview,
+      onChange: (checked: boolean) => {
+        setOriginal(checked);
+        if (checked) setCompareDiff(false);
+      },
+    },
+    {
+      key: "fill",
+      label: "보완",
+      checked: fillOverlay,
+      disabled: !total || preview,
+      onChange: setFillOverlay,
+    },
+    {
+      key: "diff",
+      label: "차이",
+      checked: compareDiff,
+      disabled: !total || preview,
+      onChange: (checked: boolean) => {
+        setCompareDiff(checked);
+        if (checked) setOriginal(false);
+      },
+    },
+    {
+      key: "wire",
+      label: "메쉬",
+      checked: wire,
+      disabled: !total,
+      onChange: setWire,
+    },
+  ];
+  const isBusy = !!busy;
+  const menus: MenuDef[] = [
+    {
+      id: "file",
+      label: "파일",
+      items: [
+        { label: "이미지 열기…", disabled: isBusy, onSelect: () => input.current?.click() },
+        { label: "프로젝트 열기…", disabled: isBusy, onSelect: () => projectInput.current?.click() },
+        { label: "샘플 일러스트 열기", disabled: isBusy, onSelect: openSample },
+        "separator",
+        { label: "저장", shortcut: "Ctrl+S", disabled: !project || isBusy, onSelect: save },
+        { label: "내보내기…", disabled: !total || isBusy, onSelect: () => setModal("export") },
+        { label: "현재 표정 PNG 저장", disabled: !total || isBusy, onSelect: exportCurrentFramePng },
+        "separator",
+        {
+          label: csv ? "Cubism CSV 샘플 연결됨 · 다시 연결…" : "Cubism CSV 샘플 연결…",
+          disabled: isBusy,
+          onSelect: () => csvInput.current?.click(),
+        },
+      ],
+    },
+    {
+      id: "edit",
+      label: "편집",
+      items: [
+        { label: "실행 취소", shortcut: "Ctrl+Z", disabled: !historyCount[0] || isBusy, onSelect: undo },
+        { label: "다시 실행", shortcut: "Ctrl+Shift+Z", disabled: !historyCount[1] || isBusy, onSelect: redo },
+        "separator",
+        { label: "빈 파츠 추가", disabled: !project || isBusy, onSelect: addEmptyPart },
+        ...DYNAMIC_LAYER_KINDS.map(([kind, label]) => ({
+          label: `분리 레이어 추가 · ${label}`,
+          disabled: !total || isBusy,
+          onSelect: () => addDynamicLayer(kind),
+        })),
+      ],
+    },
+    {
+      id: "view",
+      label: "보기",
+      items: [
+        { label: "확대", disabled: !project, onSelect: zoomIn },
+        { label: "축소", disabled: !project, onSelect: zoomOut },
+        { label: "화면에 맞춤", disabled: !project, onSelect: () => setZoom(1) },
+        "separator",
+        ...viewToggles.map((t) => ({
+          label: t.label === "보완" ? "가림 보완 영역" : t.label === "차이" ? "원본 대비 합성 차이" : t.label,
+          checked: t.checked,
+          disabled: t.disabled,
+          onSelect: () => t.onChange(!t.checked),
+        })),
+        { label: "마스크 색상 표시", checked: overlay, disabled: !project || preview, onSelect: () => setOverlay((v) => !v) },
+        { label: "선택 파츠만 보기", checked: solo, disabled: !total || preview, onSelect: () => setSolo((v) => !v) },
+        "separator",
+        { label: "어두운 작업 공간", checked: theme === "dark", onSelect: () => setTheme((v) => (v === "dark" ? "light" : "dark")) },
+        { label: "패널 도크", checked: dockOpen, onSelect: () => setDockOpen((v) => !v) },
+      ],
+    },
+    {
+      id: "help",
+      label: "도움말",
+      items: [
+        { label: "사용 가이드", onSelect: () => setModal("help") },
+        { label: "권장 일러스트 · 텍스처 아틀라스 예시", onSelect: openSpriteGuide },
+        "separator",
+        { label: "ONNX 모델 관리…", disabled: isBusy, onSelect: openModels },
+        { label: "앱 버전 · 업데이트…", disabled: isBusy, onSelect: openUpdates },
+      ],
+    },
+  ];
   return (
     <div
-      className={`app${dragging ? " is-dragging" : ""}`}
+      className={`app ws-app${dragging ? " is-dragging" : ""}`}
+      data-theme={theme}
       onDragEnter={(e) => {
         if (!e.dataTransfer.types.includes("Files")) return;
         e.preventDefault();
@@ -1829,18 +2046,18 @@ export default function App() {
             });
         }}
       />
-      <header className="topbar">
-        <a className="brand" href="#" onClick={(e) => e.preventDefault()}>
-          <BrandMark />
-          <BrandWordmark />
-        </a>
-        <div className="header-divider" />
-        <span className="project-title">
+      <header className="ws-titlebar topbar">
+        <MenuBar menus={menus}>
+          <a className="brand ws-brand" href="#" onClick={(e) => e.preventDefault()} aria-label="flat2rig">
+            <BrandMark />
+          </a>
+        </MenuBar>
+        <span className="project-title ws-title">
           {project?.name ?? "새 프로젝트"}
-          {dirty && <i className="dirty-dot" />}
+          {dirty && <i className="dirty-dot" aria-label="저장하지 않은 변경" />}
+          <span className="version">v{appVersion}</span>
         </span>
-        <span className="version">v{appVersion}</span>
-        <div className="header-actions">
+        <div className="header-actions ws-actions">
           <span className="local-status">
             <i />
             {desktop ? "로컬 처리" : "브라우저 미리보기"}
@@ -1852,31 +2069,30 @@ export default function App() {
                 : undefined
             }
             disabled={!!busy}
-            onClick={() => {
-              if (!updateInfo && !checkingUpdate) void runUpdateCheck();
-              setModal("updates");
-            }}
+            onClick={openUpdates}
             title="앱 버전 확인 및 자동 업데이트"
           >
             <RefreshCw size={14} className={checkingUpdate ? "spin" : ""} />
-            {updateInfo?.status === "available" && updateInfo.latestVersion
-              ? `업데이트 v${updateInfo.latestVersion}`
-              : "업데이트"}
+            <span className="ws-btn-text">
+              {updateInfo?.status === "available" && updateInfo.latestVersion
+                ? `업데이트 v${updateInfo.latestVersion}`
+                : "업데이트"}
+            </span>
           </button>
           <button
             disabled={!!busy}
-            onClick={() => {
-              if (desktop) void getModelStatus().then(setModelStatus).catch(() => {});
-              setModal("models");
-            }}
+            onClick={openModels}
             title="ONNX 모델 설치 · SHA-256 검증 설정"
           >
             <Settings size={15} />
-            모델 {modelStatus.length ? `${modelStatus.filter((m) => m.hashMatches).length}/${modelStatus.length}` : "관리"}
+            <span className="ws-btn-text">
+              모델 {modelStatus.length ? `${modelStatus.filter((m) => m.hashMatches).length}/${modelStatus.length}` : "관리"}
+            </span>
           </button>
           <button
             className="icon-button"
             aria-label="사용 가이드"
+            title="사용 가이드"
             onClick={() => setModal("help")}
           >
             <CircleHelp size={17} />
@@ -1885,6 +2101,7 @@ export default function App() {
             data-action="save"
             disabled={!project || !!busy}
             onClick={save}
+            title="저장 (Ctrl+S)"
           >
             <Save size={15} />
             저장
@@ -1900,281 +2117,59 @@ export default function App() {
           </button>
         </div>
       </header>
-      <div className={showLayers ? "workspace" : "workspace no-layers"}>
-        {showLayers && (
-        <aside className="layers-panel">
-          <div className="panel-header">
-            <span>
-              <Layers size={15} />
-              파츠 레이어
-            </span>
-            <span className="badge">{total.toString().padStart(2, "0")}</span>
-          </div>
-          <div className="layer-actions">
-            <button disabled={!!busy} onClick={() => input.current?.click()}>
-              <ImagePlus size={14} />
-              이미지 열기
-            </button>
-            <button
-              className="icon-button"
-              aria-label="프로젝트 열기"
-              disabled={!!busy}
-              onClick={() => projectInput.current?.click()}
-            >
-              <FolderOpen size={16} />
-            </button>
-            <button
-              className="icon-button"
-              aria-label="파츠 추가"
-              disabled={!project || !!busy}
-              onClick={() => {
-                if (project) {
-                  const p = newPart(project.width, project.height);
-                  commit({ ...project, parts: [...project.parts, p] });
-                  setSelected(p.id);
-                  setTool("add");
-                }
-              }}
-            >
-              <Plus size={16} />
-            </button>
-          </div>
-          {total > 0 && (
-            <div className="candidate-pills" style={{ padding: "6px 10px 2px", gap: 4 }}>
-              {(
-                [
-                  ["hair_front", "+ 앞머리"],
-                  ["hair_side_R", "+ 오른옆"],
-                  ["hair_side_L", "+ 왼옆"],
-                  ["hair_back", "+ 뒷머리"],
-                  ["hat", "+ 모자"],
-                  ["clothes_outer", "+ 의상"],
-                  ["acc_glasses", "+ 안경"],
-                  ["acc_hairpin", "+ 악세"],
-                ] as const
-              ).map(([kind, label]) => (
-                <button
-                  key={kind}
-                  className="compact-pill"
-                  disabled={!!busy}
-                  onClick={() => addDynamicLayer(kind)}
-                  title={`${label.replace("+ ", "")} 분리 레이어 추가`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          )}
-          <div className="layer-list">
-            {!total ? (
-              <div className="layer-empty">
-                <Box size={25} />
-                <span>파츠를 준비해 보세요</span>
-                <p>
-                  이미지를 열고 얼굴 위치를 맞추면
-                  <br />
-                  분리 초안을 만들 수 있습니다.
-                </p>
+      <OptionsBar
+        tab={tab}
+        tool={tool}
+        navTool={navTool}
+        preview={preview}
+        isRigStage={isRigStage}
+        hasProject={!!project}
+        busy={!!busy}
+        radius={radius}
+        onRadius={setRadius}
+        onTool={setTool}
+        editTarget={editTarget}
+        selectedName={!preview ? part?.name : undefined}
+        selectedColor={part?.color}
+        canUndo={!!historyCount[0]}
+        canRedo={!!historyCount[1]}
+        onUndo={undo}
+        onRedo={redo}
+        toggles={viewToggles}
+        zoom={zoom}
+        onZoomOut={zoomOut}
+        onZoomIn={zoomIn}
+        onFit={() => setZoom(1)}
+      />
+      <div
+        className={`ws-body${dockOpen && (propsOpen || layersOpen) ? "" : " is-dock-collapsed"}`}
+      >
+        <Toolbox
+          tool={tool}
+          navTool={navTool}
+          editEnabled={!preview}
+          hasParts={!!total}
+          hasProject={!!project}
+          busy={!!busy}
+          onTool={setTool}
+          onNav={setNavTool}
+        />
+        <main className="ws-center editor">
+          <div className="ws-doctabs">
+            {project ? (
+              <div className="ws-doctab is-active" title={`${project.name} · ${project.width} × ${project.height}px`}>
+                <FileImage size={13} />
+                <span className="ws-doctab-name">
+                  {project.name} @ {Math.round(zoom * 100)}%
+                </span>
+                <span className="ws-doctab-mode">({captionMode}){dirty ? "*" : ""}</span>
               </div>
             ) : (
-              (() => {
-                const rev = [...project!.parts].reverse();
-                return rev.map((p, i) => {
-                  const groupName = p.group || "기타";
-                  const prevGroup =
-                    i > 0 ? rev[i - 1].group || "기타" : null;
-                  const showHeader = groupName !== prevGroup;
-                  let runCount = 0;
-                  let groupAllVisible = true;
-                  let groupAnyVisible = false;
-                  if (showHeader) {
-                    for (const gp of project!.parts) {
-                      if ((gp.group || "기타") === groupName) {
-                        if (gp.visible) groupAnyVisible = true;
-                        else groupAllVisible = false;
-                      }
-                    }
-                    for (
-                      let k = i;
-                      k < rev.length && (rev[k].group || "기타") === groupName;
-                      k++
-                    )
-                      runCount++;
-                  }
-                  return (
-                    <Fragment key={p.id}>
-                      {showHeader && (
-                        <div className="layer-group-header">
-                          <span className="layer-group-left">
-                            <span
-                              className={`layer-group-eye${
-                                groupAnyVisible && !groupAllVisible
-                                  ? " is-partial"
-                                  : !groupAnyVisible
-                                    ? " is-hidden"
-                                    : ""
-                              }`}
-                              role="checkbox"
-                              aria-checked={
-                                groupAllVisible
-                                  ? true
-                                  : groupAnyVisible
-                                    ? "mixed"
-                                    : false
-                              }
-                              aria-label={`${groupName} 그룹 일괄 표시`}
-                              title={`${groupName} 그룹 일괄 표시/숨김`}
-                              tabIndex={0}
-                              onKeyDown={(e) => {
-                                if (e.key === " " || e.key === "Enter") {
-                                  e.preventDefault();
-                                  e.stopPropagation();
-                                  toggleGroupVisible(groupName);
-                                }
-                              }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                toggleGroupVisible(groupName);
-                              }}
-                            >
-                              {groupAnyVisible ? <Eye size={13} /> : <EyeOff size={13} />}
-                            </span>
-                            <span>{groupName}</span>
-                          </span>
-                          <span className="param-group-badge">{runCount}</span>
-                        </div>
-                      )}
-                      <button
-                        className={`layer ${selected === p.id ? "selected" : ""} ${p.status === "missing" ? "missing" : ""}`}
-                        disabled={!!busy}
-                        onClick={() => setSelected(p.id)}
-                      >
-                        <span
-                          className="layer-visibility"
-                          role="checkbox"
-                          aria-checked={p.visible}
-                          aria-label={`${p.name} 표시`}
-                          tabIndex={0}
-                          onKeyDown={(e) => {
-                            if (e.key === " ") {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              toggleVisible(p.id);
-                            }
-                          }}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleVisible(p.id);
-                          }}
-                        >
-                          {p.visible ? <Eye size={13} /> : <EyeOff size={13} />}
-                        </span>
-                        <span
-                          className="layer-thumb"
-                          style={{ "--part-color": p.color } as React.CSSProperties}
-                        >
-                          <Layers size={14} />
-                        </span>
-                        <span className="layer-label">
-                          <strong>{p.name}</strong>
-                          <small>
-                            {p.id} · {partProvenanceLabel(p.provenance)}
-                            {p.diagnostics?.length
-                              ? ` · ⚠${diagnosticLabel(p.diagnostics[0])}`
-                              : ""}
-                          </small>
-                        </span>
-                        <span
-                          className={`status-dot ${p.status}`}
-                          title={
-                            p.status === "approved"
-                              ? "확인됨"
-                              : p.status === "missing"
-                                ? "미해당"
-                                : "확인 필요"
-                          }
-                        >
-                          {p.status === "approved" && <Check size={12} />}
-                        </span>
-                        <GripVertical className="grip" size={14} />
-                        <span className="sr-only">{i + 1}</span>
-                      </button>
-                    </Fragment>
-                  );
-                });
-              })()
+              <div className="ws-doctab">
+                <ImagePlus size={13} />
+                <span className="ws-doctab-name">시작하기</span>
+              </div>
             )}
-          </div>
-          <div className="layer-footer">
-            <div>
-              <span>파츠 확인</span>
-              <strong>
-                {approved}
-                <small> / {total}</small>
-              </strong>
-            </div>
-            <div className="progress-track">
-              <div
-                style={{ width: `${total ? (approved / total) * 100 : 0}%` }}
-              />
-            </div>
-            <p>좌우는 캐릭터 기준입니다.</p>
-          </div>
-        </aside>
-        )}
-        <main className="editor">
-          <div className="editor-tabs">
-            <div role="tablist" aria-label="작업 단계">
-              <button
-                role="tab"
-                aria-selected={tab === "prepare"}
-                className={tab === "prepare" ? "active" : ""}
-                onClick={() => changeTab("prepare")}
-              >
-                <ScanFace size={15} />
-                1. 준비
-              </button>
-              <button
-                role="tab"
-                aria-selected={tab === "expressions"}
-                disabled={!total || !!busy}
-                className={tab === "expressions" ? "active" : ""}
-                onClick={() => changeTab("expressions")}
-              >
-                <Smile size={15} />
-                2. 표정
-              </button>
-              <button
-                role="tab"
-                aria-selected={tab === "adjust"}
-                disabled={!total || !!busy}
-                className={tab === "adjust" ? "active" : ""}
-                onClick={() => changeTab("adjust")}
-              >
-                <SlidersHorizontal size={15} />
-                3. 조정
-              </button>
-              <button
-                role="tab"
-                aria-selected={tab === "play"}
-                disabled={!total || !!busy}
-                className={tab === "play" ? "active" : ""}
-                onClick={() => changeTab("play")}
-              >
-                <Play size={15} />
-                4. 재생
-              </button>
-              <button
-                role="tab"
-                aria-selected={tab === "advanced"}
-                disabled={!!busy}
-                className={`tab-advanced${tab === "advanced" ? " active" : ""}`}
-                onClick={() => changeTab("advanced")}
-              >
-                <Layers size={14} />
-                고급 (파츠·메쉬·PSD)
-              </button>
-            </div>
             <span className="stage-tag">
               {tab === "prepare"
                 ? "01 PREPARE"
@@ -2189,216 +2184,34 @@ export default function App() {
                       : "ADVANCED"}
             </span>
           </div>
-          {!isRigStage && (
-          <div className="toolbar">
-            <div className="tool-group">
-              {(
-                [
-                  { key: "select", label: "선택 (V)", icon: MousePointer2 },
-                  { key: "face", label: "얼굴 영역 지정 (F)", icon: ScanFace },
-                  { key: "landmark", label: "랜드마크 이동 (L)", icon: Move },
-                  { key: "prompt", label: "클릭 보정 (P)", icon: Crosshair },
-                  { key: "add", label: "마스크 추가 (B)", icon: Plus },
-                  { key: "erase", label: "마스크 지우기 (E)", icon: Eraser },
-                ] as const
-              ).map((t) => (
-                <button
-                  key={t.key}
-                  className={`icon-button ${tool === t.key && !preview ? "active" : ""}`}
-                  title={t.label}
-                  aria-label={t.label}
-                  disabled={
-                    !project ||
-                    preview ||
-                    !!busy ||
-                    (!total &&
-                      (t.key === "add" || t.key === "erase" || t.key === "prompt"))
-                  }
-                  onClick={() => setTool(t.key)}
-                >
-                  <t.icon size={17} />
-                </button>
-              ))}
-            </div>
-            <span className="tool-divider" />
-            <button
-              className="icon-button"
-              aria-label="실행 취소"
-              title="Ctrl+Z"
-              disabled={!historyCount[0] || !!busy}
-              onClick={undo}
-            >
-              <Undo2 size={16} />
-            </button>
-            <button
-              className="icon-button"
-              aria-label="다시 실행"
-              title="Ctrl+Shift+Z"
-              disabled={!historyCount[1] || !!busy}
-              onClick={redo}
-            >
-              <Redo2 size={16} />
-            </button>
-            <div className="toolbar-end">
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={original}
-                  disabled={!project || preview}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    setOriginal(checked);
-                    if (checked) setCompareDiff(false);
-                  }}
-                />
-                원본
-              </label>
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={fillOverlay}
-                  disabled={!total || preview}
-                  onChange={(e) => setFillOverlay(e.target.checked)}
-                />
-                보완
-              </label>
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={compareDiff}
-                  disabled={!total || preview}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    setCompareDiff(checked);
-                    if (checked) setOriginal(false);
-                  }}
-                />
-                차이
-              </label>
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={wire}
-                  disabled={!total}
-                  onChange={(e) => setWire(e.target.checked)}
-                />
-                메쉬
-              </label>
-              <button
-                className="icon-button"
-                aria-label="화면에 맞춤"
-                onClick={() => setZoom(1)}
-              >
-                <Maximize size={15} />
-              </button>
-            </div>
-          </div>
-          )}
-          <div className={`stage ${busy ? "working" : ""}`}>
+          <div className={`stage ${busy ? "working" : ""}`} aria-busy={busy ? true : undefined}>
             {project ? (
-              <>
-                <div className="canvas-caption">
-                  <span>
-                    <i />
-                    {original
-                      ? "ORIGINAL"
-                      : tab === "play"
-                        ? playing
-                          ? "LIVE PLAYBACK"
-                          : "CLEAN STAGE"
-                        : tab === "expressions"
-                          ? `EXPRESSION · ${project.expressions.find((e) => e.id === project.activeExpressionId)?.name ?? "기본"}`
-                          : preview
-                            ? "MOTION PREVIEW"
-                            : "WORKING CANVAS"}
-                  </span>
-                  <span>
-                    {project.width} × {project.height}
-                  </span>
-                </div>
-                <Viewport
-                  project={project}
-                  selected={selected}
-                  tool={tool}
-                  radius={radius}
-                  zoom={zoom}
-                  original={original}
-                  overlay={overlay}
-                  fillOverlay={fillOverlay}
-                  exposureOverlay={tab === "advanced" ? exposureImage : null}
-                  compareDiff={compareDiff}
-                  wire={wire}
-                  solo={solo}
-                  preview={preview}
-                  playing={playing}
-                  cleanStage={tab === "play"}
-                  parameters={parameters}
-                  meshes={meshes}
-                  sharedTextures={projectTextures}
-                  onStart={start}
-                  onMove={move}
-                  onEnd={end}
-                  onCommitMask={commitBrushMask}
-                />
-                <div className="stage-bottom">
-                  <span>
-                    {tab === "play"
-                      ? "Space: 재생/일시정지 · 1~9 키: 표정 빠른 전환"
-                      : tab === "expressions"
-                        ? "우측 표정 카드를 클릭하거나 1~9 키로 즉시 전환할 수 있습니다"
-                        : tab === "adjust"
-                          ? "왼쪽/오른쪽 눈·입 모양을 고르고 슬라이더로 각도를 다듬으세요"
-                          : preview
-                            ? "고급 메쉬/변형 확인 모드입니다"
-                            : tool === "face"
-                              ? "얼굴 피부 영역의 좌상단에서 우하단까지 드래그하세요 · Space+드래그: 이동"
-                              : tool === "landmark"
-                                ? "눈 · 입 · 턱 · 얼굴 상단의 점을 드래그하세요 · Space+드래그: 이동"
-                                : tool === "prompt"
-                                  ? "좌클릭: 포함(+) · 우클릭/Alt/Shift+클릭: 제외(-) · Space+드래그: 이동"
-                                  : tool === "add" || tool === "erase"
-                                    ? "드래그하여 마스크 수정 · Space+드래그: 캔버스 이동"
-                                    : "파츠를 선택하여 경계를 확인하세요 · Space+드래그: 이동"}
-                  </span>
-                  <div>
-                    {isRigStage && (
-                      <>
-                        <button
-                          aria-label="실행 취소"
-                          title="실행 취소 (Ctrl+Z)"
-                          disabled={!historyCount[0] || !!busy}
-                          onClick={undo}
-                        >
-                          <Undo2 size={14} />
-                        </button>
-                        <button
-                          aria-label="다시 실행"
-                          title="다시 실행 (Ctrl+Shift+Z)"
-                          disabled={!historyCount[1] || !!busy}
-                          onClick={redo}
-                        >
-                          <Redo2 size={14} />
-                        </button>
-                      </>
-                    )}
-                    <button
-                      aria-label="축소"
-                      onClick={() => setZoom((z) => clamp(z - 0.25, 0.25, 4))}
-                    >
-                      <ZoomOut size={14} />
-                    </button>
-                    <button onClick={() => setZoom(1)}>
-                      {Math.round(zoom * 100)}%
-                    </button>
-                    <button
-                      aria-label="확대"
-                      onClick={() => setZoom((z) => clamp(z + 0.25, 0.25, 4))}
-                    >
-                      <ZoomIn size={14} />
-                    </button>
-                  </div>
-                </div>
-              </>
+              <Viewport
+                project={project}
+                selected={selected}
+                tool={tool}
+                radius={radius}
+                zoom={zoom}
+                original={original}
+                overlay={overlay}
+                fillOverlay={fillOverlay}
+                exposureOverlay={tab === "advanced" ? exposureImage : null}
+                compareDiff={compareDiff}
+                wire={wire}
+                solo={solo}
+                preview={preview}
+                playing={playing}
+                cleanStage={tab === "play"}
+                parameters={parameters}
+                meshes={meshes}
+                sharedTextures={projectTextures}
+                onStart={start}
+                onMove={move}
+                onEnd={end}
+                onCommitMask={commitBrushMask}
+                navTool={navTool}
+                onZoomStep={(d) => (d > 0 ? zoomIn() : zoomOut())}
+              />
             ) : (
               <div
                 className="welcome"
@@ -2429,9 +2242,7 @@ export default function App() {
                   <button
                     className="text-button"
                     disabled={!!busy}
-                    onClick={() => {
-                      void demoFile().then(openImage);
-                    }}
+                    onClick={openSample}
                   >
                     샘플 일러스트로 바로 체험
                     <ChevronRight size={13} />
@@ -2439,10 +2250,7 @@ export default function App() {
                   <button
                     className="text-button guide-link-btn"
                     disabled={!!busy}
-                    onClick={() => {
-                      setGuideZoom("fit");
-                      setModal("spriteGuide");
-                    }}
+                    onClick={openSpriteGuide}
                   >
                     <CircleHelp size={14} />
                     권장 일러스트 · 텍스처 아틀라스 예시 보기 (?)
@@ -2465,9 +2273,13 @@ export default function App() {
               </div>
             )}
             {busy && (
-              <div className="busy-overlay">
+              <div className="busy-overlay" aria-busy="true">
                 <div>
-                  <Loader2 className="spin" size={26} />
+                  <CatProgress
+                    label={busy}
+                    fraction={taskProgress.fraction}
+                    step={taskProgress.step}
+                  />
                   <strong>{busy}</strong>
                   <p>이미지는 이 기기에서 처리됩니다.</p>
                   <button
@@ -2483,54 +2295,97 @@ export default function App() {
               </div>
             )}
           </div>
-          <div className="editor-status">
-            <span className={error ? "error-text" : ""}>
-              {error ? <X size={13} /> : <CheckCircle2 size={13} />}
-              <span role={error ? "alert" : "status"}>
-                {error || message || "PNG 또는 JPG 이미지를 불러오세요."}
-              </span>
-            </span>
-            <span>
-              {meshing ? (
-                <>
-                  <Loader2 size={12} className="spin" />
-                  메쉬 계산 중
-                </>
-              ) : project ? (
-                `${total} PARTS · ${[...meshes.values()].reduce((n, m) => n + m.vertices.length, 0)} VERTICES`
-              ) : (
-                "READY"
-              )}
-            </span>
-          </div>
         </main>
-        <aside className="inspector">
-          <div className="panel-header">
-            <span>
-              <SlidersHorizontal size={15} />
-              {tab === "prepare"
-                ? "준비 · 파츠 생성"
-                : tab === "expressions"
-                  ? "표정 선택 · 저장"
-                  : tab === "adjust"
-                    ? "부위 · 움직임 조정"
-                    : tab === "play"
-                      ? "재생 · PNG 저장"
-                      : "고급 · 파츠·Cubism"}
-            </span>
-            <span className="tiny-label">
-              {tab === "prepare"
-                ? "STEP 1"
-                : tab === "expressions"
-                  ? "STEP 2"
-                  : tab === "adjust"
-                    ? "STEP 3"
-                    : tab === "play"
-                      ? "STEP 4"
-                      : "ADVANCED"}
-            </span>
-          </div>
-          <div className="inspector-scroll">
+        <aside className="ws-dock" aria-label="패널 도크">
+          {dockOpen && (propsOpen || layersOpen) && (
+            <div className="ws-dock-panels">
+              {propsOpen && (
+                <section className="ws-panel ws-props inspector" aria-label="속성">
+                  <div className="ws-panel-head">
+                    <span>
+                      <SlidersHorizontal size={14} />
+                      속성 ·{" "}
+                      {tab === "prepare"
+                        ? "준비 · 파츠 생성"
+                        : tab === "expressions"
+                          ? "표정 선택 · 저장"
+                          : tab === "adjust"
+                            ? "부위 · 움직임 조정"
+                            : tab === "play"
+                              ? "재생 · PNG 저장"
+                              : "고급 · 파츠·Cubism"}
+                    </span>
+                    <span className="tiny-label">
+                      {tab === "prepare"
+                        ? "STEP 1"
+                        : tab === "expressions"
+                          ? "STEP 2"
+                          : tab === "adjust"
+                            ? "STEP 3"
+                            : tab === "play"
+                              ? "STEP 4"
+                              : "ADVANCED"}
+                    </span>
+                  </div>
+                  <div className="editor-tabs ws-steps">
+                    <div role="tablist" aria-label="작업 단계">
+                      <button
+                        role="tab"
+                        aria-selected={tab === "prepare"}
+                        className={tab === "prepare" ? "active" : ""}
+                        onClick={() => changeTab("prepare")}
+                        title="1. 준비"
+                      >
+                        <ScanFace size={14} />
+                        1 준비
+                      </button>
+                      <button
+                        role="tab"
+                        aria-selected={tab === "expressions"}
+                        disabled={!total || !!busy}
+                        className={tab === "expressions" ? "active" : ""}
+                        onClick={() => changeTab("expressions")}
+                        title="2. 표정"
+                      >
+                        <Smile size={14} />
+                        2 표정
+                      </button>
+                      <button
+                        role="tab"
+                        aria-selected={tab === "adjust"}
+                        disabled={!total || !!busy}
+                        className={tab === "adjust" ? "active" : ""}
+                        onClick={() => changeTab("adjust")}
+                        title="3. 조정"
+                      >
+                        <SlidersHorizontal size={14} />
+                        3 조정
+                      </button>
+                      <button
+                        role="tab"
+                        aria-selected={tab === "play"}
+                        disabled={!total || !!busy}
+                        className={tab === "play" ? "active" : ""}
+                        onClick={() => changeTab("play")}
+                        title="4. 재생"
+                      >
+                        <Play size={14} />
+                        4 재생
+                      </button>
+                      <button
+                        role="tab"
+                        aria-selected={tab === "advanced"}
+                        disabled={!!busy}
+                        className={`tab-advanced${tab === "advanced" ? " active" : ""}`}
+                        onClick={() => changeTab("advanced")}
+                        title="고급 (파츠·메쉬·PSD)"
+                      >
+                        <Layers size={13} />
+                        고급
+                      </button>
+                    </div>
+                  </div>
+                  <div className="inspector-scroll">
             {tab === "expressions" && project ? (
               <ExpressionPanel
                 project={project}
@@ -3176,18 +3031,6 @@ export default function App() {
                           if (name && name !== part.name) patchPart({ name });
                         }}
                       />
-                      <label className="field-label">
-                        브러시 크기<span>{radius}px</span>
-                      </label>
-                      <input
-                        aria-label="브러시 크기"
-                        type="range"
-                        min="2"
-                        max="100"
-                        value={radius}
-                        disabled={!!busy}
-                        onChange={(e) => setRadius(+e.target.value)}
-                      />
                       <div className="three-buttons compact">
                         <button
                           className={tool === "prompt" ? "active" : ""}
@@ -3601,16 +3444,115 @@ export default function App() {
             )}
             </>
             )}
-          </div>
-          <div className="inspector-footer">
-            <span className="local-status">
-              <i />
-              로컬 작업 공간
-            </span>
-            <span>flat2rig</span>
+                  </div>
+                </section>
+              )}
+              <section
+                className={`ws-panel ws-layers${layersOpen ? "" : " is-collapsed"}`}
+                aria-label="레이어 패널"
+              >
+                <div className="ws-panel-head">
+                  <button
+                    type="button"
+                    className="ws-panel-toggle"
+                    aria-expanded={layersOpen}
+                    onClick={() => setLayersOpen((v) => !v)}
+                  >
+                    <ChevronRight size={13} className={layersOpen ? "is-open" : ""} />
+                    <Layers size={14} />
+                    레이어
+                  </button>
+                  <span className="badge">{total.toString().padStart(2, "0")}</span>
+                </div>
+                {layersOpen && (
+                  <LayersPanel
+                    rows={rows}
+                    width={project?.width ?? 1}
+                    height={project?.height ?? 1}
+                    selected={selected}
+                    editTarget={editTarget}
+                    busy={!!busy}
+                    hasProject={!!project}
+                    partTextures={projectTextures.partTextures}
+                    approved={approved}
+                    total={total}
+                    onSelectRow={(row) => {
+                      const next = selectLayerRow({ selected, editTarget }, row);
+                      setSelected(next.selected);
+                      setEditTarget(next.editTarget);
+                    }}
+                    onSelectThumb={(row, kind) => {
+                      const next = selectLayerThumb({ selected, editTarget }, row, kind);
+                      setSelected(next.selected);
+                      setEditTarget(next.editTarget);
+                    }}
+                    onToggleVisible={toggleVisible}
+                    onToggleGroup={toggleGroupVisible}
+                    onOpenImage={() => input.current?.click()}
+                    onOpenProject={() => projectInput.current?.click()}
+                    onAddPart={addEmptyPart}
+                    onAddDynamic={addDynamicLayer}
+                  />
+                )}
+              </section>
+            </div>
+          )}
+          <div className="ws-rail" role="toolbar" aria-orientation="vertical" aria-label="패널">
+            <button
+              type="button"
+              className={`tb-tool${dockOpen && propsOpen ? " is-active" : ""}`}
+              aria-label="속성 패널"
+              aria-pressed={dockOpen && propsOpen}
+              title="속성 패널 표시/숨김"
+              onClick={() => {
+                if (!dockOpen) {
+                  setDockOpen(true);
+                  setPropsOpen(true);
+                } else setPropsOpen((v) => !v);
+              }}
+            >
+              <SlidersHorizontal size={16} />
+            </button>
+            <button
+              type="button"
+              className={`tb-tool${dockOpen && layersOpen ? " is-active" : ""}`}
+              aria-label="레이어 패널"
+              aria-pressed={dockOpen && layersOpen}
+              title="레이어 패널 펼치기/접기"
+              onClick={() => {
+                if (!dockOpen) {
+                  setDockOpen(true);
+                  setLayersOpen(true);
+                } else setLayersOpen((v) => !v);
+              }}
+            >
+              <Layers size={16} />
+            </button>
+            <button
+              type="button"
+              className="tb-tool"
+              aria-label={dockOpen ? "도크 접기" : "도크 펼치기"}
+              title={dockOpen ? "도크 접기" : "도크 펼치기"}
+              onClick={() => setDockOpen((v) => !v)}
+            >
+              <ChevronRight size={16} className={dockOpen ? "" : "is-flipped"} />
+            </button>
           </div>
         </aside>
       </div>
+      <StatusBar
+        zoom={zoom}
+        width={project?.width}
+        height={project?.height}
+        parts={total}
+        vertices={[...meshes.values()].reduce((n, m) => n + m.vertices.length, 0)}
+        meshing={meshing}
+        message={message}
+        error={error}
+        busy={busy}
+        progress={taskProgress}
+        onFit={() => setZoom(1)}
+      />
       {modal && (
         <div
           className="modal-backdrop"

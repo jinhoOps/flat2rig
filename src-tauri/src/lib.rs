@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use image::ImageEncoder;
 use std::sync::atomic::Ordering;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 #[derive(Serialize)]
@@ -39,6 +39,36 @@ struct FaceAnalysisResponse {
     rig_provenance: Option<RigLandmarkProvenance>,
     model_hashes: HashMap<String, String>,
     postprocess_versions: HashMap<String, String>,
+}
+
+/// T11a: stage-boundary progress for long analysis commands (`task-progress`).
+/// `done` counts finished steps out of `total`; `step` names the step now running.
+/// Emitted only at natural boundaries (a handful per command) so it never slows the work
+/// and never changes what the command computes or returns.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProgressEvent {
+    pub job: u64,
+    pub step: String,
+    pub done: u32,
+    pub total: u32,
+}
+
+pub const TASK_PROGRESS_EVENT: &str = "task-progress";
+
+pub fn task_progress(job: u64, step: &str, done: u32, total: u32) -> TaskProgressEvent {
+    let total = total.max(1);
+    TaskProgressEvent {
+        job,
+        step: step.to_string(),
+        done: done.min(total),
+        total,
+    }
+}
+
+fn emit_progress(app: &tauri::AppHandle, job: u64, step: &str, done: u32, total: u32) {
+    // A failed emit (e.g. window closing) must not fail the analysis itself.
+    let _ = app.emit(TASK_PROGRESS_EVENT, task_progress(job, step, done, total));
 }
 
 #[tauri::command]
@@ -145,6 +175,7 @@ async fn analyze_face(
             return Err("CANCELLED".into());
         }
 
+        emit_progress(&app, my_job, "입력 확인", 0, 3);
         let n = core::check_size(width, height)?;
         let data = core::decode_bytes(&rgba, n * 4)?;
         let image_hash = hash_rgba_bytes(&data, width, height);
@@ -172,6 +203,7 @@ async fn analyze_face(
             });
         }
 
+        emit_progress(&app, my_job, "얼굴 검출", 1, 3);
         let det = detect_faces(&mut reg, &data, width, height, DEFAULT_FACE_SCORE_THRESHOLD)?;
         if state.is_stale_or_cancelled(my_job) {
             return Err("CANCELLED".into());
@@ -204,6 +236,7 @@ async fn analyze_face(
 
         let chosen = face_index.unwrap_or(0).min(det.candidates.len() - 1);
         let top = &det.candidates[chosen];
+        emit_progress(&app, my_job, "28점 랜드마크", 2, 3);
         let lm = detect_landmarks(&mut reg, &data, width, height, top.bbox, top.crop_bbox)?;
         if state.is_stale_or_cancelled(my_job) {
             return Err("CANCELLED".into());
@@ -276,11 +309,13 @@ async fn detect_landmarks_for_face(
 
         let n = core::check_size(width, height)?;
         let data = core::decode_bytes(&rgba, n * 4)?;
+        emit_progress(&app, my_job, "입력 확인", 0, 2);
         let image_hash = hash_rgba_bytes(&data, width, height);
         let mut reg = state
             .registry
             .lock()
             .map_err(|_| "Model registry lock poisoned".to_string())?;
+        emit_progress(&app, my_job, "28점 랜드마크", 1, 2);
         let lm = detect_landmarks(&mut reg, &data, width, height, bbox, crop_bbox)?;
         if state.is_stale_or_cancelled(my_job) {
             return Err("CANCELLED".into());
@@ -440,6 +475,7 @@ async fn propose_parts(
         let n = core::check_size(width, height)?;
         landmarks.validate(width, height)?;
         let data = core::decode_bytes(&rgba, n * 4)?;
+        emit_progress(&app, my_job, "파츠 분할 · 숨은 영역 합성", 1, 3);
         let pts28 = points_28.unwrap_or_default();
         let mode = detail_mode.unwrap_or_else(|| "detail".into());
         let hs = hair_split.unwrap_or(true);
@@ -463,6 +499,7 @@ async fn propose_parts(
         if state.is_stale_or_cancelled(my_job) {
             return Err("CANCELLED".into());
         }
+        emit_progress(&app, my_job, "결과 정리", 2, 3);
         Ok(ProposePartsResponse {
             job_id: my_job,
             part_ids: out.part_ids,
@@ -514,6 +551,7 @@ async fn refine_part_prompt(
         let n = core::check_size(width, height)?;
         landmarks.validate(width, height)?;
         let data = core::decode_bytes(&rgba, n * 4)?;
+        emit_progress(&app, my_job, "클릭 프롬프트 분할", 1, 2);
         let refined = refine_part_with_prompts(
             &state,
             &data,
@@ -989,5 +1027,26 @@ mod pasted_path_tests {
         std::fs::create_dir_all(&folder).unwrap();
         assert!(validate_pasted_path(&folder).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod task_progress_tests {
+    use super::{task_progress, TASK_PROGRESS_EVENT};
+
+    #[test]
+    fn task_progress_payload_is_camel_case_and_clamped() {
+        assert_eq!(TASK_PROGRESS_EVENT, "task-progress");
+        let ev = task_progress(7, "얼굴 검출", 1, 3);
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "job": 7, "step": "얼굴 검출", "done": 1, "total": 3 })
+        );
+        // done never exceeds total; total is at least one step.
+        let over = task_progress(1, "x", 9, 2);
+        assert_eq!((over.done, over.total), (2, 2));
+        let zero = task_progress(1, "x", 0, 0);
+        assert_eq!((zero.done, zero.total), (0, 1));
     }
 }
