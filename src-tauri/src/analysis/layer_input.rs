@@ -549,4 +549,44 @@ mod tests {
             assert!(load_layer_dir(dir.path()).is_err(), "accepted {bad}");
         }
     }
+
+    /// B1: the app builds layer parts in TypeScript (`src/layerParts.ts`); both sides assert the
+    /// same visible / fill split and composite against `tests/fixtures/layer-split-parity.json`.
+    #[test]
+    fn split_and_composite_match_the_shared_ts_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/layer-split-parity.json");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(cases.len() >= 3);
+        let bytes = |v: &serde_json::Value| -> Vec<u8> {
+            v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u8).collect()
+        };
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let w = case["width"].as_u64().unwrap() as usize;
+            let h = case["height"].as_u64().unwrap() as usize;
+            let layers: Vec<(String, Vec<u8>)> = case["layers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| (l["id"].as_str().unwrap().to_string(), bytes(&l["rgba"])))
+                .collect();
+            let set = set_of(w, h, layers.iter().map(|(id, px)| (id.as_str(), px.clone())).collect());
+            let (masks, fills) = split_visible_fill(&set);
+            let composite = composite_layers(&set);
+            let exp = &case["expected"];
+            for (p, (m, f)) in masks.iter().zip(&fills).enumerate() {
+                assert_eq!(m, &bytes(&exp["masks"][p]), "{name}: mask of layer {p}");
+                assert_eq!(f, &bytes(&exp["fills"][p]), "{name}: fill of layer {p}");
+            }
+            assert_eq!(composite, bytes(&exp["composite"]), "{name}: composite");
+            let check = mask_sum_check(&masks, &composite);
+            assert_eq!(check.max_abs_diff as u64, exp["maskSum"]["maxAbsDiff"].as_u64().unwrap(), "{name}");
+            assert_eq!(check.shared_visible_px as u64, exp["maskSum"]["sharedVisiblePx"].as_u64().unwrap(), "{name}");
+            assert_eq!(check.foreground_px as u64, exp["maskSum"]["foregroundPx"].as_u64().unwrap(), "{name}");
+            assert!(check.matches, "{name}: visible masks must sum to the composite alpha");
+        }
+    }
 }

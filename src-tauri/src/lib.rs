@@ -907,6 +907,8 @@ struct PastedPathFile {
 
 const PASTED_IMAGE_MAX_BYTES: u64 = 60 * 1024 * 1024;
 const PASTED_PROJECT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// B1: layered PSD input (same cap as the webview file reader, `MAX_PSD_BYTES` in `src/psdLayers.ts`).
+const PASTED_PSD_MAX_BYTES: u64 = 300 * 1024 * 1024;
 
 /// Validates a path pasted from the clipboard: an existing regular file whose extension is one the
 /// app opens (PNG / JPEG illustration or `.flat2rig` project) within the input size limits.
@@ -919,8 +921,9 @@ fn validate_pasted_path(path: &std::path::Path) -> Result<(String, u64), String>
         .unwrap_or_default();
     let limit = match ext.as_str() {
         "png" | "jpg" | "jpeg" => PASTED_IMAGE_MAX_BYTES,
+        "psd" => PASTED_PSD_MAX_BYTES,
         "flat2rig" => PASTED_PROJECT_MAX_BYTES,
-        _ => return Err("PNG, JPG 이미지 또는 .flat2rig 파일 경로만 붙여넣을 수 있습니다.".into()),
+        _ => return Err("PNG, JPG 이미지, 레이어 PSD 또는 .flat2rig 파일 경로만 붙여넣을 수 있습니다.".into()),
     };
     if !path.is_absolute() {
         return Err("붙여넣은 경로는 전체 경로여야 합니다.".into());
@@ -1020,6 +1023,9 @@ mod pasted_path_tests {
         let txt = dir.join("notes.txt");
         std::fs::write(&txt, b"x").unwrap();
         assert_eq!(validate_pasted_path(&png).unwrap().0, "art.PNG");
+        let psd = dir.join("layers.psd");
+        std::fs::write(&psd, b"x").unwrap();
+        assert_eq!(validate_pasted_path(&psd).unwrap(), ("layers.psd".to_string(), super::PASTED_PSD_MAX_BYTES));
         assert!(validate_pasted_path(&txt).is_err());
         assert!(validate_pasted_path(&dir.join("missing.png")).is_err());
         assert!(validate_pasted_path(std::path::Path::new("relative.png")).is_err());

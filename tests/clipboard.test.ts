@@ -11,13 +11,16 @@ describe("clipboard paste input", () => {
     expect(parseClipboardPath("file:///C:/art/%ED%9E%88%EB%AF%B8.png")).toBe("C:\\art\\히미.png");
     expect(parseClipboardPath("\\\\nas\\share\\proj.flat2rig")).toBe("\\\\nas\\share\\proj.flat2rig");
     expect(parseClipboardPath("/home/me/art.jpeg")).toBe("/home/me/art.jpeg");
+    // B1: layered PSD is an input now.
+    expect(parseClipboardPath("C:\\art\\model.psd")).toBe("C:\\art\\model.psd");
+    expect(parseClipboardPath('"D:\\art\\Himikan 모델.PSD"')).toBe("D:\\art\\Himikan 모델.PSD");
   });
 
   it("ignores text that is not one openable absolute path", () => {
     expect(parseClipboardPath("")).toBeNull();
     expect(parseClipboardPath("hello")).toBeNull();
     expect(parseClipboardPath("ref/sutteang/2d_.png")).toBeNull();
-    expect(parseClipboardPath("C:\\art\\model.psd")).toBeNull();
+    expect(parseClipboardPath("C:\\art\\model.psb")).toBeNull();
     expect(parseClipboardPath("C:\\a.png\nC:\\b.png")).toBeNull();
     expect(parseClipboardPath("https://example.com/a.png")).toBeNull();
   });
@@ -32,6 +35,8 @@ describe("clipboard paste input", () => {
     expect(clipboardFile({ files: [project], items: [] } as unknown as DataTransfer)?.name).toBe(
       "scene.flat2rig",
     );
+    const psd = new File([new Uint8Array([1])], "layers.psd");
+    expect(clipboardFile({ files: [psd], items: [] } as unknown as DataTransfer)?.name).toBe("layers.psd");
     const text = new File([new Uint8Array([1])], "a.txt", { type: "text/plain" });
     expect(clipboardFile({ files: [text], items: [] } as unknown as DataTransfer)).toBeNull();
   });

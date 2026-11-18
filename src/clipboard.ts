@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
-/** Extensions the app opens from a pasted file or path (illustration or project). */
-const OPENABLE = /\.(png|jpe?g|flat2rig)$/i;
+/** Extensions the app opens from a pasted file or path (illustration, layered PSD or project). */
+const OPENABLE = /\.(png|jpe?g|psd|flat2rig)$/i;
 
 /**
  * Extracts one openable file path from pasted text: a bare Windows / POSIX path, a quoted path
@@ -63,7 +63,9 @@ export async function readClipboardPath(path: string): Promise<File> {
     ? "image/png"
     : /\.jpe?g$/i.test(res.name)
       ? "image/jpeg"
-      : "application/octet-stream";
+      : /\.psd$/i.test(res.name)
+        ? "image/vnd.adobe.photoshop"
+        : "application/octet-stream";
   return new File([bytes], res.name, { type });
 }
 
