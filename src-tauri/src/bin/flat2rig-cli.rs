@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use flat2rig_lib::analysis::{
     detector::{detect_faces, DEFAULT_FACE_SCORE_THRESHOLD},
     landmarks::detect_landmarks,
+    layer_input,
     lineart,
     models::{ModelRegistry, ModelRole},
     parts::{propose_parts_auto_with_template_stage, propose_parts_with_sam_with_options},
@@ -272,6 +273,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut line_art = true;
     let mut rest_gate = true;
     let mut eval = EvalOptions::default();
+    let mut from_layers: Option<PathBuf> = None;
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -318,6 +320,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .get(i)
                 .ok_or("Missing value for --eval-truth (directory with truth-manifest.json)")?;
             eval.truth_dir = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--from-layers=") {
+            from_layers = Some(PathBuf::from(val));
+        } else if arg == "--from-layers" {
+            i += 1;
+            let val = args
+                .get(i)
+                .ok_or("Missing value for --from-layers (directory with <partId>.png + layers.json)")?;
+            from_layers = Some(PathBuf::from(val));
         } else if arg.starts_with("--") {
             return Err(format!("Unknown flag: {arg}").into());
         } else {
@@ -325,19 +335,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
-    if positional.len() < 2 {
-        return Err(
-            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--legacy-eye] [--no-lineart] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
-        );
-    }
+    const USAGE: &str = "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--legacy-eye] [--no-lineart] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --from-layers LAYER_DIR [--uncoupled] [--legacy-eye] OUTPUT_DIR [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]";
+    let input = if let Some(dir) = from_layers {
+        // Finished part layers: segmentation and hidden-area synthesis do not run, so the flags
+        // that only steer them (or re-run them for evaluation) do not apply.
+        if proportion.is_some() || stage.is_some() || eval.any() {
+            return Err(
+                "--from-layers cannot be combined with --proportion, --stage, --eval-holdout or --eval-truth".into(),
+            );
+        }
+        if positional.is_empty() || positional.len() > 2 {
+            return Err(USAGE.into());
+        }
+        PipelineInput {
+            source: PartSource::Layers(dir),
+            output: positional[0],
+            landmarks: positional.get(1).copied(),
+        }
+    } else {
+        if positional.len() < 2 {
+            return Err(USAGE.into());
+        }
+        PipelineInput {
+            source: PartSource::Image {
+                path: positional[0],
+                model: positional.get(2).copied(),
+            },
+            output: positional[1],
+            landmarks: positional.get(3).copied(),
+        }
+    };
     core::with_legacy_eye_rig(legacy_eye, || {
         core::with_seam_coupling(coupled, || {
             lineart::with_lineart(line_art, || {
-                let go = || run_pipeline(&positional, proportion, stage, coupled, legacy_eye, &eval);
+                let go = || run_pipeline(&input, proportion, stage, coupled, legacy_eye, &eval);
                 if rest_gate { go() } else { lineart::without_rest_gate(go) }
             })
         })
     })
+}
+
+/// Where the parts come from.
+enum PartSource<'a> {
+    /// One flat image: automatic segmentation + hidden-area synthesis (the default run).
+    Image { path: &'a str, model: Option<&'a str> },
+    /// A directory of finished part layers (`analysis::layer_input`).
+    Layers(PathBuf),
+}
+
+struct PipelineInput<'a> {
+    source: PartSource<'a>,
+    output: &'a str,
+    landmarks: Option<&'a str>,
 }
 
 /// T14 evaluation flags. Both off = the product run (outputs unchanged, no `fidelity` key).
@@ -722,7 +771,7 @@ fn lineart_outputs(
 }
 
 fn run_pipeline(
-    positional: &[&str],
+    input: &PipelineInput,
     proportion: Option<String>,
     stage: Option<String>,
     coupled: bool,
@@ -730,7 +779,17 @@ fn run_pipeline(
     eval: &EvalOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
-    let img = image::open(positional[0])?.into_rgba8();
+    // Layer input: the analysis image (detection, landmarks) is the composite of the layers.
+    let (img, layers) = match &input.source {
+        PartSource::Image { path, .. } => (image::open(path)?.into_rgba8(), None),
+        PartSource::Layers(dir) => {
+            let set = layer_input::load_layer_dir(dir)?;
+            let comp = layer_input::composite_layers(&set);
+            let img = image::RgbaImage::from_raw(set.width as u32, set.height as u32, comp)
+                .ok_or("layer composite size mismatch")?;
+            (img, Some(set))
+        }
+    };
     let (w, h) = img.dimensions();
     core::check_size(w as usize, h as usize)?;
 
@@ -739,7 +798,7 @@ fn run_pipeline(
     let mut face_bbox: Option<[f64; 4]> = None;
     let mut detection_source = "cli-json";
 
-    let landmarks = if let Some(path) = positional.get(3) {
+    let landmarks = if let Some(path) = input.landmarks {
         serde_json::from_slice(&std::fs::read(path)?)?
     } else {
         let mut auto_lm = None;
@@ -806,7 +865,7 @@ fn run_pipeline(
         }
     };
     landmarks.validate(w as usize, h as usize)?;
-    let output = PathBuf::from(positional[1]);
+    let output = PathBuf::from(input.output);
     std::fs::create_dir_all(output.join("parts"))?;
 
     let style_overrides = proportion.as_ref().map(|mode| TemplateStyleSelection {
@@ -819,8 +878,8 @@ fn run_pipeline(
         mouth_style: None,
         clothes_style: None,
     });
-    let propose = || {
-        propose_parts_auto_with_template_stage(
+    let propose = || match &input.source {
+        PartSource::Image { model, .. } => propose_parts_auto_with_template_stage(
             &state,
             img.as_raw(),
             w as usize,
@@ -829,15 +888,23 @@ fn run_pipeline(
             &points_28,
             face_bbox,
             32.0,
-            positional.get(2).copied(),
+            *model,
             "detail",
             true,
             true,
             style_overrides.as_ref(),
             stage.as_deref(),
-        )
+        ),
+        PartSource::Layers(_) => Err("layer input has no re-runnable proposal".to_string()),
     };
-    let proposed = propose()?;
+    let (proposed, layer_report) = match &layers {
+        None => (propose()?, None),
+        Some(set) => {
+            let (p, r) = layer_input::proposal_from_layers(set, img.as_raw())?;
+            img.save(output.join("composite.png"))?;
+            (p, Some(r))
+        }
+    };
     // T10: eye layers deform with the aperture lines of the proposed visible masks (every motion
     // preview, seam, coverage and exposure computation below uses these landmarks).
     let landmarks = landmarks.with_eye_frames(&proposed.part_ids, &proposed.masks, w as usize, h as usize);
@@ -919,8 +986,15 @@ fn run_pipeline(
             pixel[3] = mask[i];
             if mask[i] > 0 {
                 visible_px += 1;
-                composite.as_mut()[i * 4..i * 4 + 4].copy_from_slice(&pixel.0);
+                if layers.is_none() {
+                    composite.as_mut()[i * 4..i * 4 + 4].copy_from_slice(&pixel.0);
+                }
             }
+        }
+        if layers.is_some() {
+            // Layer visible masks are uncovered alpha (parts can share an anti-aliased edge
+            // pixel), so they stack with `normal` over instead of one owner per pixel.
+            alpha_blend_layer(&mut composite, &vis_part);
         }
         for (i, pixel) in eff_part.pixels_mut().enumerate() {
             pixel[3] = effective[i];
@@ -1156,6 +1230,10 @@ fn run_pipeline(
         &img,
         env,
     )?;
+    if let Some(report) = &layer_report {
+        stats["layerInput"] = serde_json::to_value(report)?;
+        stats["analysisImage"] = json!("composite.png");
+    }
     stats["elapsedMs"] = json!(start.elapsed().as_millis());
     if eval.any() {
         // T14 (evaluation only): nothing below changes the product outputs computed above.
