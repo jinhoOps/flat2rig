@@ -12,10 +12,16 @@ This script
 2. maps tags to flat2rig part ids (TAG_MAP below; anything without a flat2rig id is kept as an
    `extra_<tag>` layer and listed in the manifest, never dropped),
 3. splits combined left/right layers (eyewhite, irides, eyelash, eyebrow) into character-relative
-   L/R by connected components (AGENTS.md 1: character L = screen right = larger x),
-4. writes straight-alpha full-canvas RGBA PNGs plus `truth-manifest.json` in the same shape as
+   L/R by connected components (AGENTS.md 1: character L = screen right = larger x) around a
+   midline from the iris (else eye-white) component pair, else the face centroid; eyelash
+   components below the eye centre become `eye*_lower`,
+4. zeroes alpha <= 4/255 (See-through noise, e.g. a full-canvas mouth layer) and fixes two draw
+   order defects for the rig order only (face features below the face, eye white above the iris);
+   See-through's raw order stays in the manifest,
+5. writes straight-alpha full-canvas RGBA PNGs plus `truth-manifest.json` in the same shape as
    `artifacts/t14/himikan-truth/` (width/height/parts/transform), with extra fields for draw order,
-   source layers and the mapping table.
+   source layers and the mapping table, and `layers.json` for `flat2rig-cli --from-layers`
+   (extra layers renamed to role-bearing ids such as `hat`, `acc_glasses`, `hands`, explicit order).
 
 Run with the See-through venv (it has numpy, pillow, psd-tools, scipy):
   artifacts/seethrough/venv/Scripts/python.exe -I tools/evaluation/v2_seethrough_to_layers.py \
@@ -72,11 +78,27 @@ TAG_MAP: dict[str, tuple[str | None, str, str]] = {
     "objects": (None, "extra", "소품: flat2rig 파츠 없음"),
 }
 ALPHA_ON = 0.5 / 255.0
+ALPHA_FLOOR = 4.5 / 255.0  # alpha <= 4/255 is zeroed (recorded as alphaFloor in the manifest)
 FACE_FEATURES = {
     "browL", "browR", "eyeL_white", "eyeR_white", "eyeL_iris", "eyeR_iris", "eyeL_upper", "eyeR_upper",
     "eyeL_lower", "eyeR_lower", "mouth_all", "face_detail",
 }
 FACE_FEATURE_EXTRAS = {"extra_eyewear"}
+# Rig input (`layers.json`, read by `flat2rig-cli --from-layers` before truth-manifest.json): extra
+# layers get ids whose prefix gives them a flat2rig role (core::infer_part_role) instead of being
+# dropped from the render. The PNG files keep their extra_<tag> names.
+RIG_ID = {
+    "extra_headwear": "hat",
+    "extra_eyewear": "acc_glasses",
+    "extra_earwear": "acc_earwear",
+    "extra_handwear": "hands",
+    "extra_bottomwear": "clothes_bottom",
+    "extra_legwear": "clothes_legwear",
+    "extra_footwear": "clothes_footwear",
+    "extra_tail": "other_tail",
+    "extra_wings": "other_wings",
+    "extra_objects": "other_objects",
+}
 
 
 def sha256(path: Path) -> str:
@@ -192,31 +214,46 @@ def main() -> int:
         if layer.is_group():
             continue
         p = to_grid(premul(layer_canvas(layer, CW, CH)), box, (tw, th))
+        # Alpha floor: See-through leaves near-zero alpha over large areas (e.g. a full-canvas
+        # mouth layer whose RGB is copied from the input). It is invisible but turns into meshes.
+        p = p * (p[..., 3:4] > ALPHA_FLOOR)
         layers.append({"idx": idx, "tag": layer.name, "p": p, "visible": layer.is_visible()})
 
     by_tag: dict[str, list[dict]] = {}
     for L in layers:
         by_tag.setdefault(L["tag"], []).append(L)
 
-    # Character midline for L/R: eye-white component pair, else face centroid, else canvas centre.
+    # Character midline for L/R: the two largest iris (then eye-white) components when they look
+    # like a pair (comparable size, side by side), else the face centroid, else the canvas centre.
     split_x, split_src = tw / 2.0, "canvas centre"
-    if "eyewhite" in by_tag:
-        comps = sorted(components(by_tag["eyewhite"][0]["p"][..., 3]), key=lambda c: -c["n"])
+    for tag in ("irides", "eyewhite"):
+        if tag not in by_tag:
+            continue
+        comps = sorted(components(by_tag[tag][0]["p"][..., 3]), key=lambda c: -c["n"])
         if len(comps) >= 2:
-            split_x, split_src = (comps[0]["cx"] + comps[1]["cx"]) / 2.0, "midpoint of the two largest eyewhite components"
+            a, b = comps[0], comps[1]
+            wa = np.ptp(np.nonzero(a["mask"])[1]) + 1
+            if b["n"] >= 0.25 * a["n"] and abs(a["cx"] - b["cx"]) >= wa:
+                split_x, split_src = (a["cx"] + b["cx"]) / 2.0, f"midpoint of the two largest {tag} components"
+                break
     if split_src == "canvas centre" and "face" in by_tag:
         cx = centroid_x(by_tag["face"][0]["p"][..., 3])
         if cx is not None:
             split_x, split_src = cx, "face alpha centroid"
 
-    # Eye-white centre y per side (for upper/lower lash split).
+    # Eye centre y per side for the upper/lower lash split: eye-white centroid, else (See-through
+    # sometimes emits no eyewhite layer) the iris centroid.
     white_cy: dict[str, float] = {}
-    if "eyewhite" in by_tag:
-        wl, wr = split_lr(by_tag["eyewhite"][0]["p"], split_x)
+    lash_ref = {}
+    for tag in ("eyewhite", "irides"):
+        if tag not in by_tag:
+            continue
+        wl, wr = split_lr(by_tag[tag][0]["p"], split_x)
         for S_, q in (("L", wl), ("R", wr)):
             a = q[..., 3]
-            if a.sum() > 0:
+            if S_ not in white_cy and a.sum() > 0:
                 white_cy[S_] = float((np.arange(th)[:, None] * a).sum() / a.sum())
+                lash_ref[S_] = tag
 
     # parts: id -> list of (order key, premultiplied canvas, source tag)
     parts: dict[str, list] = {}
@@ -296,6 +333,15 @@ def main() -> int:
             fi = order.index("face")
             order[fi + 1 : fi + 1] = below
             lifted = below
+    # Within an eye flat2rig draws white < iris (< lids). See-through can stack the eye white above
+    # the iris, which paints the white over the pupil; move such a white just below its iris.
+    eye_fixed = []
+    for S_ in ("L", "R"):
+        w_id, i_id = f"eye{S_}_white", f"eye{S_}_iris"
+        if w_id in order and i_id in order and order.index(w_id) > order.index(i_id):
+            order.remove(w_id)
+            order.insert(order.index(i_id), w_id)
+            eye_fixed.append(w_id)
     parts_img = {pid: np.asarray(Image.open(out / f"{pid}.png"), np.float32) / 255.0 for pid in order}
     for pid in order:
         full = over_p(full, premul(parts_img[pid]))
@@ -325,22 +371,37 @@ def main() -> int:
         "lrConvention": "character-relative (AGENTS.md 1): L = screen right (x > splitX)",
         "splitX": split_x,
         "splitXSource": split_src,
+        "lashSplitY": {S_: {"y": v, "source": lash_ref[S_]} for S_, v in white_cy.items()},
         "parts": manifest_parts,
         "extraLayers": extra_parts,
         "drawOrder": order,
         "seeThroughDrawOrder": raw_order,
         "liftedAboveFace": lifted,
+        "eyeWhiteMovedBelowIris": eye_fixed,
+        "alphaFloor": "alpha <= 4/255 set to 0 before conversion",
         "tagMapping": mapping_rows,
         "unmappedLayers": unmapped,
         "notes": [
             "Parts are straight-alpha full-canvas RGBA including See-through's inpainted hidden areas.",
             "seeThroughDrawOrder is bottom to top by the first source layer (See-through depth order); split L/R parts share their source layer's slot.",
-            "drawOrder = seeThroughDrawOrder with face features found below the face (liftedAboveFace) moved to just above it; _recomposite.png uses drawOrder, _recomposite_seethrough_order.png the raw PSD order.",
+            "drawOrder = seeThroughDrawOrder with face features found below the face (liftedAboveFace) moved to just above it and eye whites above their iris (eyeWhiteMovedBelowIris) moved just below it; _recomposite.png uses drawOrder, _recomposite_seethrough_order.png the raw PSD order.",
             "mouth/nose RGB is copied from the input by See-through (further_extr), so they carry no hidden-area colour.",
         ],
         "partReports": reports,
     }
     (out / "truth-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    rig_of = lambda pid: RIG_ID.get(pid, pid)  # noqa: E731
+    files_all = {**manifest_parts, **extra_parts}
+    rig = {
+        "width": tw,
+        "height": th,
+        "parts": {rig_of(pid): files_all[pid] for pid in order},
+        "order": [rig_of(pid) for pid in order],
+        "source": "See-through via tools/evaluation/v2_seethrough_to_layers.py (rig input; truth-manifest.json holds the full record)",
+        "rigIds": {pid: rig_of(pid) for pid in order if rig_of(pid) != pid},
+        "orderNote": "See-through depth order with face features lifted above the face (truth-manifest.json liftedAboveFace)",
+    }
+    (out / "layers.json").write_text(json.dumps(rig, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"{len(manifest_parts)} parts, {len(extra_parts)} extra layers -> {out}")
     return 0
 
