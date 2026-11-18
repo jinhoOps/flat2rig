@@ -925,29 +925,6 @@ async fn read_pasted_path(path: String) -> Result<PastedPathFile, String> {
     .map_err(|e| e.to_string())?
 }
 
-#[cfg(test)]
-mod pasted_path_tests {
-    use super::validate_pasted_path;
-
-    #[test]
-    fn pasted_path_accepts_only_existing_images_and_projects() {
-        let dir = std::env::temp_dir().join(format!("flat2rig-paste-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let png = dir.join("art.PNG");
-        std::fs::write(&png, b"x").unwrap();
-        let txt = dir.join("notes.txt");
-        std::fs::write(&txt, b"x").unwrap();
-        assert_eq!(validate_pasted_path(&png).unwrap().0, "art.PNG");
-        assert!(validate_pasted_path(&txt).is_err());
-        assert!(validate_pasted_path(&dir.join("missing.png")).is_err());
-        assert!(validate_pasted_path(std::path::Path::new("relative.png")).is_err());
-        let folder = dir.join("folder.png");
-        std::fs::create_dir_all(&folder).unwrap();
-        assert!(validate_pasted_path(&folder).is_err());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -990,4 +967,27 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run flat2rig");
+}
+
+#[cfg(test)]
+mod pasted_path_tests {
+    use super::validate_pasted_path;
+
+    #[test]
+    fn pasted_path_accepts_only_existing_images_and_projects() {
+        let dir = std::env::temp_dir().join(format!("flat2rig-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("art.PNG");
+        std::fs::write(&png, b"x").unwrap();
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"x").unwrap();
+        assert_eq!(validate_pasted_path(&png).unwrap().0, "art.PNG");
+        assert!(validate_pasted_path(&txt).is_err());
+        assert!(validate_pasted_path(&dir.join("missing.png")).is_err());
+        assert!(validate_pasted_path(std::path::Path::new("relative.png")).is_err());
+        let folder = dir.join("folder.png");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(validate_pasted_path(&folder).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
