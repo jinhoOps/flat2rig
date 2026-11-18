@@ -46,8 +46,30 @@ pub struct Landmarks {
     pub mouth: Point,
     pub chin: Point,
     pub crown: Point,
+    /// T10 per-eye aperture lines derived from the visible eye masks (`derive_eye_frames`). Never
+    /// serialized or persisted: every consumer that has the masks derives it again, and `deform`
+    /// falls back to `default_eye_frame` when it is absent (TS `RigLandmarks.eyeFrames`).
+    #[serde(skip)]
+    pub eye_frames: Option<EyeFrames>,
 }
 impl Landmarks {
+    /// Five-point landmarks without derived eye frames.
+    pub fn new(eye_l: Point, eye_r: Point, mouth: Point, chin: Point, crown: Point) -> Self {
+        Self {
+            eye_l,
+            eye_r,
+            mouth,
+            chin,
+            crown,
+            eye_frames: None,
+        }
+    }
+    /// Copy with eye frames derived from `ids`/`visible` (see `derive_eye_frames`).
+    pub fn with_eye_frames(&self, ids: &[String], visible: &[Vec<u8>], w: usize, h: usize) -> Self {
+        let mut out = self.clone();
+        out.eye_frames = Some(derive_eye_frames(self, ids, visible, w, h));
+        out
+    }
     pub fn validate(&self, w: usize, h: usize) -> Result<(), String> {
         for p in [self.eye_l, self.eye_r, self.mouth, self.chin, self.crown] {
             if !p.x.is_finite()
@@ -1166,6 +1188,10 @@ pub struct Pose {
     pub hair: f64,
     pub hair_side: f64,
     pub hair_back: f64,
+    /// Eye/mouth shape input carried by envelope expression poses (T10). Not a parameter: never
+    /// serialized; `deform` passes it to `deform_with_shapes`.
+    #[serde(skip)]
+    pub shape: Option<ShapeDeformInput>,
 }
 impl Default for Pose {
     fn default() -> Self {
@@ -1192,6 +1218,7 @@ impl Default for Pose {
             hair: 0.,
             hair_side: 0.,
             hair_back: 0.,
+            shape: None,
         }
     }
 }
@@ -1435,8 +1462,607 @@ pub struct ShapeDeformInput {
     pub mouth: Option<RegionDeformParams>,
 }
 
+/// `deform` with the pose's own eye/mouth shape input (`Pose::shape`, set by envelope poses).
 pub fn deform(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
-    deform_with_shapes(point, id, lm, pose, None)
+    deform_with_shapes(point, id, lm, pose, pose.shape.as_ref())
+}
+
+// -------------------------------------------------------------------------------------------------
+// T10 — sealed eye rig
+// -------------------------------------------------------------------------------------------------
+//
+// Every non-substitute eye layer of one side (white, iris, upper lid, lower lid and any extra
+// `eyeL_*` layer) is moved by ONE vertical field per column, like a single warp deformer:
+//
+//   v ≤ lash(u)            → upper-lid map  `m_lid`  (lid closes onto the closing line `t`)
+//   v ≥ lower(u)           → lower-lid map  `m_lo`   (lower lid rises onto the same line)
+//   lash(u) < v < lower(u) → linear between `m_lid(lash)` and `m_lo(lower)` (the aperture)
+//
+// `lash`/`lower` are the top/bottom of the rest-pose visible aperture (visible white ∪ iris pixels)
+// per head-local column, derived from the masks (`derive_eye_frames`). Because all layers share the
+// field, the white's top stays glued to the lid's lower edge (no skin gap) and anything hidden
+// under a lid at rest stays under it; at `eye = 0` the aperture has zero height, so the white and
+// the iris (clipped to the white) cannot show. Ranges, gaze offsets and expression curvature are
+// unchanged; the lash travels the full distance to the closing line (more than the pre-T10 0.78).
+// Mirrored 1:1 in `src/engine.ts` (`deformUncoupled`, `deriveEyeFrames`).
+
+/// Column bins used to sample the rest aperture.
+pub const EYE_FRAME_BINS: usize = 16;
+/// Aperture pixels farther than this (eye distances) from the eye landmark are ignored.
+pub const EYE_FRAME_REACH_ED: f64 = 0.9;
+/// The upper-lid map is fully applied within this many eye distances above the lash line…
+pub const EYE_LID_REACH_ED: f64 = 0.20;
+/// …and fades to identity over this further span (brow gap stays put).
+pub const EYE_LID_RAMP_ED: f64 = 0.12;
+/// Lash band (eye distances above the lash line) that keeps its thickness when the lid closes.
+pub const EYE_LASH_KEEP_ED: f64 = 0.03;
+/// Mesh quality: an extreme-pose triangle counts as flipped only when its signed area falls below
+/// `-ratio × rest area` (collapsed slivers on the closing eye line are not inversions).
+pub const EXTREME_FLIP_COLLAPSE_RATIO: f64 = 0.05;
+/// Eye motion (max of closure, |gaze|, eye smile, expression shape deltas) at which white/iris texels
+/// outside the aperture are fully folded onto the lid edge; the fold ramps in linearly from zero, so
+/// the field is the identity at the rest pose.
+pub const EYE_FOLD_ONSET_CLOSE: f64 = 0.05;
+/// Upward tuck (eye distances, × close²) of the collapsing white/iris into the closed upper-lid
+/// band (see `deform_eye`).
+pub const EYE_INTERIOR_TUCK_ED: f64 = 0.01;
+/// Thickness ratio the lower-lid band keeps when fully closed.
+pub const EYE_LOWER_CLOSED_SCALE: f64 = 0.4;
+
+/// One aperture column sample in head-local coordinates (`HeadFrame::to_local`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EyeFrameSample {
+    pub u: f64,
+    /// Top of the visible aperture (upper lid's lower edge) at `u`.
+    pub lash: f64,
+    /// Bottom of the visible aperture (lower lid's upper edge) at `u`.
+    pub lower: f64,
+}
+
+/// Aperture samples per eye (character L / R), sorted by `u`; `None` = not derivable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EyeFrames {
+    #[serde(rename = "L")]
+    pub l: Option<Vec<EyeFrameSample>>,
+    #[serde(rename = "R")]
+    pub r: Option<Vec<EyeFrameSample>>,
+}
+
+/// Character side of an eye layer by ID prefix (`eyeL*` / `eyeR*`).
+pub fn eye_layer_side(id: &str) -> Option<char> {
+    if id.starts_with("eyeL") {
+        Some('L')
+    } else if id.starts_with("eyeR") {
+        Some('R')
+    } else {
+        None
+    }
+}
+
+/// Eye interior layer (white or iris, including numbered extras such as `eyeL_iris_2`).
+pub fn is_eye_interior_layer(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("eyeL_").or_else(|| id.strip_prefix("eyeR_")) else {
+        return false;
+    };
+    let base = match rest.split_once('_') {
+        Some((b, n)) if !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) => b,
+        Some(_) => return false,
+        None => rest,
+    };
+    base == "white" || base == "iris"
+}
+
+/// Iris layer of an eye (`eyeL_iris`, `eyeR_iris_2`, …).
+pub fn is_eye_iris_layer(id: &str) -> bool {
+    is_eye_interior_layer(id) && id.contains("_iris")
+}
+
+/// Rest aperture lines per eye from the visible white/iris masks (alpha ≥ 128).
+pub fn derive_eye_frames(
+    lm: &Landmarks,
+    ids: &[String],
+    visible: &[Vec<u8>],
+    w: usize,
+    h: usize,
+) -> EyeFrames {
+    let hf = HeadFrame::from_landmarks(lm, 0, 0);
+    let dist = hf.eye_dist;
+    let side_frame = |side: char, eye: Point| -> Option<Vec<EyeFrameSample>> {
+        let (eu, ev) = hf.to_local(eye.v());
+        let reach = dist * EYE_FRAME_REACH_ED;
+        // Visible white ∪ iris near the eye; only the largest 8-connected component defines the
+        // aperture (isolated specks segmented inside the lash wing would make the corner samples
+        // falsely tall and drag the lid wing with the aperture).
+        let mut sel = vec![false; w * h];
+        for (p, id) in ids.iter().enumerate() {
+            if eye_layer_side(id) != Some(side) || !is_eye_interior_layer(id) {
+                continue;
+            }
+            let Some(m) = visible.get(p) else { continue };
+            for y in 0..h {
+                for x in 0..w {
+                    if m[y * w + x] < 128 {
+                        continue;
+                    }
+                    let (u, v) = hf.to_local(DVec2::new(x as f64 + 0.5, y as f64 + 0.5));
+                    if (u - eu).abs() <= reach && (v - ev).abs() <= reach {
+                        sel[y * w + x] = true;
+                    }
+                }
+            }
+        }
+        let mut best: Vec<usize> = Vec::new();
+        let mut seen = vec![false; w * h];
+        for start in 0..w * h {
+            if !sel[start] || seen[start] {
+                continue;
+            }
+            let mut comp = vec![start];
+            seen[start] = true;
+            let mut k = 0;
+            while k < comp.len() {
+                let i = comp[k];
+                k += 1;
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                for dy in -1..=1i64 {
+                    for dx in -1..=1i64 {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                            continue;
+                        }
+                        let j = ny as usize * w + nx as usize;
+                        if sel[j] && !seen[j] {
+                            seen[j] = true;
+                            comp.push(j);
+                        }
+                    }
+                }
+            }
+            if comp.len() > best.len() {
+                best = comp;
+            }
+        }
+        let pts: Vec<(f64, f64)> = best
+            .iter()
+            .map(|&i| hf.to_local(DVec2::new((i % w) as f64 + 0.5, (i / w) as f64 + 0.5)))
+            .collect();
+        if pts.len() < 8 {
+            return None;
+        }
+        let umin = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let umax = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        let span = umax - umin;
+        if span < 1.0 {
+            return None;
+        }
+        let k = EYE_FRAME_BINS;
+        let mut lash = vec![f64::INFINITY; k];
+        let mut lower = vec![f64::NEG_INFINITY; k];
+        for &(u, v) in &pts {
+            let b = (((u - umin) / span * k as f64).floor() as usize).min(k - 1);
+            lash[b] = lash[b].min(v - 0.5);
+            lower[b] = lower[b].max(v + 0.5);
+        }
+        // Conservative lines: each sample takes the extreme over its neighbouring bins, so the
+        // piecewise-linear line never cuts a visible aperture pixel (rest pose stays exact).
+        let samples: Vec<EyeFrameSample> = (0..k)
+            .filter(|&b| lash[b].is_finite())
+            .map(|b| {
+                let (a, c) = (b.saturating_sub(1), (b + 1).min(k - 1));
+                let top = lash[a].min(lash[b]).min(lash[c]);
+                let bottom = lower[a].max(lower[b]).max(lower[c]);
+                EyeFrameSample {
+                    u: umin + (b as f64 + 0.5) * span / k as f64,
+                    lash: top,
+                    lower: bottom.max(top + 1.0),
+                }
+            })
+            .collect();
+        Some(samples)
+    };
+    EyeFrames {
+        l: side_frame('L', lm.eye_l),
+        r: side_frame('R', lm.eye_r),
+    }
+}
+
+/// Aperture used when no frame could be derived (landmarks only).
+pub fn default_eye_frame(eye_u: f64, eye_v: f64, dist: f64) -> Vec<EyeFrameSample> {
+    [-1.0, -0.5, 0.0, 0.5, 1.0]
+        .iter()
+        .map(|&t: &f64| {
+            let k = 1.0 - 0.6 * t * t;
+            EyeFrameSample {
+                u: eye_u + t * 0.30 * dist,
+                lash: eye_v - 0.20 * dist * k,
+                lower: eye_v + 0.13 * dist * k,
+            }
+        })
+        .collect()
+}
+
+/// `(lash, lower)` at head-local column `u` (piecewise linear, constant beyond the ends).
+pub fn eye_lines_at(samples: &[EyeFrameSample], u: f64) -> (f64, f64) {
+    let (first, last) = (samples[0], samples[samples.len() - 1]);
+    if u <= first.u {
+        return (first.lash, first.lower);
+    }
+    if u >= last.u {
+        return (last.lash, last.lower);
+    }
+    for pair in samples.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if u <= b.u {
+            let t = if b.u > a.u { (u - a.u) / (b.u - a.u) } else { 0.0 };
+            return (a.lash + (b.lash - a.lash) * t, a.lower + (b.lower - a.lower) * t);
+        }
+    }
+    (last.lash, last.lower)
+}
+
+/// T10: whether rest point `point` of eye layer `id` is a white/iris texel outside the rest
+/// aperture (`lash < v < lower`), i.e. one the sealed rig folds onto a lid edge (never shown by
+/// its own motion). Uses the derived frames when present, else `default_eye_frame`.
+pub fn eye_interior_folded(point: Point, id: &str, lm: &Landmarks) -> bool {
+    if !is_eye_interior_layer(id) || legacy_eye_rig_enabled() {
+        return false;
+    }
+    let hf = HeadFrame::from_landmarks(lm, 0, 0);
+    let is_left = id.starts_with("eyeL");
+    let eye = if is_left { lm.eye_l } else { lm.eye_r };
+    let (eu, ev) = hf.to_local(eye.v());
+    let fallback;
+    let samples: &[EyeFrameSample] = match lm
+        .eye_frames
+        .as_ref()
+        .and_then(|f| if is_left { f.l.as_ref() } else { f.r.as_ref() })
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s,
+        None => {
+            fallback = default_eye_frame(eu, ev, hf.eye_dist);
+            &fallback
+        }
+    };
+    let (u, v) = hf.to_local(point.v());
+    let (lash, lower) = eye_lines_at(samples, u);
+    v <= lash || v >= lower
+}
+
+thread_local! {
+    static LEGACY_EYE_RIG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `deform` uses the pre-T10 per-layer eye formulas on this thread (measurement only).
+pub fn legacy_eye_rig_enabled() -> bool {
+    LEGACY_EYE_RIG.with(|c| c.get())
+}
+
+/// Runs `f` with the pre-T10 eye formulas and clipping rule (before/after measurements, CLI
+/// `--legacy-eye`). Thread-local like `with_seam_coupling`.
+pub fn with_legacy_eye_rig<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let prev = LEGACY_EYE_RIG.with(|c| c.replace(enabled));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LEGACY_EYE_RIG.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+/// Static eye-shape vertical warp (`ShapeDeformInput`) at posed column `pu`. One function for
+/// every eye layer (`legacy_masks` reproduces the pre-T10 per-layer masks for substitute layers).
+#[allow(clippy::too_many_arguments)]
+fn eye_shape_v(
+    pv: f64,
+    pu: f64,
+    eye_u: f64,
+    eye_v: f64,
+    dist: f64,
+    is_left: bool,
+    shape: &RegionDeformParams,
+    is_iris: bool,
+    legacy: Option<(bool, bool, bool)>,
+) -> f64 {
+    let mut pv = pv;
+    let nx = (pu - eye_u) / (dist * 0.24).max(1.0);
+    let center_arch = (1.0 - nx * nx).max(0.0);
+    let eye_sign = if is_left { 1.0 } else { -1.0 };
+    let outer_signed = (nx * eye_sign).clamp(-0.4, 1.2);
+    pv -= shape.corner * dist * 0.045 * outer_signed;
+    // legacy = (is_upper, is_sub_lid, is_lower)
+    let (skip_upper, full_upper, full_lower) = legacy.unwrap_or((false, false, false));
+    if full_upper {
+        pv -= shape.upper_curve_delta * dist * 0.055 * center_arch;
+    } else if !skip_upper {
+        let upper_mask = ((eye_v + dist * 0.06 - pv) / (dist * 0.14).max(1.0)).clamp(0.0, 1.0);
+        pv -= shape.upper_curve_delta * dist * 0.055 * center_arch * upper_mask;
+    }
+    let lower_mask = if full_lower {
+        1.0
+    } else {
+        ((pv - (eye_v - dist * 0.02)) / (dist * 0.14).max(1.0)).clamp(0.0, 1.0)
+    };
+    pv += shape.lower_curve_delta * dist * 0.045 * center_arch * lower_mask;
+    if !is_iris {
+        pv = eye_v + (pv - eye_v) * (1.0 + shape.roundness_delta * 0.32 * center_arch);
+    }
+    pv
+}
+
+/// Eye block of `deform` (head-local `(pu, pv)` in → out).
+#[allow(clippy::too_many_arguments)]
+fn deform_eye(
+    pu: f64,
+    pv: f64,
+    id: &str,
+    lm: &Landmarks,
+    hf: &HeadFrame,
+    pose: &Pose,
+    shape_deform: Option<&ShapeDeformInput>,
+) -> (f64, f64) {
+    let dist = hf.eye_dist;
+    let is_left = id.starts_with("eyeL");
+    let (eye, open, smile) = if is_left {
+        (lm.eye_l, pose.eye_l, pose.eye_l_smile)
+    } else {
+        (lm.eye_r, pose.eye_r, pose.eye_r_smile)
+    };
+    let (eye_u, eye_v) = hf.to_local(eye.v());
+    let shape = shape_deform.and_then(|s| if is_left { s.eye_l } else { s.eye_r });
+    let is_iris = id.ends_with("_iris") || is_eye_iris_layer(id);
+    let is_sub_layer = id.contains("_sub_");
+    if legacy_eye_rig_enabled() || is_sub_layer {
+        return deform_eye_legacy(pu, pv, id, eye_u, eye_v, dist, is_left, open, smile, pose, shape);
+    }
+    let (mut pu, mut pv) = (pu, pv);
+    let (off_x, off_y, width) = shape.map_or((0.0, 0.0, 1.0), |s| (s.offset_x, s.offset_y, s.width));
+    if let Some(s) = shape.as_ref() {
+        pu += off_x * dist * 0.14;
+        pv += off_y * dist * 0.12;
+        let ws = if is_iris { 1.0 + (width - 1.0) * 0.45 } else { width };
+        pu = eye_u + (pu - eye_u) * ws;
+        pv = eye_shape_v(pv, pu, eye_u, eye_v, dist, is_left, s, is_iris, None);
+    }
+    if is_iris {
+        pu += pose.eye_ball_x * dist * 0.045;
+        pv -= pose.eye_ball_y * dist * 0.025;
+    }
+    let close = (1.0 - open).clamp(0.0, 1.0);
+    let widen = (open - 1.0).clamp(0.0, 0.3);
+    let curve_delta = shape.map_or(0.0, |s| s.upper_curve_delta);
+    let pos_curve = curve_delta.max(0.0);
+    let neg_curve = (-curve_delta).max(0.0);
+    let nx_c = (pu - eye_u) / (dist * 0.25).max(1.0);
+    let arch = (1.0 - nx_c * nx_c).max(0.0);
+    // Rest column of the aperture lines under this posed column (inverse of the white's width map).
+    let mut u_rest = pu;
+    if shape.is_some() && width.abs() > 1e-6 {
+        u_rest = eye_u + (pu - eye_u) / width - off_x * dist * 0.14;
+    }
+    let frame = lm
+        .eye_frames
+        .as_ref()
+        .and_then(|f| if is_left { f.l.as_ref() } else { f.r.as_ref() })
+        .filter(|s| !s.is_empty());
+    let fallback;
+    let samples: &[EyeFrameSample] = match frame {
+        Some(s) => s,
+        None => {
+            fallback = default_eye_frame(eye_u, eye_v, dist);
+            &fallback
+        }
+    };
+    let (lash_r, lower_r) = eye_lines_at(samples, u_rest);
+    let interior = is_eye_interior_layer(id) || id.ends_with("_white") || is_iris;
+    let warp = |v: f64| match shape.as_ref() {
+        Some(s) => eye_shape_v(v + off_y * dist * 0.12, pu, eye_u, eye_v, dist, is_left, s, false, None),
+        None => v,
+    };
+    let la = warp(lash_r);
+    let ba = warp(lower_r).max(la + 0.5);
+    let d_a = warp(eye_v) - eye_v;
+    // Closing line: at the eye-centre column the pre-T10 full-closure seam (`eye_v + 0.022·dist`);
+    // across the eye it keeps the same fraction `λ` of the aperture height, so it follows the
+    // aperture shape and the corners (thin aperture) barely move, as in a real blink. On top: the
+    // expression curvature terms and the sad (∪) drop the pre-T10 upper lid received, so no
+    // expression's lash travel shrinks. Never above the lash line; it may sit below the lower line
+    // (the lower lid then follows it down).
+    let (lash_c, lower_c) = eye_lines_at(samples, eye_u);
+    let lambda = ((eye_v + dist * 0.022 - lash_c) / (lower_c - lash_c).max(1.0)).clamp(0.0, 1.0);
+    let s1 = (la + lambda * (ba - la)
+        - (smile * 0.032 + pos_curve * 0.028) * dist * arch
+        + neg_curve * (0.045 * arch - 0.018 * (1.0 - arch)) * dist
+        + neg_curve * ((0.040 + 0.055) * arch - 0.025 * (1.0 - arch)) * dist)
+        .max(la);
+    let lift_open = smile * 0.045 * dist * arch;
+    let target = s1 - smile * 0.018 * dist * arch;
+    let sigma = (0.22 + (0.14 * smile + 0.12 * pos_curve - 0.03 * neg_curve).clamp(-0.03, 0.20) * arch)
+        .clamp(0.20, 0.42);
+    let reach = dist * EYE_LID_REACH_ED;
+    let ramp = (dist * EYE_LID_RAMP_ED).max(1.0);
+    let lower_smile = smile * 0.025 * dist * arch;
+    // Closed-lid band: the lash stroke nearest the lid edge keeps its thickness (a σ-squashed thin
+    // stroke aliases into a dotted line); only the eyelid skin above it is compressed by σ.
+    let keep = dist * EYE_LASH_KEEP_ED;
+    let closed_offset = |x: f64| if x >= -keep { x } else { -keep + (x + keep) * sigma };
+    let m_lid = |v: f64| {
+        let aw = ((v - (la - reach - ramp)) / ramp).clamp(0.0, 1.0);
+        let mut r = v + aw * (close * (target + closed_offset(v - la) - v) - (1.0 - close) * lift_open);
+        if widen > 0.0 {
+            r -= aw * (eye_v + d_a - v).max(0.0) * 0.28 * widen;
+        }
+        r
+    };
+    let m_lo = |v: f64| {
+        let aw = (((ba + reach + ramp) - v) / ramp).clamp(0.0, 1.0);
+        v + aw * (close * (target + (v - ba) * EYE_LOWER_CLOSED_SCALE - v) - (1.0 - close) * lower_smile)
+    };
+    // White/iris texels outside the rest aperture are under a lid (or a static occluder) at rest;
+    // they fold onto the lid edge so they can never be pulled into view (zero-height fold).
+    // Tuck: as the eye closes, the collapsing white/iris and the lower lid glued to it rise
+    // `EYE_INTERIOR_TUCK_ED · close²` into the closed upper-lid band, so near-degenerate mesh chords
+    // along the curved closing line rasterize under the upper lid instead of on its edge. Zero at
+    // rest; the upper lid itself is not shifted.
+    let tuck = EYE_INTERIOR_TUCK_ED * dist * close * close;
+    let lower_aw = |v: f64| (((ba + reach + ramp) - v) / ramp).clamp(0.0, 1.0);
+    let interp = |v: f64| {
+        let (lo, hi) = (m_lid(la), m_lo(ba));
+        lo + (v - la) / (ba - la) * (hi - lo)
+    };
+    let shared = |v: f64| {
+        if v <= la {
+            m_lid(v)
+        } else if v >= ba {
+            m_lo(v)
+        } else {
+            interp(v)
+        }
+    };
+    pv = if interior {
+        // White/iris texels outside the rest aperture fold onto the lid edge as soon as the eye
+        // moves (closure, gaze, eye smile, expression shape; full at `EYE_FOLD_ONSET_CLOSE`), so they
+        // are never pulled into view; at the exact rest pose the field is the identity.
+        let folded = if pv <= la {
+            m_lid(la)
+        } else if pv >= ba {
+            m_lo(ba)
+        } else {
+            interp(pv)
+        };
+        let unfolded = shared(pv);
+        let shape_mag = shape.map_or(0.0, |s| {
+            (s.width - 1.0)
+                .abs()
+                .max(s.roundness_delta.abs())
+                .max(s.corner.abs())
+                .max(s.upper_curve_delta.abs())
+                .max(s.lower_curve_delta.abs())
+                .max(s.offset_x.abs())
+                .max(s.offset_y.abs())
+        });
+        // Gaze moves only the iris; the white folds with lid motion alone.
+        let gaze = if is_iris { pose.eye_ball_x.abs().max(pose.eye_ball_y.abs()) } else { 0.0 };
+        let motion = close
+            .max(gaze)
+            .max(smile.abs())
+            .max(widen)
+            .max(shape_mag);
+        let k = (motion / EYE_FOLD_ONSET_CLOSE).min(1.0);
+        unfolded + (folded - unfolded) * k - tuck
+    } else if id.contains("_upper") {
+        // Upper-lid texels below the lash line (corner wings) translate with the lash instead of
+        // being collapsed with the aperture, so the closed lid line stays unbroken at the corners.
+        if pv <= la {
+            m_lid(pv)
+        } else {
+            pv + (m_lid(la) - la)
+        }
+    } else if id.contains("_lower") {
+        // Lower-lid texels above the lower line translate with it (mirror of the upper lid).
+        if pv >= ba {
+            m_lo(pv) - tuck * lower_aw(pv)
+        } else {
+            pv + (m_lo(ba) - ba) - tuck
+        }
+    } else {
+        shared(pv)
+    };
+    (pu, pv)
+}
+
+/// Pre-T10 eye formulas (per-layer maps; kept for substitute layers and `with_legacy_eye_rig`).
+#[allow(clippy::too_many_arguments)]
+fn deform_eye_legacy(
+    pu: f64,
+    pv: f64,
+    id: &str,
+    eye_u: f64,
+    eye_v: f64,
+    dist: f64,
+    is_left: bool,
+    open: f64,
+    smile: f64,
+    pose: &Pose,
+    shape: Option<RegionDeformParams>,
+) -> (f64, f64) {
+    let (mut pu, mut pv) = (pu, pv);
+    let is_sub_layer = id.contains("_sub_");
+    let is_iris = id.ends_with("_iris");
+    let is_upper = id.ends_with("_upper");
+    let is_lower = id.ends_with("_lower");
+    if let Some(shape) = shape.as_ref() {
+        pu += shape.offset_x * dist * 0.14;
+        pv += shape.offset_y * dist * 0.12;
+        let width_scale = if is_iris {
+            1.0 + (shape.width - 1.0) * 0.45
+        } else {
+            shape.width
+        };
+        pu = eye_u + (pu - eye_u) * width_scale;
+        pv = eye_shape_v(
+            pv,
+            pu,
+            eye_u,
+            eye_v,
+            dist,
+            is_left,
+            shape,
+            is_iris,
+            Some((is_upper, id.ends_with("_sub_lid"), is_lower)),
+        );
+    }
+    if is_sub_layer {
+        return (pu, pv);
+    }
+    let close = (1.0 - open).clamp(0.0, 1.0);
+    let widen = (open - 1.0).clamp(0.0, 0.3);
+    let curve_delta = shape.map_or(0.0, |s| s.upper_curve_delta);
+    let nx_c = (pu - eye_u) / (dist * 0.25).max(1.0);
+    let arch = (1.0 - nx_c * nx_c).max(0.0);
+    let pos_curve = curve_delta.max(0.0);
+    let neg_curve = (-curve_delta).max(0.0);
+    let seam_v = eye_v + dist * 0.022 * close - (smile * 0.032 + pos_curve * 0.028) * dist * close * arch
+        + neg_curve * (0.045 * arch - 0.018 * (1.0 - arch)) * dist * close;
+    if is_iris {
+        pu += pose.eye_ball_x * dist * 0.045;
+        pv -= pose.eye_ball_y * dist * 0.025;
+        pv = seam_v + (pv - eye_v) * open.clamp(0.03, 1.3);
+    } else if is_upper {
+        let lid_anchor_v = eye_v - dist * 0.45;
+        let anchor_w = ((pv - lid_anchor_v) / (dist * 0.12).max(1.0)).clamp(0.0, 1.0);
+        let orig_pv = pv;
+        if close > 0.0 && orig_pv < seam_v {
+            let close_scale = (0.22
+                + (0.14 * smile + 0.12 * pos_curve - 0.03 * neg_curve).clamp(-0.03, 0.20) * arch)
+                .clamp(0.20, 0.42);
+            let closed_v = seam_v + (orig_pv - seam_v) * close_scale;
+            pv += (closed_v - orig_pv) * close * anchor_w;
+        } else if widen > 0.0 && orig_pv < seam_v {
+            pv -= (seam_v - orig_pv) * 0.28 * widen * anchor_w;
+        }
+        if smile != 0.0 || curve_delta != 0.0 {
+            let vert_w =
+                anchor_w * ((eye_v + dist * 0.16 - orig_pv) / (dist * 0.12).max(1.0)).clamp(0.0, 1.0);
+            let lift_k = (1.0 - close) * 0.045 + close * 0.018;
+            let smile_lift = smile * lift_k * dist * arch;
+            let curve_lift = pos_curve * lift_k * dist * arch;
+            let neg_drop =
+                neg_curve * ((0.040 + 0.055 * close) * arch - 0.025 * close * (1.0 - arch)) * dist;
+            pv -= (smile_lift + curve_lift - neg_drop) * vert_w;
+        }
+    } else if is_lower {
+        let open_clamp = open.clamp(0.18, 1.3);
+        pv = eye_v + (pv - eye_v) * open_clamp - smile * dist * 0.025 * arch;
+    } else {
+        let open_clamp = open.clamp(0.08, 1.3);
+        pv = eye_v + (pv - eye_v) * open_clamp;
+    }
+    (pu, pv)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1606,7 +2232,7 @@ fn coupled_neck_field(
 /// T13b uncoupled per-layer field (the pre-T13b `deform`). Kept public for before/after
 /// measurements and the Rust/TS parity fixture; rendering uses `deform`.
 pub fn deform_uncoupled(point: Point, id: &str, lm: &Landmarks, pose: &Pose) -> Point {
-    deform_uncoupled_with_shapes(point, id, lm, pose, None)
+    deform_uncoupled_with_shapes(point, id, lm, pose, pose.shape.as_ref())
 }
 
 pub fn deform_with_shapes(
@@ -1669,100 +2295,7 @@ fn deform_uncoupled_with_shapes(
     let eye_mid_v = (eye_l_v + eye_r_v) * 0.5;
     let is_sub_layer = id.contains("_sub_");
     if id.starts_with("eye") {
-        let is_left = id.starts_with("eyeL");
-        let (eye, open, smile) = if is_left {
-            (lm.eye_l, pose.eye_l, pose.eye_l_smile)
-        } else {
-            (lm.eye_r, pose.eye_r, pose.eye_r_smile)
-        };
-        let (eye_u, eye_v) = hf.to_local(eye.v());
-        let shape = shape_deform.and_then(|s| if is_left { s.eye_l } else { s.eye_r });
-        let is_iris = id.ends_with("_iris");
-        let is_upper = id.ends_with("_upper");
-        let is_lower = id.ends_with("_lower");
-        if let Some(shape) = shape {
-            pu += shape.offset_x * dist * 0.14;
-            pv += shape.offset_y * dist * 0.12;
-            let width_scale = if is_iris {
-                1.0 + (shape.width - 1.0) * 0.45
-            } else {
-                shape.width
-            };
-            pu = eye_u + (pu - eye_u) * width_scale;
-            let nx = (pu - eye_u) / (dist * 0.24).max(1.0);
-            let center_arch = (1.0 - nx * nx).max(0.0);
-            let eye_sign = if is_left { 1.0 } else { -1.0 };
-            let outer_signed = (nx * eye_sign).clamp(-0.4, 1.2);
-            pv -= shape.corner * dist * 0.045 * outer_signed;
-            if !is_upper && !id.ends_with("_sub_lid") {
-                let upper_mask =
-                    ((eye_v + dist * 0.06 - pv) / (dist * 0.14).max(1.0)).clamp(0.0, 1.0);
-                pv -= shape.upper_curve_delta * dist * 0.055 * center_arch * upper_mask;
-            } else if id.ends_with("_sub_lid") {
-                pv -= shape.upper_curve_delta * dist * 0.055 * center_arch;
-            }
-            let lower_mask = if is_lower {
-                1.0
-            } else {
-                ((pv - (eye_v - dist * 0.02)) / (dist * 0.14).max(1.0)).clamp(0.0, 1.0)
-            };
-            pv += shape.lower_curve_delta * dist * 0.045 * center_arch * lower_mask;
-            if !is_iris {
-                pv = eye_v + (pv - eye_v) * (1.0 + shape.roundness_delta * 0.32 * center_arch);
-            }
-        }
-        if !is_sub_layer {
-            let close = (1.0 - open).clamp(0.0, 1.0);
-            let widen = (open - 1.0).clamp(0.0, 0.3);
-            let curve_delta = shape.map_or(0.0, |s| s.upper_curve_delta);
-            let nx_c = (pu - eye_u) / (dist * 0.25).max(1.0);
-            let arch = (1.0 - nx_c * nx_c).max(0.0);
-            let pos_curve = curve_delta.max(0.0);
-            let neg_curve = (-curve_delta).max(0.0);
-            let seam_v = eye_v
-                + dist * 0.022 * close
-                - (smile * 0.032 + pos_curve * 0.028) * dist * close * arch
-                + neg_curve * (0.045 * arch - 0.018 * (1.0 - arch)) * dist * close;
-            if is_iris {
-                pu += pose.eye_ball_x * dist * 0.045;
-                pv -= pose.eye_ball_y * dist * 0.025;
-                pv = seam_v + (pv - eye_v) * open.clamp(0.03, 1.3);
-            } else if is_upper {
-                // Bring real upper eyelid + lashes smoothly down to closing seam for both LD & SD
-                // eyes while keeping the top eyebrow-gap apron anchored and bending smile (^)/sad (u).
-                let lid_anchor_v = eye_v - dist * 0.45;
-                let anchor_w = ((pv - lid_anchor_v) / (dist * 0.12).max(1.0)).clamp(0.0, 1.0);
-                let orig_pv = pv;
-                if close > 0.0 && orig_pv < seam_v {
-                    let close_scale = (0.22
-                        + (0.14 * smile + 0.12 * pos_curve - 0.03 * neg_curve).clamp(-0.03, 0.20)
-                            * arch)
-                        .clamp(0.20, 0.42);
-                    let closed_v = seam_v + (orig_pv - seam_v) * close_scale;
-                    pv += (closed_v - orig_pv) * close * anchor_w;
-                } else if widen > 0.0 && orig_pv < seam_v {
-                    pv -= (seam_v - orig_pv) * 0.28 * widen * anchor_w;
-                }
-                if smile != 0.0 || curve_delta != 0.0 {
-                    let vert_w = anchor_w
-                        * ((eye_v + dist * 0.16 - orig_pv) / (dist * 0.12).max(1.0)).clamp(0.0, 1.0);
-                    let lift_k = (1.0 - close) * 0.045 + close * 0.018;
-                    let smile_lift = smile * lift_k * dist * arch;
-                    let curve_lift = pos_curve * lift_k * dist * arch;
-                    let neg_drop = neg_curve
-                        * ((0.040 + 0.055 * close) * arch - 0.025 * close * (1.0 - arch))
-                        * dist;
-                    pv -= (smile_lift + curve_lift - neg_drop) * vert_w;
-                }
-            } else if is_lower {
-                let open_clamp = open.clamp(0.18, 1.3);
-                pv = eye_v + (pv - eye_v) * open_clamp - smile * dist * 0.025 * arch;
-            } else {
-                // Keep sclera scaling smooth and uniform around `eye_v` so corner triangles never invert during extreme blink.
-                let open_clamp = open.clamp(0.08, 1.3);
-                pv = eye_v + (pv - eye_v) * open_clamp;
-            }
-        }
+        (pu, pv) = deform_eye(pu, pv, id, lm, &hf, pose, shape_deform);
     }
     if id.starts_with("brow") {
         let (brow_y, brow_form) = if id.starts_with("browL") {
@@ -1854,6 +2387,28 @@ fn deform_uncoupled_with_shapes(
     apply_body_sway(head_posed, body_pivot, hh, pose, body_follow).into()
 }
 /// Combines a part's strict visible mask with any separated occlusion fill mask.
+/// Straight-alpha "over" of one RGBA pixel onto `dst` (8-bit, rounded). The CLI effective
+/// composite and the T10 rest-invariance check of template synthesis use this one function.
+#[inline]
+pub fn blend_straight_pixel(dst: &mut [u8], src: [u8; 4]) {
+    let sa = src[3] as f32 / 255.0;
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[3] as f32 / 255.0;
+    let inv = 1.0 - sa;
+    let out_a = sa + da * inv;
+    if out_a <= 1e-6 {
+        return;
+    }
+    let d_w = da * inv;
+    for c in 0..3 {
+        let blended = (src[c] as f32 * sa + dst[c] as f32 * d_w) / out_a;
+        dst[c] = blended.round().clamp(0.0, 255.0) as u8;
+    }
+    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
 pub fn effective_part_mask(visible_mask: &[u8], fill_mask: Option<&[u8]>) -> Vec<u8> {
     visible_mask
         .iter()
@@ -2215,7 +2770,11 @@ pub fn check_mesh_quality(
                 posed_verts[ids[1]],
                 posed_verts[ids[2]],
             );
-            if posed_cross * rest_crosses[ti] <= 0.0 {
+            // T10: a triangle collapsing to a sliver (the closing eye aperture: its vertices land
+            // on the curved closing line, so the sliver's orientation follows the curvature) is
+            // not a visible inversion; only a signed area below -5 % of the rest area counts.
+            let r = rest_crosses[ti];
+            if posed_cross * r.signum() < -EXTREME_FLIP_COLLAPSE_RATIO * r.abs() {
                 flipped_mask[ti] = true;
             }
         }
@@ -2256,6 +2815,7 @@ mod tests {
             mouth: Point { x: 30., y: 33. },
             chin: Point { x: 30., y: 40. },
             crown: Point { x: 30., y: 4. },
+            eye_frames: None,
         }
     }
     #[test]
@@ -2400,6 +2960,7 @@ mod tests {
             mouth: Point { x: 30.0 * s, y: 33.0 * s },
             chin: Point { x: 30.0 * s, y: 40.0 * s },
             crown: Point { x: 30.0 * s, y: 4.0 * s },
+            eye_frames: None,
         };
         let m_1024 = part_overlap_margins(&scale_lm(16.0), 1024, 1024);
         let m_2048 = part_overlap_margins(&scale_lm(32.0), 2048, 2048);
@@ -2525,6 +3086,7 @@ mod tests {
             mouth: Point { x: 360., y: 165. },
             chin: Point { x: 360., y: 195. },
             crown: Point { x: 360., y: 40. },
+            eye_frames: None,
         };
         let report = check_mesh_quality(&mesh, &mask, w, h, "clothes", &l);
         assert!(report.triangle_count >= 120, "expected >=120 tris, got {}", report.triangle_count);
@@ -2577,10 +3139,14 @@ mod tests {
         let d_top = deform(top_corner, "eyeL_upper", &l, &closed);
         let d_mid = deform(mid_lid, "eyeL_upper", &l, &closed);
         let d_low = deform(low_corner, "eyeL_upper", &l, &closed);
-        let close_y = l.eye_l.y + 16.0 * 0.04;
-        assert!(d_top.y >= top_corner.y && d_top.y <= close_y + 1e-6);
-        assert!(d_mid.y >= mid_lid.y && d_mid.y <= close_y + 1e-6);
-        assert!((d_low.y - low_corner.y).abs() < 1e-6, "below close_y outer corner must not droop onto cheek: {d_low:?}");
+        // T10: lid texels move down monotonically; below the lash line (default frame) they
+        // translate with the lash, whose travel shrinks toward the thin aperture corners, so the
+        // outer corner moves at most a tenth of an eye distance (no droop onto the cheek).
+        let dist = 16.0;
+        assert!(d_top.y >= top_corner.y);
+        assert!(d_mid.y >= mid_lid.y && d_mid.y <= l.eye_l.y + dist * 0.2);
+        assert!(d_low.y >= low_corner.y - 1e-6, "{d_low:?}");
+        assert!(d_low.y - low_corner.y <= dist * 0.1, "outer corner droops onto cheek: {d_low:?}");
         assert!(d_mid.y >= d_top.y);
     }
     #[test]
@@ -2692,11 +3258,18 @@ mod tests {
             mouth: Point { x: 56., y: 66. },
             chin: Point { x: 54., y: 84. },
             crown: Point { x: 68., y: 8. },
+            eye_frames: None,
         };
         let hf = HeadFrame::from_landmarks(&tilt_lm, 128, 128);
         let (eye_lu, eye_lv) = hf.to_local(DVec2::new(tilt_lm.eye_l.x, tilt_lm.eye_l.y));
-        let tip = hf.to_world(eye_lu, eye_lv + 2.0);
-        let corner = hf.to_world(eye_lu + 10.0, eye_lv + 2.0);
+        // T10: probe the lash line itself (the lid's lower edge, default frame without masks); it
+        // lands on the closing line, whose expression curvature is checked here.
+        let hf0 = HeadFrame::from_landmarks(&tilt_lm, 0, 0);
+        let frame = default_eye_frame(eye_lu, eye_lv, hf0.eye_dist);
+        let (lash_c, _) = eye_lines_at(&frame, eye_lu);
+        let (lash_k, _) = eye_lines_at(&frame, eye_lu + 10.0);
+        let tip = hf.to_world(eye_lu, lash_c);
+        let corner = hf.to_world(eye_lu + 10.0, lash_k);
 
         // Smiling expression arches real upper eyelid upward (^) along HeadFrame -v
         let smile_pose = Pose {

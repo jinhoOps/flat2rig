@@ -8,7 +8,7 @@ use flat2rig_lib::analysis::{
     templates::{with_eval_holdout, TemplateStyleSelection},
 };
 use flat2rig_lib::core;
-use flat2rig_lib::rig::{exposure, fidelity, seams};
+use flat2rig_lib::rig::{exposure, eye_seal, fidelity, seams};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -25,29 +25,9 @@ fn decode_part_rgba(tex_url: Option<&str>, fallback: &image::RgbaImage) -> image
     fallback.clone()
 }
 
-#[inline]
-fn blend_straight_pixel(dst: &mut [u8], src: [u8; 4]) {
-    let sa = src[3] as f32 / 255.0;
-    if sa <= 0.0 {
-        return;
-    }
-    let da = dst[3] as f32 / 255.0;
-    let inv = 1.0 - sa;
-    let out_a = sa + da * inv;
-    if out_a <= 1e-6 {
-        return;
-    }
-    let d_w = da * inv;
-    for c in 0..3 {
-        let blended = (src[c] as f32 * sa + dst[c] as f32 * d_w) / out_a;
-        dst[c] = blended.round().clamp(0.0, 255.0) as u8;
-    }
-    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
-}
-
 fn alpha_blend_layer(dst: &mut image::RgbaImage, src: &image::RgbaImage) {
     for (dp, sp) in dst.pixels_mut().zip(src.pixels()) {
-        blend_straight_pixel(&mut dp.0, sp.0);
+        core::blend_straight_pixel(&mut dp.0, sp.0);
     }
 }
 
@@ -101,7 +81,7 @@ fn draw_deformed_part(
                     continue;
                 }
                 let di = (y as usize * stride + x as usize) * 4;
-                blend_straight_pixel(
+                core::blend_straight_pixel(
                     &mut dst_raw[di..di + 4],
                     [src_raw[si], src_raw[si + 1], src_raw[si + 2], src_raw[si + 3]],
                 );
@@ -287,6 +267,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut proportion: Option<String> = None;
     let mut stage: Option<String> = None;
     let mut coupled = true;
+    let mut legacy_eye = false;
     let mut eval = EvalOptions::default();
     let mut positional: Vec<&str> = Vec::new();
     let mut i = 0;
@@ -312,6 +293,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // T13b baseline: run the whole pipeline (hidden-area synthesis, seam requirements,
             // exposure map, motion previews) with the pre-T13b uncoupled `deform`.
             coupled = false;
+        } else if arg == "--legacy-eye" {
+            // T10 baseline (measurement only): the whole pipeline with the pre-T10 per-layer eye
+            // formulas and clipping rule.
+            legacy_eye = true;
         } else if arg == "--eval-holdout" {
             // T14 (evaluation only): seam holdout re-synthesized by the hidden-texel path.
             eval.holdout = true;
@@ -332,11 +317,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if positional.len() < 2 {
         return Err(
-            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
+            "Usage: flat2rig-cli [--proportion auto|ld|sd] [--uncoupled] [--legacy-eye] [--eval-holdout] [--eval-truth DIR] [--stage full|base_silhouette|features_overlay|clothes_overlay|hair_overlay|base_body] INPUT.png OUTPUT_DIR [MODEL.onnx] [LANDMARKS.json] | --analyze [--full] INPUT.png [OUTPUT.json]".into(),
         );
     }
-    core::with_seam_coupling(coupled, || {
-        run_pipeline(&positional, proportion, stage, coupled, &eval)
+    core::with_legacy_eye_rig(legacy_eye, || {
+        core::with_seam_coupling(coupled, || {
+            run_pipeline(&positional, proportion, stage, coupled, legacy_eye, &eval)
+        })
     })
 }
 
@@ -494,6 +481,7 @@ fn run_pipeline(
     proportion: Option<String>,
     stage: Option<String>,
     coupled: bool,
+    legacy_eye: bool,
     eval: &EvalOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
@@ -568,6 +556,7 @@ fn run_pipeline(
                     x: w as f64 * 0.5,
                     y: h as f64 * 0.08,
                 },
+                eye_frames: None,
             }
         }
     };
@@ -604,6 +593,9 @@ fn run_pipeline(
         )
     };
     let proposed = propose()?;
+    // T10: eye layers deform with the aperture lines of the proposed visible masks (every motion
+    // preview, seam, coverage and exposure computation below uses these landmarks).
+    let landmarks = landmarks.with_eye_frames(&proposed.part_ids, &proposed.masks, w as usize, h as usize);
 
     let mut meshes = Vec::new();
     let mut mesh_quality = Vec::new();
@@ -659,6 +651,7 @@ fn run_pipeline(
     let mut motion_buffers: Vec<image::RgbaImage> =
         (0..motion_poses.len()).map(|_| image::RgbaImage::new(w, h)).collect();
     let mut part_meshes: Vec<core::Mesh> = Vec::with_capacity(proposed.part_ids.len());
+    let mut layer_textures: Vec<Vec<u8>> = Vec::with_capacity(proposed.part_ids.len());
 
     for idx in 0..proposed.part_ids.len() {
         let id = &proposed.part_ids[idx];
@@ -698,6 +691,7 @@ fn run_pipeline(
         alpha_blend_layer(&mut fill_only_composite, &fill_part);
 
         eff_part.save(output.join("parts").join(format!("{id}.png")))?;
+        layer_textures.push(eff_part.as_raw().clone());
 
         let mesh = core::art_mesh_for_part(&effective, w as usize, h as usize, 14, id, &landmarks);
         let quality = core::check_mesh_quality(&mesh, &effective, w as usize, h as usize, id, &landmarks);
@@ -794,6 +788,52 @@ fn run_pipeline(
     image::RgbaImage::from_raw(w, h, heat)
         .ok_or("exposure heatmap size mismatch")?
         .save(output.join("exposure.png"))?;
+    // T10: eye seal (leaks / lid seam gaps / lid-line breaks) over the expression × gaze poses,
+    // plus hard renders of the seal poses for before/after comparison (`eye_seal/*.png`).
+    let seal_poses = eye_seal::eye_seal_poses(env);
+    let eye_seal_report = eye_seal::check_eye_seal_with(
+        &proposed.part_ids,
+        &proposed.masks,
+        &fill_full,
+        &part_meshes,
+        &landmarks,
+        wu,
+        hu,
+        &seal_poses,
+    );
+    {
+        std::fs::create_dir_all(output.join("eye_seal"))?;
+        let textures: Vec<&[u8]> = layer_textures.iter().map(|t| t.as_slice()).collect();
+        let rest = seams::EnvelopePose {
+            name: "rest".into(),
+            group: "rest".into(),
+            pose: core::Pose::default(),
+        };
+        for pe in std::iter::once(&rest).chain(seal_poses.iter().filter(|p| {
+            p.name.ends_with("/gaze:00") || p.name == "seal:sad/gaze:++" || p.name == "seal:closed/gaze:--"
+        })) {
+            let (rgba, top) = eye_seal::render_pose_rgba(
+                &proposed.part_ids,
+                &proposed.masks,
+                &fill_full,
+                &part_meshes,
+                &textures,
+                &landmarks,
+                wu,
+                hu,
+                &pe.pose,
+            );
+            let file = pe.name.replace([':', '/'], "_").replace("+", "p").replace("-", "m");
+            image::RgbaImage::from_raw(w, h, rgba)
+                .ok_or("eye seal render size mismatch")?
+                .save(output.join("eye_seal").join(format!("{file}.png")))?;
+            // Posed top-layer owner (layer index + 1, 0 = none; 16-bit) for defect diagnosis.
+            let owner: Vec<u16> = top.iter().map(|&t| (t + 1) as u16).collect();
+            image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(w, h, owner)
+                .ok_or("eye seal owner size mismatch")?
+                .save(output.join("eye_seal").join(format!("{file}_owner.png")))?;
+        }
+    }
     let seam_rows: Vec<serde_json::Value> = requirements
         .iter()
         .map(|r| {
@@ -813,6 +853,7 @@ fn run_pipeline(
                 "uncoupledUnderlapPx": r.uncoupled_underlap_px,
                 "uncoupledMaxRelativeDisplacementPx": r.uncoupled_max_relative_displacement_px,
                 "adoptedUnderlap": r.adopted,
+                "legacyEyeUnderlapPx": r.legacy_eye_underlap_px,
                 "worstPose": r.worst_pose,
                 "lowerMisses": cov.map_or(0, |c| c.lower_misses),
                 "holes": cov.map_or(0, |c| c.holes),
@@ -856,6 +897,8 @@ fn run_pipeline(
             "violations": coverage.violations.iter().take(16).collect::<Vec<_>>(),
         },
         "seams": seam_rows,
+        "eyeSeal": eye_seal_report,
+        "eyeRig": { "legacy": legacy_eye, "eyeFrames": landmarks.eye_frames },
         "elapsedMs": start.elapsed().as_millis(),
         "engine": "Rust / ort / delaunator / glam"
     });

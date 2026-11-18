@@ -68,10 +68,14 @@ struct RawEnvelope {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawEnvelopePose {
     name: String,
     group: String,
     params: serde_json::Map<String, serde_json::Value>,
+    /// T10 expression poses carry the eye shape input the app evaluates for that expression.
+    #[serde(default)]
+    shape: Option<crate::core::ShapeDeformInput>,
 }
 
 /// camelCase field names of `Pose` (the same keys TS `Parameters` uses).
@@ -123,8 +127,9 @@ pub fn parse_pose_envelope(json: &str) -> Result<PoseEnvelope, String> {
                 ));
             }
         }
-        let pose: Pose = serde_json::from_value(serde_json::Value::Object(p.params))
+        let mut pose: Pose = serde_json::from_value(serde_json::Value::Object(p.params))
             .map_err(|e| format!("pose envelope: `{}`: {e}", p.name))?;
+        pose.shape = p.shape;
         poses.push(EnvelopePose {
             name: p.name,
             group: p.group,
@@ -140,6 +145,41 @@ pub fn parse_pose_envelope(json: &str) -> Result<PoseEnvelope, String> {
             .collect(),
         poses,
     })
+}
+
+thread_local! {
+    static BASE_ENVELOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with hidden-area synthesis restricted to the pre-T10 envelope (every pose except the
+/// T10 `eyeSeal` group). Used only to build the rest-invariance baseline of template synthesis
+/// (`templates::synthesize_template_bank_for_stage`); thread-local like `with_seam_coupling`.
+pub fn with_base_envelope<R>(f: impl FnOnce() -> R) -> R {
+    let prev = BASE_ENVELOPE.with(|c| c.replace(true));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BASE_ENVELOPE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+/// Whether `with_base_envelope` is active on this thread.
+pub fn base_envelope_enabled() -> bool {
+    BASE_ENVELOPE.with(|c| c.get())
+}
+
+/// Envelope used by hidden-area synthesis: the shared envelope, or (inside `with_base_envelope`)
+/// the pre-T10 subset without the `eyeSeal` group.
+pub fn hidden_area_envelope() -> Vec<EnvelopePose> {
+    let env = &pose_envelope().poses;
+    if base_envelope_enabled() {
+        env.iter().filter(|p| p.group != "eyeSeal").cloned().collect()
+    } else {
+        env.clone()
+    }
 }
 
 /// The embedded shared envelope (parsed once).
@@ -523,8 +563,13 @@ pub struct SeamRequirement {
     pub coupled_underlap_px: Option<usize>,
     pub uncoupled_underlap_px: Option<usize>,
     pub uncoupled_max_relative_displacement_px: Option<f64>,
-    /// Which field set `required_underlap_px`: `coupled`, `uncoupled`, or `equal`.
+    /// Which field set `required_underlap_px`: `coupled`, `uncoupled`, `equal`, or (T10) `legacyEye`.
     pub adopted: Option<&'static str>,
+    /// T10: underlap measured with the pre-T10 eye formulas (`core::with_legacy_eye_rig`) for seams
+    /// that involve an eye layer. The hidden area never shrinks because of the sealed eye rig: an eye
+    /// seam keeps the max of both, and a white/iris *lower* layer keeps the legacy value (its texels
+    /// outside the aperture fold under the lid, so the folded field has no inverse to measure).
+    pub legacy_eye_underlap_px: Option<usize>,
 }
 
 /// Requirements for every seam using the real `core::deform`.
@@ -639,6 +684,7 @@ where
             uncoupled_underlap_px: None,
             uncoupled_max_relative_displacement_px: None,
             adopted: None,
+            legacy_eye_underlap_px: None,
         });
     }
     out
@@ -676,6 +722,80 @@ where
 /// two fields are identical and the plain uncoupled requirements are returned.
 #[allow(clippy::too_many_arguments)]
 pub fn hidden_area_seam_requirements(
+    graph: &SeamGraph,
+    visible_masks: &[Vec<u8>],
+    fg_alpha: &[u8],
+    lm: &Landmarks,
+    w: usize,
+    h: usize,
+    poses: &[EnvelopePose],
+    max_samples_per_seam: usize,
+) -> Vec<SeamRequirement> {
+    let current = coupled_hidden_area_requirements(
+        graph,
+        visible_masks,
+        fg_alpha,
+        lm,
+        w,
+        h,
+        poses,
+        max_samples_per_seam,
+    );
+    if crate::core::legacy_eye_rig_enabled() {
+        return current;
+    }
+    // T10: eye seams also measured with the pre-T10 eye formulas (never shrink a hidden area).
+    let is_eye = |id: &str| crate::core::eye_layer_side(id).is_some();
+    let eye_graph = SeamGraph {
+        seams: graph
+            .seams
+            .iter()
+            .filter(|s| is_eye(&s.upper_id) || is_eye(&s.lower_id))
+            .cloned()
+            .collect(),
+    };
+    if eye_graph.seams.is_empty() {
+        return current;
+    }
+    let legacy = crate::core::with_legacy_eye_rig(true, || {
+        coupled_hidden_area_requirements(
+            &eye_graph,
+            visible_masks,
+            fg_alpha,
+            lm,
+            w,
+            h,
+            poses,
+            max_samples_per_seam,
+        )
+    });
+    current
+        .into_iter()
+        .map(|mut r| {
+            if let Some(l) = legacy
+                .iter()
+                .find(|l| l.upper_id == r.upper_id && l.lower_id == r.lower_id)
+            {
+                let lr = l.required_underlap_px;
+                r.legacy_eye_underlap_px = Some(lr);
+                let interior_lower = crate::core::is_eye_interior_layer(&r.lower_id)
+                    || r.lower_id.ends_with("_white")
+                    || r.lower_id.ends_with("_iris");
+                if interior_lower || lr > r.required_underlap_px {
+                    if lr != r.required_underlap_px {
+                        r.adopted = Some("legacyEye");
+                    }
+                    r.required_underlap_px = lr;
+                }
+            }
+            r
+        })
+        .collect()
+}
+
+/// T13b coupled/uncoupled merge of `seam_requirements` (see `hidden_area_seam_requirements`).
+#[allow(clippy::too_many_arguments)]
+fn coupled_hidden_area_requirements(
     graph: &SeamGraph,
     visible_masks: &[Vec<u8>],
     fg_alpha: &[u8],
@@ -912,7 +1032,7 @@ pub fn check_seam_coverage(
     poses: &[EnvelopePose],
     stride: usize,
 ) -> SeamCoverageReport {
-    check_seam_coverage_with(
+    check_seam_coverage_with_fold(
         graph,
         layer_ids,
         visible_masks,
@@ -923,6 +1043,7 @@ pub fn check_seam_coverage(
         poses,
         stride,
         |p, id, pose| deform(p, id, lm, pose),
+        |p, id| crate::core::eye_interior_folded(p, id, lm),
     )
 }
 
@@ -941,6 +1062,42 @@ pub fn check_seam_coverage_with<D>(
 ) -> SeamCoverageReport
 where
     D: Fn(Point, &str, &Pose) -> Point,
+{
+    check_seam_coverage_with_fold(
+        graph,
+        layer_ids,
+        visible_masks,
+        fill_masks,
+        fg_alpha,
+        w,
+        h,
+        poses,
+        stride,
+        deform_fn,
+        |_, _| false,
+    )
+}
+
+/// `check_seam_coverage_with` plus a predicate `folded(rest_point, lower_id)` for rest samples the
+/// lower layer's field folds away (T10 white/iris outside the aperture): those samples expose
+/// nothing of the lower layer and are skipped, since the folded field has no inverse there.
+#[allow(clippy::too_many_arguments)]
+pub fn check_seam_coverage_with_fold<D, F>(
+    graph: &SeamGraph,
+    layer_ids: &[String],
+    visible_masks: &[Vec<u8>],
+    fill_masks: &[Vec<u8>],
+    fg_alpha: &[u8],
+    w: usize,
+    h: usize,
+    poses: &[EnvelopePose],
+    stride: usize,
+    deform_fn: D,
+    folded: F,
+) -> SeamCoverageReport
+where
+    D: Fn(Point, &str, &Pose) -> Point,
+    F: Fn(Point, &str) -> bool,
 {
     let n = w * h;
     let owner = visible_owner(visible_masks, n);
@@ -988,6 +1145,13 @@ where
                 let walk =
                     walk_exposed_band(b, yu, &f_lower, fg_alpha, &owner, lower, w, h, |t, s, k| {
                         if eff[lower][k] > 0 {
+                            return true;
+                        }
+                        // T10: a white/iris rest sample outside the aperture folds onto the lid
+                        // edge (zero posed area): nothing of the lower is exposed there and the
+                        // folded field has no inverse. Background holes stay counted by the
+                        // exposure raster.
+                        if folded(Point::from(s), seam.lower_id.as_str()) {
                             return true;
                         }
                         let posed = f_lower(s);
@@ -1055,6 +1219,7 @@ mod tests {
             mouth: Point { x: 512.0, y: 492.0 },
             chin: Point { x: 512.0, y: 560.0 },
             crown: Point { x: 512.0, y: 120.0 },
+            eye_frames: None,
         }
     }
 
@@ -1064,7 +1229,7 @@ mod tests {
         assert_eq!(env.version, 1);
         assert_eq!(
             env.poses.len(),
-            94,
+            145,
             "envelope size changed: update docs/tests"
         );
         assert_eq!(env.poses[0].name, "rest");
@@ -1087,6 +1252,7 @@ mod tests {
             "headBodySame",
             "hairPhase",
             "headHairBody",
+            "eyeSeal",
         ] {
             assert!(groups.contains(g), "missing group {g}");
         }
@@ -1750,7 +1916,7 @@ mod tests {
         let doc = serde_json::json!({
             "description": "T13a/T13b Rust/TS parity: envelope poses as parsed by Rust (Pose::default() merged); max relative seam displacement over the envelope with core::deform (coupled, T13b) and core::deform_uncoupled; far reference point max displacement (coupled); seam coupling weights. TS asserts the same values with engine.ts deform / deformUncoupled / seamCouplingWeights.",
             "landmarks": lm,
-            "envelope": env.iter().map(|p| serde_json::json!({ "name": p.name, "pose": p.pose })).collect::<Vec<_>>(),
+            "envelope": env.iter().map(|p| serde_json::json!({ "name": p.name, "pose": p.pose, "shape": p.pose.shape })).collect::<Vec<_>>(),
             "cases": out_cases,
             "farPoints": far,
             "couplingWeights": weights,

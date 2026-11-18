@@ -1409,6 +1409,7 @@ mod tests {
             uncoupled_underlap_px: None,
             uncoupled_max_relative_displacement_px: None,
             adopted: None,
+            legacy_eye_underlap_px: None,
         };
         // Exposure: neck hidden x∈[20,30); exposed in 3 of 4 poses at depth ≤ 3, 1 pose deeper.
         let mut hidden = vec![false; n];

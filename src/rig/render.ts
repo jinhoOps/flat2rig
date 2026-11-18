@@ -2,7 +2,10 @@ import {
   compositePartTexture,
   deform,
   effectiveMask,
+  eyeLayerSide,
+  isEyeIrisLayer,
   meshForPart,
+  rigLandmarks,
   type ShapeDeformInput,
 } from "../engine";
 import { canvas, loadImage, pixelsCanvas } from "../images";
@@ -140,11 +143,13 @@ function computePosedPoints(
   moving: boolean,
 ): Point[] | null {
   if (!moving || !mesh || mesh.triangles.length === 0) return null;
+  // T10: eye layers deform with the aperture lines of the project's visible eye masks.
+  const lm = rigLandmarks(project);
   let maxDelta = 0;
   const posed = new Array<Point>(mesh.vertices.length);
   for (let i = 0; i < mesh.vertices.length; i++) {
     const sv = mesh.vertices[i];
-    const dv = deform(sv, part, project.landmarks, params, shapeDeform);
+    const dv = deform(sv, part, lm, params, shapeDeform);
     const d = Math.abs(dv.x - sv.x) + Math.abs(dv.y - sv.y);
     if (d > maxDelta) maxDelta = d;
     posed[i] = dv;
@@ -202,7 +207,7 @@ export function drawWireOverlay(
     precomputedPosed ??
     (deformVertices
       ? mesh.vertices.map((pt) =>
-          deform(pt, part, project.landmarks, pose, shapeDeform),
+          deform(pt, part, rigLandmarks(project), pose, shapeDeform),
         )
       : mesh.vertices);
   const edgeCounts = new Map<string, [number, number, number]>();
@@ -389,6 +394,42 @@ interface ResolvedRenderLayer {
   isBasePart: boolean;
 }
 
+const hasHiddenArea = (part: Pick<Part, "fillMask">) =>
+  Boolean(part.fillMask?.some((v) => v > 0));
+
+/**
+ * T10 clipping rule (mirrors Rust `rig::exposure::default_clip_targets`): an iris layer
+ * (`eye{L,R}_iris`, numbered extras by suffix) clips to its side's `eye{L,R}_white` when that white
+ * has a hidden area (`fillMask`) and is drawn below it — otherwise clipping would erase visible iris
+ * pixels; `face_detail` and `mouth_*` clip to `face` when `face` has a hidden area. Entries of the
+ * rig profile's `clippingTargets` are honoured under the same condition (target below the child,
+ * target with a hidden area). The pose never changes the result, so still previews, thumbnails,
+ * snapshots and playback clip identically.
+ */
+export function resolveClippingTargets(
+  orderedParts: ReadonlyArray<Pick<Part, "id" | "fillMask">>,
+  profileTargets?: Record<string, string>,
+): Record<string, string> {
+  const index = new Map(orderedParts.map((part, i) => [part.id, i] as const));
+  const usable = (childId: string, targetId: string) => {
+    const c = index.get(childId);
+    const t = index.get(targetId);
+    return c !== undefined && t !== undefined && t < c && hasHiddenArea(orderedParts[t]);
+  };
+  const out: Record<string, string> = {};
+  for (const part of orderedParts) {
+    const side = eyeLayerSide(part.id);
+    let target: string | undefined;
+    if (side && isEyeIrisLayer(part.id)) target = `eye${side}_white`;
+    else if (part.id === "face_detail" || part.id.startsWith("mouth")) target = "face";
+    if (target && usable(part.id, target)) out[part.id] = target;
+  }
+  for (const [childId, targetId] of Object.entries(profileTargets ?? {})) {
+    if (!(childId in out) && usable(childId, targetId)) out[childId] = targetId;
+  }
+  return out;
+}
+
 export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
   const {
     ctx,
@@ -419,12 +460,6 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
     return scratch;
   }
 
-  const baseClippingTargets = p.rigProfile.clippingTargets ?? {
-    eyeL_iris: "eyeL_white",
-    eyeR_iris: "eyeR_white",
-    face_detail: "face",
-  };
-
   const orderedParts = [...p.parts]
     .map((part, i) => ({ part, i }))
     .sort(
@@ -436,32 +471,15 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
   const visibleOrdered = orderedParts.filter(
     ({ part }) => part.visible && part.status !== "missing" && (!soloPartId || part.id === soloPartId),
   );
-  const hasFaceFill = visibleOrdered.some(
-    ({ part }) => part.id === "face" && Boolean(part.fillMask),
+  // T10: one pose-independent clipping rule for every render path (playback, still expression /
+  // gaze previews, thumbnails, PNG/export snapshots), shared with Rust `exposure::default_clip_targets`.
+  const clippingTargets = resolveClippingTargets(
+    visibleOrdered.map(({ part }) => part),
+    p.rigProfile.clippingTargets,
   );
-  const scleraHasFill = (targetId: string) =>
-    visibleOrdered.some(
-      ({ part }) => part.id === targetId && Boolean(part.fillMask?.some((v) => v > 0)),
-    );
-  const clippingTargets: Record<string, string> = {};
-  for (const [childId, targetId] of Object.entries(baseClippingTargets)) {
-    if (
-      targetId === "face"
-        ? hasFaceFill
-        : moving || scleraHasFill(targetId)
-    ) {
-      clippingTargets[childId] = targetId;
-    }
-  }
-  if (hasFaceFill) {
-    Object.assign(clippingTargets, {
-      face_detail: "face",
-      mouth_inner: "face",
-      mouth_upper: "face",
-      mouth_lower: "face",
-      mouth_sub_skin: "face",
-      mouth_sub_inner: "face",
-    });
+  // Mouth substitute layers are drawn above `face` (not parts): same `mouth_*` → `face` rule.
+  if (visibleOrdered.some(({ part }) => part.id === "face" && hasHiddenArea(part))) {
+    for (const id of ["mouth_sub_skin", "mouth_sub_inner"]) clippingTargets[id] ??= "face";
   }
   const subsAtSlot = new Map<string, ShapeSubstituteAsset[]>();
   const subsAfterFace: ShapeSubstituteAsset[] = [];

@@ -1283,7 +1283,10 @@ export function checkMeshQuality(
         deformed[mesh.triangles[t * 3 + 1]],
         deformed[mesh.triangles[t * 3 + 2]],
       );
-      if (pc * restCrosses[t] <= 0) flipped[t] = 1;
+      // T10: a triangle collapsing to a sliver on the curved closing eye line is not a visible
+      // inversion; only a signed area below -5% of the rest area counts (Rust `check_mesh_quality`).
+      const r = restCrosses[t];
+      if (pc * Math.sign(r) < -EXTREME_FLIP_COLLAPSE_RATIO * Math.abs(r)) flipped[t] = 1;
     }
   }
   const flippedAtExtremes = flipped.reduce((s, b) => s + b, 0);
@@ -1486,6 +1489,415 @@ export interface ShapeDeformInput {
 }
 
 // -------------------------------------------------------------------------------------------------
+// T10 sealed eye rig — mirrors Rust `core::deform_eye` / `core::derive_eye_frames` (see the comment
+// block there). All non-substitute eye layers of one side share one vertical field per head-local
+// column: above the rest lash line the upper-lid map, below the lower line the lower-lid map, and a
+// linear interpolation across the aperture. White/iris texels outside the aperture fold onto the lid
+// edge, so at `eye = 0` the interior has zero height under the closed lid.
+// -------------------------------------------------------------------------------------------------
+
+export const EYE_FRAME_BINS = 16;
+export const EYE_FRAME_REACH_ED = 0.9;
+export const EYE_LID_REACH_ED = 0.2;
+export const EYE_LID_RAMP_ED = 0.12;
+export const EYE_LOWER_CLOSED_SCALE = 0.4;
+export const EYE_INTERIOR_TUCK_ED = 0.01;
+export const EYE_FOLD_ONSET_CLOSE = 0.05;
+export const EYE_LASH_KEEP_ED = 0.03;
+/** Extreme-pose flip threshold as a fraction of the rest area (Rust `EXTREME_FLIP_COLLAPSE_RATIO`). */
+export const EXTREME_FLIP_COLLAPSE_RATIO = 0.05;
+
+/** One aperture column sample in head-local coordinates (`toHeadLocal`). */
+export interface EyeFrameSample {
+  u: number;
+  lash: number;
+  lower: number;
+}
+
+export interface EyeFrames {
+  L?: EyeFrameSample[];
+  R?: EyeFrameSample[];
+}
+
+/**
+ * Landmarks plus the derived eye aperture lines. Never stored in the project (`project.landmarks`
+ * stays the five points); renderers derive it with `rigLandmarks`.
+ */
+export type RigLandmarks = Landmarks & { eyeFrames?: EyeFrames };
+
+export function eyeLayerSide(id: string): "L" | "R" | null {
+  if (id.startsWith("eyeL")) return "L";
+  if (id.startsWith("eyeR")) return "R";
+  return null;
+}
+
+/** White or iris layer of an eye, including numbered extras (`eyeL_iris_2`). */
+export function isEyeInteriorLayer(id: string): boolean {
+  return /^eye[LR]_(white|iris)(_\d+)?$/.test(id);
+}
+
+export function isEyeIrisLayer(id: string): boolean {
+  return isEyeInteriorLayer(id) && id.includes("_iris");
+}
+
+/** Rest aperture lines per eye from the visible white/iris masks (alpha ≥ 128). */
+export function deriveEyeFrames(
+  lm: Landmarks,
+  parts: ReadonlyArray<Pick<Part, "id" | "mask">>,
+  w: number,
+  h: number,
+): EyeFrames {
+  const hf = buildHeadFrame(lm, 0, 0);
+  const dist = hf.eyeDist;
+  const sideFrame = (side: "L" | "R"): EyeFrameSample[] | undefined => {
+    const eye = side === "L" ? lm.eyeL : lm.eyeR;
+    const [eu, ev] = toHeadLocal(hf, eye.x, eye.y);
+    const reach = dist * EYE_FRAME_REACH_ED;
+    // Visible white ∪ iris near the eye; only the largest 8-connected component defines the
+    // aperture (isolated specks inside the lash wing would make the corner samples falsely tall).
+    const sel = new Uint8Array(w * h);
+    for (const part of parts) {
+      if (eyeLayerSide(part.id) !== side || !isEyeInteriorLayer(part.id) || !part.mask) continue;
+      const m = part.mask;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          if (m[y * w + x] < 128) continue;
+          const [u, v] = toHeadLocal(hf, x + 0.5, y + 0.5);
+          if (Math.abs(u - eu) <= reach && Math.abs(v - ev) <= reach) sel[y * w + x] = 1;
+        }
+      }
+    }
+    let best: number[] = [];
+    const seen = new Uint8Array(w * h);
+    for (let start = 0; start < w * h; start++) {
+      if (!sel[start] || seen[start]) continue;
+      const comp = [start];
+      seen[start] = 1;
+      for (let k = 0; k < comp.length; k++) {
+        const i = comp[k];
+        const x = i % w;
+        const y = (i - x) / w;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            const j = ny * w + nx;
+            if (sel[j] && !seen[j]) {
+              seen[j] = 1;
+              comp.push(j);
+            }
+          }
+        }
+      }
+      if (comp.length > best.length) best = comp;
+    }
+    const us: number[] = [];
+    const vs: number[] = [];
+    for (const i of best) {
+      const [u, v] = toHeadLocal(hf, (i % w) + 0.5, Math.floor(i / w) + 0.5);
+      us.push(u);
+      vs.push(v);
+    }
+    if (us.length < 8) return undefined;
+    let umin = Infinity;
+    let umax = -Infinity;
+    for (const u of us) {
+      umin = Math.min(umin, u);
+      umax = Math.max(umax, u);
+    }
+    const span = umax - umin;
+    if (span < 1) return undefined;
+    const k = EYE_FRAME_BINS;
+    const lash = new Array<number>(k).fill(Infinity);
+    const lower = new Array<number>(k).fill(-Infinity);
+    for (let i = 0; i < us.length; i++) {
+      const b = Math.min(k - 1, Math.floor(((us[i] - umin) / span) * k));
+      lash[b] = Math.min(lash[b], vs[i] - 0.5);
+      lower[b] = Math.max(lower[b], vs[i] + 0.5);
+    }
+    // Conservative lines: each sample takes the extreme over its neighbouring bins, so the
+    // piecewise-linear line never cuts a visible aperture pixel (rest pose stays exact).
+    const out: EyeFrameSample[] = [];
+    for (let b = 0; b < k; b++) {
+      if (!Number.isFinite(lash[b])) continue;
+      const a = Math.max(0, b - 1);
+      const c = Math.min(k - 1, b + 1);
+      const top = Math.min(lash[a], lash[b], lash[c]);
+      const bottom = Math.max(lower[a], lower[b], lower[c]);
+      out.push({
+        u: umin + ((b + 0.5) * span) / k,
+        lash: top,
+        lower: Math.max(bottom, top + 1),
+      });
+    }
+    return out;
+  };
+  const out: EyeFrames = {};
+  const l = sideFrame("L");
+  const r = sideFrame("R");
+  if (l) out.L = l;
+  if (r) out.R = r;
+  return out;
+}
+
+/** Aperture used when no frame could be derived (landmarks only). */
+export function defaultEyeFrame(eyeU: number, eyeV: number, dist: number): EyeFrameSample[] {
+  return [-1, -0.5, 0, 0.5, 1].map((t) => {
+    const k = 1 - 0.6 * t * t;
+    return {
+      u: eyeU + t * 0.3 * dist,
+      lash: eyeV - 0.2 * dist * k,
+      lower: eyeV + 0.13 * dist * k,
+    };
+  });
+}
+
+/** `[lash, lower]` at head-local column `u` (piecewise linear, constant beyond the ends). */
+export function eyeLinesAt(samples: readonly EyeFrameSample[], u: number): [number, number] {
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  if (u <= first.u) return [first.lash, first.lower];
+  if (u >= last.u) return [last.lash, last.lower];
+  for (let i = 0; i + 1 < samples.length; i++) {
+    const a = samples[i];
+    const b = samples[i + 1];
+    if (u <= b.u) {
+      const t = b.u > a.u ? (u - a.u) / (b.u - a.u) : 0;
+      return [a.lash + (b.lash - a.lash) * t, a.lower + (b.lower - a.lower) * t];
+    }
+  }
+  return [last.lash, last.lower];
+}
+
+const rigLandmarksCache = new WeakMap<
+  object,
+  { landmarks: Landmarks; width: number; height: number; value: RigLandmarks }
+>();
+
+/** `project.landmarks` with eye frames derived from the project's visible eye masks (memoised). */
+export function rigLandmarks(project: {
+  landmarks: Landmarks;
+  parts: ReadonlyArray<Pick<Part, "id" | "mask">>;
+  width: number;
+  height: number;
+}): RigLandmarks {
+  const key = project.parts as object;
+  const hit = rigLandmarksCache.get(key);
+  if (
+    hit &&
+    hit.landmarks === project.landmarks &&
+    hit.width === project.width &&
+    hit.height === project.height
+  ) {
+    return hit.value;
+  }
+  const value: RigLandmarks = {
+    ...project.landmarks,
+    eyeFrames: deriveEyeFrames(project.landmarks, project.parts, project.width, project.height),
+  };
+  rigLandmarksCache.set(key, {
+    landmarks: project.landmarks,
+    width: project.width,
+    height: project.height,
+    value,
+  });
+  return value;
+}
+
+/** Static eye-shape vertical warp at posed column `pu` (Rust `eye_shape_v`). */
+function eyeShapeV(
+  pv0: number,
+  pu: number,
+  eyeU: number,
+  eyeV: number,
+  dist: number,
+  isLeft: boolean,
+  shape: RegionDeformParams,
+  isIris: boolean,
+  legacy?: { skipUpper: boolean; fullUpper: boolean; fullLower: boolean },
+): number {
+  let pv = pv0;
+  const nx = (pu - eyeU) / Math.max(1, dist * 0.24);
+  const centerArch = Math.max(0, 1 - nx * nx);
+  const eyeSign = isLeft ? 1 : -1;
+  const outerSigned = clamp(nx * eyeSign, -0.4, 1.2);
+  pv -= shape.corner * dist * 0.045 * outerSigned;
+  if (legacy?.fullUpper) {
+    pv -= shape.upperCurveDelta * dist * 0.055 * centerArch;
+  } else if (!legacy?.skipUpper) {
+    const upperMask = clamp((eyeV + dist * 0.06 - pv) / Math.max(1, dist * 0.14), 0, 1);
+    pv -= shape.upperCurveDelta * dist * 0.055 * centerArch * upperMask;
+  }
+  const lowerMask = legacy?.fullLower
+    ? 1
+    : clamp((pv - (eyeV - dist * 0.02)) / Math.max(1, dist * 0.14), 0, 1);
+  pv += shape.lowerCurveDelta * dist * 0.045 * centerArch * lowerMask;
+  if (!isIris) {
+    pv = eyeV + (pv - eyeV) * (1 + shape.roundnessDelta * 0.32 * centerArch);
+  }
+  return pv;
+}
+
+/** Eye block of `deformUncoupled` (Rust `deform_eye`): head-local `(pu, pv)` in → out. */
+function deformEye(
+  pu0: number,
+  pv0: number,
+  id: string,
+  lm: RigLandmarks,
+  hf: HeadFrame,
+  params: Parameters,
+  shapeDeform?: ShapeDeformInput,
+): [number, number] {
+  const dist = hf.eyeDist;
+  const isLeft = id.startsWith("eyeL");
+  const side = isLeft ? "L" : "R";
+  const eye = lm[`eye${side}`];
+  const [eyeU, eyeV] = toHeadLocal(hf, eye.x, eye.y);
+  const open = params[`eye${side}`];
+  const smile = params[`eye${side}Smile`];
+  const shape = isLeft ? shapeDeform?.eyeL : shapeDeform?.eyeR;
+  const isIris = id.endsWith("_iris") || isEyeIrisLayer(id);
+  let pu = pu0;
+  let pv = pv0;
+  if (id.includes("_sub_")) {
+    // Substitute layers keep the pre-T10 static shape warp only.
+    if (shape) {
+      pu += shape.offsetX * dist * 0.14;
+      pv += shape.offsetY * dist * 0.12;
+      const ws = isIris ? 1 + (shape.width - 1) * 0.45 : shape.width;
+      pu = eyeU + (pu - eyeU) * ws;
+      pv = eyeShapeV(pv, pu, eyeU, eyeV, dist, isLeft, shape, isIris, {
+        skipUpper: id.endsWith("_upper"),
+        fullUpper: id.endsWith("_sub_lid"),
+        fullLower: id.endsWith("_lower"),
+      });
+    }
+    return [pu, pv];
+  }
+  const offX = shape?.offsetX ?? 0;
+  const offY = shape?.offsetY ?? 0;
+  const width = shape?.width ?? 1;
+  if (shape) {
+    pu += offX * dist * 0.14;
+    pv += offY * dist * 0.12;
+    const ws = isIris ? 1 + (width - 1) * 0.45 : width;
+    pu = eyeU + (pu - eyeU) * ws;
+    pv = eyeShapeV(pv, pu, eyeU, eyeV, dist, isLeft, shape, isIris);
+  }
+  if (isIris) {
+    pu += params.eyeBallX * dist * 0.045;
+    pv -= params.eyeBallY * dist * 0.025;
+  }
+  const close = clamp(1 - open, 0, 1);
+  const widen = clamp(open - 1, 0, 0.3);
+  const curveDelta = shape?.upperCurveDelta ?? 0;
+  const posCurve = Math.max(0, curveDelta);
+  const negCurve = Math.max(0, -curveDelta);
+  const nxC = (pu - eyeU) / Math.max(1, dist * 0.25);
+  const arch = Math.max(0, 1 - nxC * nxC);
+  // Rest column of the aperture lines under this posed column (inverse of the white's width map).
+  let uRest = pu;
+  if (shape && Math.abs(width) > 1e-6) {
+    uRest = eyeU + (pu - eyeU) / width - offX * dist * 0.14;
+  }
+  const frame = lm.eyeFrames?.[side];
+  const samples = frame && frame.length > 0 ? frame : defaultEyeFrame(eyeU, eyeV, dist);
+  const [lashR, lowerR] = eyeLinesAt(samples, uRest);
+  const interior = isEyeInteriorLayer(id) || id.endsWith("_white") || isIris;
+  const warp = (v: number) =>
+    shape ? eyeShapeV(v + offY * dist * 0.12, pu, eyeU, eyeV, dist, isLeft, shape, false) : v;
+  const la = warp(lashR);
+  const ba = Math.max(warp(lowerR), la + 0.5);
+  const dA = warp(eyeV) - eyeV;
+  // Closing line: the pre-T10 full-closure seam at the eye-centre column, kept as the same fraction
+  // λ of the aperture height across the eye (corners barely move), plus expression curvature and the
+  // pre-T10 sad (∪) lid drop (no expression's lash travel shrinks); never above the lash line.
+  const [lashC, lowerC] = eyeLinesAt(samples, eyeU);
+  const lambda = clamp((eyeV + dist * 0.022 - lashC) / Math.max(1, lowerC - lashC), 0, 1);
+  const s1 = Math.max(
+    la +
+      lambda * (ba - la) -
+      (smile * 0.032 + posCurve * 0.028) * dist * arch +
+      negCurve * (0.045 * arch - 0.018 * (1 - arch)) * dist +
+      negCurve * ((0.04 + 0.055) * arch - 0.025 * (1 - arch)) * dist,
+    la,
+  );
+  const liftOpen = smile * 0.045 * dist * arch;
+  const target = s1 - smile * 0.018 * dist * arch;
+  const sigma = clamp(
+    0.22 + clamp(0.14 * smile + 0.12 * posCurve - 0.03 * negCurve, -0.03, 0.2) * arch,
+    0.2,
+    0.42,
+  );
+  const reach = dist * EYE_LID_REACH_ED;
+  const ramp = Math.max(1, dist * EYE_LID_RAMP_ED);
+  const lowerSmile = smile * 0.025 * dist * arch;
+  // Closed-lid band: the lash stroke nearest the lid edge keeps its thickness; only the eyelid
+  // skin above it is compressed by σ (a squashed thin stroke aliases into a dotted line).
+  const keep = dist * EYE_LASH_KEEP_ED;
+  const closedOffset = (x: number) => (x >= -keep ? x : -keep + (x + keep) * sigma);
+  const mLid = (v: number) => {
+    const aw = clamp((v - (la - reach - ramp)) / ramp, 0, 1);
+    let r = v + aw * (close * (target + closedOffset(v - la) - v) - (1 - close) * liftOpen);
+    if (widen > 0) r -= aw * Math.max(0, eyeV + dA - v) * 0.28 * widen;
+    return r;
+  };
+  const mLo = (v: number) => {
+    const aw = clamp((ba + reach + ramp - v) / ramp, 0, 1);
+    return (
+      v + aw * (close * (target + (v - ba) * EYE_LOWER_CLOSED_SCALE - v) - (1 - close) * lowerSmile)
+    );
+  };
+  // White/iris texels outside the rest aperture fold onto the lid edge (never pulled into view).
+  // Tuck the collapsing white/iris and the lower lid glued to it into the closed upper-lid band
+  // (zero at rest; the upper lid is not shifted).
+  const tuck = EYE_INTERIOR_TUCK_ED * dist * close * close;
+  const lowerAw = (v: number) => clamp((ba + reach + ramp - v) / ramp, 0, 1);
+  const interp = (v: number) => {
+    const lo = mLid(la);
+    const hi = mLo(ba);
+    return lo + ((v - la) / (ba - la)) * (hi - lo);
+  };
+  const shared = (v: number) => (v <= la ? mLid(v) : v >= ba ? mLo(v) : interp(v));
+  if (interior) {
+    // Outside the aperture, white/iris fold onto the lid edge once the eye moves (identity at rest).
+    const folded = pv <= la ? mLid(la) : pv >= ba ? mLo(ba) : interp(pv);
+    const unfolded = shared(pv);
+    const shapeMag = shape
+      ? Math.max(
+          Math.abs(shape.width - 1),
+          Math.abs(shape.roundnessDelta),
+          Math.abs(shape.corner),
+          Math.abs(shape.upperCurveDelta),
+          Math.abs(shape.lowerCurveDelta),
+          Math.abs(shape.offsetX),
+          Math.abs(shape.offsetY),
+        )
+      : 0;
+    // Gaze moves only the iris; the white folds with lid motion alone.
+    const gaze = isIris ? Math.max(Math.abs(params.eyeBallX), Math.abs(params.eyeBallY)) : 0;
+    const motion = Math.max(
+      close,
+      gaze,
+      Math.abs(smile),
+      widen,
+      shapeMag,
+    );
+    const k = Math.min(1, motion / EYE_FOLD_ONSET_CLOSE);
+    pv = unfolded + (folded - unfolded) * k - tuck;
+  } else if (id.includes("_upper")) {
+    // Corner-wing texels below the lash line translate with the lash (no collapse, no line break).
+    pv = pv <= la ? mLid(pv) : pv + (mLid(la) - la);
+  } else if (id.includes("_lower")) {
+    pv = pv >= ba ? mLo(pv) - tuck * lowerAw(pv) : pv + (mLo(ba) - ba) - tuck;
+  } else {
+    pv = shared(pv);
+  }
+  return [pu, pv];
+}
+
+// -------------------------------------------------------------------------------------------------
 // T13b coupled seam deformation — mirrors Rust `core::deform_with_shapes` (see the comment block
 // there). `coupled(x) = own(x) + c(x)·(partner(x) − own(x))`; `c` is 1 on the seam line and exactly 0
 // beyond the falloff, so points far from seams keep their full motion. No parameter range or
@@ -1594,7 +2006,7 @@ function coupledNeckField(
 export function deform(
   p: Point,
   part: Pick<Part, "id" | "role">,
-  lm: Landmarks,
+  lm: RigLandmarks,
   params: Parameters,
   shapeDeform?: ShapeDeformInput,
 ): Point {
@@ -1626,7 +2038,7 @@ export function deform(
 export function deformUncoupled(
   p: Point,
   part: Pick<Part, "id" | "role">,
-  lm: Landmarks,
+  lm: RigLandmarks,
   params: Parameters,
   shapeDeform?: ShapeDeformInput,
 ): Point {
@@ -1654,111 +2066,7 @@ export function deformUncoupled(
   const eyeMidV = (eyeLV + eyeRV) * 0.5;
   const isSubLayer = part.id.includes("_sub_");
   if (part.id.startsWith("eye")) {
-    const isLeft = part.id.startsWith("eyeL"),
-      side = isLeft ? "L" : "R",
-      eye = lm[`eye${side}`],
-      [eyeU, eyeV] = toHeadLocal(hf, eye.x, eye.y),
-      open = params[`eye${side}`],
-      smile = params[`eye${side}Smile`];
-    const shape = isLeft ? shapeDeform?.eyeL : shapeDeform?.eyeR;
-    const isIris = part.id.endsWith("_iris");
-    const isUpper = part.id.endsWith("_upper");
-    const isLower = part.id.endsWith("_lower");
-    if (shape) {
-      pu += shape.offsetX * eyeDist * 0.14;
-      pv += shape.offsetY * eyeDist * 0.12;
-      const widthScale = isIris ? 1 + (shape.width - 1) * 0.45 : shape.width;
-      pu = eyeU + (pu - eyeU) * widthScale;
-      const nx = (pu - eyeU) / Math.max(1, eyeDist * 0.24);
-      const centerArch = Math.max(0, 1 - nx * nx);
-      const eyeSign = isLeft ? 1 : -1;
-      const outerSigned = clamp(nx * eyeSign, -0.4, 1.2);
-      pv -= shape.corner * eyeDist * 0.045 * outerSigned;
-      if (!isUpper && !part.id.endsWith("_sub_lid")) {
-        const upperMask = clamp(
-          (eyeV + eyeDist * 0.06 - pv) / Math.max(1, eyeDist * 0.14),
-          0,
-          1,
-        );
-        pv -= shape.upperCurveDelta * eyeDist * 0.055 * centerArch * upperMask;
-      } else if (part.id.endsWith("_sub_lid")) {
-        pv -= shape.upperCurveDelta * eyeDist * 0.055 * centerArch;
-      }
-      const lowerMask = isLower
-        ? 1
-        : clamp((pv - (eyeV - eyeDist * 0.02)) / Math.max(1, eyeDist * 0.14), 0, 1);
-      pv += shape.lowerCurveDelta * eyeDist * 0.045 * centerArch * lowerMask;
-      if (!isIris) {
-        pv = eyeV + (pv - eyeV) * (1 + shape.roundnessDelta * 0.32 * centerArch);
-      }
-    }
-    if (!isSubLayer) {
-      const close = clamp(1 - open, 0, 1);
-      const widen = clamp(open - 1, 0, 0.3);
-      const curveDelta = shape?.upperCurveDelta ?? 0;
-      const nxC = (pu - eyeU) / Math.max(1, eyeDist * 0.25);
-      const arch = Math.max(0, 1 - nxC * nxC);
-      const posCurve = Math.max(0, curveDelta);
-      const negCurve = Math.max(0, -curveDelta);
-      const seamV =
-        eyeV +
-        eyeDist * 0.022 * close -
-        (smile * 0.032 + posCurve * 0.028) * eyeDist * close * arch +
-        negCurve * (0.045 * arch - 0.018 * (1 - arch)) * eyeDist * close;
-      if (isIris) {
-        pu += params.eyeBallX * eyeDist * 0.045;
-        pv -= params.eyeBallY * eyeDist * 0.025;
-        pv = seamV + (pv - eyeV) * clamp(open, 0.03, 1.3);
-      } else if (isUpper) {
-        const lidAnchorV = eyeV - eyeDist * 0.45;
-        const anchorW = clamp(
-          (pv - lidAnchorV) / Math.max(1, eyeDist * 0.12),
-          0,
-          1,
-        );
-        const origPv = pv;
-        if (close > 0 && origPv < seamV) {
-          const closeScale = clamp(
-            0.22 +
-              clamp(
-                0.14 * smile + 0.12 * posCurve - 0.03 * negCurve,
-                -0.03,
-                0.2,
-              ) *
-                arch,
-            0.2,
-            0.42,
-          );
-          const closedV = seamV + (origPv - seamV) * closeScale;
-          pv += (closedV - origPv) * close * anchorW;
-        } else if (widen > 0 && origPv < seamV) {
-          pv -= (seamV - origPv) * 0.28 * widen * anchorW;
-        }
-        if (smile !== 0 || curveDelta !== 0) {
-          const vertW =
-            anchorW *
-            clamp(
-              (eyeV + eyeDist * 0.16 - origPv) / Math.max(1, eyeDist * 0.12),
-              0,
-              1,
-            );
-          const liftK = (1 - close) * 0.045 + close * 0.018;
-          const smileLift = smile * liftK * eyeDist * arch;
-          const curveLift = posCurve * liftK * eyeDist * arch;
-          const negDrop =
-            negCurve *
-            ((0.04 + 0.055 * close) * arch - 0.025 * close * (1 - arch)) *
-            eyeDist;
-          pv -= (smileLift + curveLift - negDrop) * vertW;
-        }
-      } else if (isLower) {
-        const openClamp = clamp(open, 0.18, 1.3);
-        pv = eyeV + (pv - eyeV) * openClamp - smile * eyeDist * 0.025 * arch;
-      } else {
-        const openClamp = clamp(open, 0.08, 1.3);
-        pv = eyeV + (pv - eyeV) * openClamp;
-      }
-    }
+    [pu, pv] = deformEye(pu, pv, part.id, lm, hf, params, shapeDeform);
   }
   if (part.id.startsWith("brow")) {
     const isL = part.id.startsWith("browL");
@@ -1879,7 +2187,7 @@ export function maxSeamRelativeDisplacement(
   points: readonly Point[],
   upper: Pick<Part, "id" | "role">,
   lower: Pick<Part, "id" | "role">,
-  lm: Landmarks,
+  lm: RigLandmarks,
   poses: readonly EnvelopePose[] = POSE_ENVELOPE,
   deformFn: typeof deform = deform,
 ): { maxPx: number; worstPose: string | null } {
@@ -1887,8 +2195,8 @@ export function maxSeamRelativeDisplacement(
   let worstPose: string | null = null;
   for (const pose of poses) {
     for (const b of points) {
-      const u = deformFn(b, upper, lm, pose.params);
-      const l = deformFn(b, lower, lm, pose.params);
+      const u = deformFn(b, upper, lm, pose.params, pose.shape);
+      const l = deformFn(b, lower, lm, pose.params, pose.shape);
       const r = Math.hypot(u.x - l.x, u.y - l.y);
       if (r > maxPx + 1e-12) {
         maxPx = r;

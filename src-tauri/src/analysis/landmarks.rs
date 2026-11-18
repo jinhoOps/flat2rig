@@ -389,6 +389,7 @@ pub fn rig_landmarks_from_28(
         mouth,
         chin,
         crown: Point { x: est_x, y: est_y },
+        eye_frames: None,
     };
     let provenance = RigLandmarkProvenance {
         eye_l: LandmarkSource::Model,

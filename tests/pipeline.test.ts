@@ -3,12 +3,19 @@ import { createCanvas, Image, ImageData } from "@napi-rs/canvas";
 import { initializeCanvas, readPsd } from "ag-psd";
 import { strFromU8, unzipSync, zipSync, strToU8 } from "fflate";
 import {
+  buildHeadFrame,
   checkMeshQuality,
   cleanSubtractedSiblingMask,
   compositePartTexture,
   deform,
   deformUncoupled,
+  defaultEyeFrame,
   defaultLandmarks,
+  deriveEyeFrames,
+  isEyeInteriorLayer,
+  EYE_LID_RAMP_ED,
+  EYE_LID_REACH_ED,
+  eyeLinesAt,
   effectiveMask,
   expandFillSeparated,
   foregroundMask,
@@ -20,6 +27,9 @@ import {
   recommendedFillRadius,
   seamCouplingWeights,
   separate,
+  toHeadLocal,
+  type EyeFrames,
+  type RigLandmarks,
 } from "../src/engine";
 import {
   cubismCsv,
@@ -52,6 +62,7 @@ import {
 } from "../src/types";
 import fillRadiusParity from "./fixtures/fill-radius-parity.json";
 import seamEnvelopeParity from "./fixtures/seam-envelope-parity.json";
+import eyeSealParity from "./fixtures/eye-seal-parity.json";
 import { POSE_ENVELOPE, POSE_ENVELOPE_RANGES } from "../src/rig/poseEnvelope";
 import {
   createCustomExpression,
@@ -68,6 +79,7 @@ import {
   buildProjectSubstituteTextures,
   renderCharacterFrame,
   renderDeterministicSnapshot,
+  resolveClippingTargets,
 } from "../src/rig/render";
 import { synthesizeShapeAssetsForProject } from "../src/rig/shapes";
 
@@ -281,13 +293,14 @@ describe("image partition and editing invariants", () => {
   });
   it("deforms expanded body, eye, brow, mouth, and hair parameters accurately", () => {
     const lm = defaultLandmarks(256, 256);
-    const irisMoved = deform({ x: 150, y: 90 }, { id: "eyeL_iris" }, lm, {
+    // Iris centre (inside the eye aperture): gaze right/down moves it right/down.
+    const irisMoved = deform(lm.eyeL, { id: "eyeL_iris" }, lm, {
       ...REST,
       eyeBallX: 1,
       eyeBallY: -1,
     });
-    expect(irisMoved.x).toBeGreaterThan(150);
-    expect(irisMoved.y).toBeGreaterThan(90);
+    expect(irisMoved.x).toBeGreaterThan(lm.eyeL.x);
+    expect(irisMoved.y).toBeGreaterThan(lm.eyeL.y);
 
     const browRaised = deform({ x: 150, y: 74 }, { id: "browL" }, lm, {
       ...REST,
@@ -888,8 +901,13 @@ describe("preserved part merging on regeneration", () => {
   it("keeps closed eye_upper lids monotonic without outer corner droop onto cheek", () => {
     const lm = defaultLandmarks(64, 64);
     const dist = Math.hypot(lm.eyeL.x - lm.eyeR.x, lm.eyeL.y - lm.eyeR.y);
-    const anchor = { x: lm.eyeL.x, y: lm.eyeL.y - dist * 0.45 };
-    const lashPeak = { x: lm.eyeL.x, y: lm.eyeL.y - dist * 0.16 };
+    const hf = buildHeadFrame(lm, 0, 0);
+    const [eu, ev] = toHeadLocal(hf, lm.eyeL.x, lm.eyeL.y);
+    // T10: the lid field is anchored relative to the rest lash line (default frame without masks).
+    const [lash] = eyeLinesAt(defaultEyeFrame(eu, ev, dist), eu);
+    const lashY = lm.eyeL.y + (lash - ev);
+    const anchor = { x: lm.eyeL.x, y: lashY - dist * (EYE_LID_REACH_ED + EYE_LID_RAMP_ED) };
+    const lashPeak = { x: lm.eyeL.x, y: lashY - dist * 0.01 };
     const cornerTip = { x: lm.eyeL.x + dist * 0.22, y: lm.eyeL.y - dist * 0.02 };
 
     // Rest pose: zero displacement
@@ -901,8 +919,10 @@ describe("preserved part merging on regeneration", () => {
     const dCorner = deform(cornerTip, { id: "eyeL_upper" }, lm, closedPose);
     expect(dAnchor.y).toBeCloseTo(anchor.y, 6);
     expect(dPeak.y).toBeGreaterThan(lashPeak.y + dist * 0.10);
-    expect(dCorner.y).toBeGreaterThanOrEqual(dPeak.y);
-    expect(dCorner.y).toBeLessThanOrEqual(lm.eyeL.y + dist * 0.04 + 1e-6);
+    // T10: below the lash line the lid translates with the lash, whose travel shrinks toward the
+    // thin aperture corners: the corner moves down monotonically but at most 0.2 eye distances.
+    expect(dCorner.y).toBeGreaterThanOrEqual(cornerTip.y - 1e-6);
+    expect(dCorner.y - cornerTip.y).toBeLessThanOrEqual(dist * 0.2);
   });
 
   it("builds role-aware Cubism ArtMesh topology without orphan vertices or collapsing thin parts", () => {
@@ -1950,7 +1970,7 @@ describe("preserved part merging on regeneration", () => {
     expect(PARAM_DEFS.length).toBe(Object.keys(REST).length);
     const names = new Set(POSE_ENVELOPE.map((p) => p.name));
     expect(names.size).toBe(POSE_ENVELOPE.length);
-    expect(POSE_ENVELOPE.length).toBe(94);
+    expect(POSE_ENVELOPE.length).toBe(145);
     for (const p of POSE_ENVELOPE) {
       for (const def of PARAM_DEFS) {
         const v = p.params[def.key as keyof typeof REST];
@@ -1973,7 +1993,7 @@ describe("preserved part merging on regeneration", () => {
   it("T13a envelope and seam relative displacement match Rust (shared parity fixture)", () => {
     const fixture = seamEnvelopeParity as unknown as {
       landmarks: Landmarks;
-      envelope: { name: string; pose: Record<string, number> }[];
+      envelope: { name: string; pose: Record<string, number>; shape: unknown }[];
       cases: {
         upper: string;
         lower: string;
@@ -1993,6 +2013,12 @@ describe("preserved part merging on regeneration", () => {
     expect(fixture.envelope.map((e) => e.name)).toEqual(POSE_ENVELOPE.map((p) => p.name));
     fixture.envelope.forEach((e, i) => {
       expect(POSE_ENVELOPE[i].params, e.name).toEqual(e.pose);
+      // T10: expression poses carry the same eye shape input on both sides (Rust `Pose::shape`).
+      const norm = (x: unknown) => {
+        const v = x as Record<string, unknown> | null | undefined;
+        return v ? { eyeL: v.eyeL ?? null, eyeR: v.eyeR ?? null, mouth: v.mouth ?? null } : null;
+      };
+      expect(norm(POSE_ENVELOPE[i].shape), `${e.name} shape`).toEqual(norm(e.shape));
     });
     expect(fixture.cases.length).toBeGreaterThan(10);
     for (const c of fixture.cases) {
@@ -2063,5 +2089,206 @@ describe("preserved part merging on regeneration", () => {
       },
     );
     expect(Math.abs(scaled.maxPx - 2 * base.maxPx)).toBeLessThan(1e-6);
+  });
+});
+
+describe("T10 sealed eye rig", () => {
+  /** Rebuilds the visible white/iris masks of Rust `rig::eye_seal::tests::synthetic_eyes`. */
+  const syntheticEyeInteriors = (lm: Landmarks, w: number, h: number) => {
+    const d = Math.hypot(lm.eyeL.x - lm.eyeR.x, lm.eyeL.y - lm.eyeR.y);
+    const inEll = (x: number, y: number, cx: number, cy: number, rx: number, ry: number) => {
+      const a = (x - cx) / rx;
+      const b = (y - cy) / ry;
+      return a * a + b * b <= 1;
+    };
+    const parts: { id: string; mask: Uint8Array }[] = [];
+    for (const [side, eye] of [
+      ["R", lm.eyeR],
+      ["L", lm.eyeL],
+    ] as const) {
+      const white = new Uint8Array(w * h);
+      const iris = new Uint8Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const px = x + 0.5;
+          const py = y + 0.5;
+          if (!inEll(px, py, eye.x, eye.y + 0.01 * d, 0.26 * d, 0.16 * d)) continue;
+          if (inEll(px, py, eye.x, eye.y, 0.12 * d, 0.13 * d)) iris[y * w + x] = 255;
+          else white[y * w + x] = 255;
+        }
+      }
+      parts.push({ id: `eye${side}_white`, mask: white }, { id: `eye${side}_iris`, mask: iris });
+    }
+    return parts;
+  };
+
+  it("derives the same aperture lines and eye deform as Rust (shared eye parity fixture)", () => {
+    const fx = eyeSealParity as unknown as {
+      width: number;
+      height: number;
+      landmarks: Landmarks;
+      eyeFrames: EyeFrames;
+      points: { id: string; point: [number, number] }[];
+      cases: { pose: string; out: [number, number][] }[];
+    };
+    const frames = deriveEyeFrames(
+      fx.landmarks,
+      syntheticEyeInteriors(fx.landmarks, fx.width, fx.height),
+      fx.width,
+      fx.height,
+    );
+    for (const side of ["L", "R"] as const) {
+      const got = frames[side]!;
+      const want = fx.eyeFrames[side]!;
+      expect(got.length, side).toBe(want.length);
+      got.forEach((s, i) => {
+        for (const k of ["u", "lash", "lower"] as const) {
+          expect(Math.abs(s[k] - want[i][k]), `${side}[${i}].${k}`).toBeLessThan(1e-9);
+        }
+      });
+    }
+    const lm: RigLandmarks = { ...fx.landmarks, eyeFrames: frames };
+    expect(fx.cases.length).toBeGreaterThan(40);
+    for (const c of fx.cases) {
+      const pose = POSE_ENVELOPE.find((p) => p.name === c.pose)!;
+      expect(pose, c.pose).toBeDefined();
+      fx.points.forEach((pt, i) => {
+        const q = deform({ x: pt.point[0], y: pt.point[1] }, { id: pt.id }, lm, pose.params, pose.shape);
+        expect(Math.abs(q.x - c.out[i][0]) + Math.abs(q.y - c.out[i][1]), `${c.pose} ${pt.id}`).toBeLessThan(
+          1e-6,
+        );
+      });
+    }
+  });
+
+  it("closes the aperture to zero height under the lid at eye=0 and keeps rest and gaze motion", () => {
+    const lm = defaultLandmarks(256, 256);
+    const hf = buildHeadFrame(lm, 0, 0);
+    const [eu, ev] = toHeadLocal(hf, lm.eyeL.x, lm.eyeL.y);
+    const [lash, lower] = eyeLinesAt(defaultEyeFrame(eu, ev, hf.eyeDist), eu);
+    const top = { x: lm.eyeL.x, y: lm.eyeL.y + (lash - ev) + 0.5 };
+    const bottom = { x: lm.eyeL.x, y: lm.eyeL.y + (lower - ev) - 0.5 };
+    for (const id of ["eyeL_white", "eyeL_iris", "eyeL_upper", "eyeL_lower"]) {
+      for (const p of [top, bottom, lm.eyeL]) {
+        const r = deform(p, { id }, lm, REST);
+        expect(Math.hypot(r.x - p.x, r.y - p.y), `${id} rest`).toBeLessThan(1e-9);
+      }
+    }
+    const closed = { ...REST, eyeL: 0 };
+    const wTop = deform(top, { id: "eyeL_white" }, lm, closed);
+    const wBottom = deform(bottom, { id: "eyeL_white" }, lm, closed);
+    expect(Math.abs(wTop.y - wBottom.y)).toBeLessThan(1e-9);
+    // The collapsed interior sits at or above the lid's lower edge (tucked into the lid band).
+    const lidEdge = deform(top, { id: "eyeL_upper" }, lm, closed);
+    expect(wTop.y).toBeLessThanOrEqual(lidEdge.y + 1e-9);
+    // Half closed: the white's top stays glued to the lid's lower edge (no skin gap).
+    const half = { ...REST, eyeL: 0.5 };
+    const lashPt = { x: top.x, y: top.y - 0.5 };
+    const a = deform(lashPt, { id: "eyeL_white" }, lm, half);
+    const b = deform(lashPt, { id: "eyeL_upper" }, lm, half);
+    expect(Math.abs(a.y - b.y)).toBeLessThan(0.02 * hf.eyeDist * 0.25 + 1e-9);
+    // Gaze extremes keep the full iris travel inside the open eye (0.045 / 0.025 eye distances).
+    const g = deform(lm.eyeL, { id: "eyeL_iris" }, lm, { ...REST, eyeBallX: 1, eyeBallY: 1 });
+    expect(g.x - lm.eyeL.x).toBeCloseTo(hf.eyeDist * 0.045, 9);
+    expect(lm.eyeL.y - g.y).toBeCloseTo(hf.eyeDist * 0.025, 9);
+    // Interior texels outside the aperture fold onto the lid edge (never pulled into view).
+    const above = { x: lm.eyeL.x, y: top.y - hf.eyeDist * 0.15 };
+    const f = deform(above, { id: "eyeL_white" }, lm, half);
+    const edge = deform({ x: top.x, y: top.y - 0.5 }, { id: "eyeL_white" }, lm, half);
+    expect(Math.abs(f.y - edge.y)).toBeLessThan(1e-9);
+    expect(isEyeInteriorLayer("eyeL_iris_2")).toBe(true);
+    expect(isEyeInteriorLayer("eyeL_upper")).toBe(false);
+  });
+
+  it("keeps every eye layer exactly in place at the rest pose (inside and outside the aperture)", () => {
+    const fx = eyeSealParity as unknown as { width: number; height: number; landmarks: Landmarks };
+    const lm: RigLandmarks = {
+      ...fx.landmarks,
+      eyeFrames: deriveEyeFrames(
+        fx.landmarks,
+        syntheticEyeInteriors(fx.landmarks, fx.width, fx.height),
+        fx.width,
+        fx.height,
+      ),
+    };
+    for (const id of ["eyeL_white", "eyeL_iris", "eyeL_upper", "eyeL_lower", "eyeR_white", "eyeR_lash"]) {
+      for (let y = 100; y < 300; y += 7) {
+        for (let x = 120; x < 400; x += 7) {
+          const p = { x: x + 0.25, y: y + 0.75 };
+          const q = deform(p, { id }, lm, REST);
+          expect(q.x === p.x && q.y === p.y, `${id} (${x},${y})`).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("carries the app's evaluated expression eye shapes in the eyeSeal envelope poses", () => {
+    const project = fixture();
+    const exprOf: Record<string, { activeExpressionId: string; overrideShapeIds?: Record<string, string> }> = {
+      closed: {
+        activeExpressionId: "neutral",
+        overrideShapeIds: { eye_L: "eye_L_closed", eye_R: "eye_R_closed" },
+      },
+      smile: { activeExpressionId: "smile" },
+      sad: { activeExpressionId: "sad" },
+      winkL: { activeExpressionId: "wink" },
+      winkR: { activeExpressionId: "wink_r" },
+    };
+    const seal = POSE_ENVELOPE.filter((p) => p.group === "eyeSeal" && !p.name.startsWith("seal:blink"));
+    expect(seal.length).toBe(45);
+    for (const pose of seal) {
+      const key = pose.name.slice(5, pose.name.indexOf("/"));
+      const ev = evaluateRigFrame({ project, deterministic: true, ...exprOf[key] });
+      // Envelope values are rounded to 12 decimals (parsed identically by serde_json and JS).
+      const params = { ...ev.parameters, eyeBallX: pose.params.eyeBallX, eyeBallY: pose.params.eyeBallY };
+      for (const k of Object.keys(params) as (keyof typeof params)[]) {
+        expect(Math.abs(pose.params[k] - params[k]), `${pose.name} ${k}`).toBeLessThan(1e-12);
+      }
+      for (const side of ["eyeL", "eyeR"] as const) {
+        const want = ev.shapeDeform[side];
+        const got = pose.shape?.[side];
+        expect(Boolean(got), `${pose.name} ${side}`).toBe(Boolean(want));
+        if (!want || !got) continue;
+        for (const k of Object.keys(want) as (keyof typeof want)[]) {
+          expect(Math.abs(got[k] - want[k]), `${pose.name} ${side}.${k}`).toBeLessThan(1e-12);
+        }
+      }
+    }
+    // Closure degree is never shrunk: closed expressions and partial blinks are all present.
+    expect(POSE_ENVELOPE.some((p) => p.name === "seal:blink0.15/gaze:00")).toBe(true);
+    expect(POSE_ENVELOPE.some((p) => p.name === "seal:blink0.5/gaze:00")).toBe(true);
+  });
+
+  it("resolves clipping with one pose-independent rule shared by every render path", () => {
+    const n = 4;
+    const filled = new Uint8Array(n).fill(255);
+    const empty = new Uint8Array(n);
+    const parts = [
+      { id: "face", fillMask: empty },
+      { id: "eyeL_white", fillMask: empty },
+      { id: "eyeL_iris", fillMask: filled },
+      { id: "eyeR_white", fillMask: filled },
+      { id: "eyeR_iris_2", fillMask: empty },
+      { id: "mouth_upper", fillMask: empty },
+      { id: "face_detail", fillMask: empty },
+    ];
+    // White without a hidden area would erase visible iris pixels: no clip. Numbered iris by suffix.
+    expect(resolveClippingTargets(parts)).toEqual({ eyeR_iris_2: "eyeR_white" });
+    const withFaceFill = parts.map((p) => (p.id === "face" ? { ...p, fillMask: filled } : p));
+    expect(resolveClippingTargets(withFaceFill)).toEqual({
+      eyeR_iris_2: "eyeR_white",
+      mouth_upper: "face",
+      face_detail: "face",
+    });
+    // A target drawn above the child is never used; profile entries follow the same condition.
+    expect(
+      resolveClippingTargets(
+        [
+          { id: "eyeL_iris", fillMask: empty },
+          { id: "eyeL_white", fillMask: filled },
+        ],
+        { eyeL_iris: "eyeL_white" },
+      ),
+    ).toEqual({});
   });
 });

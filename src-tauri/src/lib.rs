@@ -610,6 +610,7 @@ async fn compute_exposure_map(
             });
             ids.push(part.id);
         }
+        let landmarks = landmarks.with_eye_frames(&ids, &visible, width, height);
         let env = &rig::seams::pose_envelope().poses;
         let summary = rig::exposure::compute_exposure_map(
             &ids, &visible, &fills, &landmarks, width, height, env,
@@ -658,12 +659,20 @@ async fn build_rig(
             return Err("Too many parts".into());
         }
         let mut result = Vec::new();
+        let mut decoded = Vec::with_capacity(parts.len());
         for part in parts {
             let visible = core::decode_bytes(&part.mask, n)?;
             let fill = match part.fill_mask {
                 Some(ref f) => Some(core::decode_bytes(f, n)?),
                 None => None,
             };
+            decoded.push((part, visible, fill));
+        }
+        // T10: eye layers deform with the aperture lines of all visible eye masks.
+        let ids: Vec<String> = decoded.iter().map(|(p, _, _)| p.id.clone()).collect();
+        let vis: Vec<Vec<u8>> = decoded.iter().map(|(_, v, _)| v.clone()).collect();
+        let landmarks = landmarks.with_eye_frames(&ids, &vis, width, height);
+        for (part, visible, fill) in decoded {
             let effective = core::effective_part_mask(&visible, fill.as_deref());
             let mesh = core::art_mesh_for_part(&effective, width, height, 14, &part.id, &landmarks);
             let quality =

@@ -3892,8 +3892,143 @@ pub fn synthesize_template_bank(
 }
 
 /// Generates stage-filtered template layers (`"base_silhouette" | "features_overlay" | "clothes_overlay" | "hair_overlay" | "base_body" | "full"`) after full-image analysis.
+///
+/// T10 rest invariance: the result is the synthesis with the current rig and envelope merged onto
+/// a baseline synthesis (pre-T10 eye formulas, pre-T10 envelope = HEAD behaviour). Every baseline
+/// hidden texel and texel colour is kept (no hidden area shrinks), and a hidden texel the baseline
+/// lacks is added only where a layer above it is fully opaque at rest, so the static rest composite
+/// (`mask U fillMask`, what the app draws without motion) is unchanged pixel for pixel.
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize_template_bank_for_stage(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    landmarks: &Landmarks,
+    points_28: &[Landmark28Point],
+    evidence_ids: &[String],
+    evidence_masks: &[Vec<u8>],
+    evidence_provenances: &[String],
+    evidence_confidences: &[f64],
+    overrides: &TemplateStyleSelection,
+    pipeline_stage: &str,
+) -> TemplateSynthesisOutput {
+    let run = || {
+        synthesize_template_bank_for_stage_raw(
+            rgba,
+            w,
+            h,
+            landmarks,
+            points_28,
+            evidence_ids,
+            evidence_masks,
+            evidence_provenances,
+            evidence_confidences,
+            overrides,
+            pipeline_stage,
+        )
+    };
+    let current = run();
+    if crate::core::legacy_eye_rig_enabled() || seams::base_envelope_enabled() {
+        return current;
+    }
+    let base = crate::core::with_legacy_eye_rig(true, || seams::with_base_envelope(run));
+    merge_rest_invariant(base, current, w, h)
+}
+
+fn decode_texture_rgba(t: &Option<String>, n: usize) -> Option<Vec<u8>> {
+    let b64 = t.as_ref()?.strip_prefix("data:image/png;base64,")?;
+    let bytes = STANDARD.decode(b64).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.into_rgba8().into_raw();
+    (img.len() == n * 4).then_some(img)
+}
+
+fn encode_texture_rgba(tex: &[u8], w: usize, h: usize) -> Option<String> {
+    let mut png_bytes = Vec::new();
+    PngEncoder::new_with_quality(&mut png_bytes, CompressionType::Fast, FilterType::Sub)
+        .write_image(tex, w as u32, h as u32, ColorType::Rgba8.into())
+        .ok()?;
+    Some(format!("data:image/png;base64,{}", STANDARD.encode(&png_bytes)))
+}
+
+/// See `synthesize_template_bank_for_stage`. A hidden texel of `current` that `base` lacks is kept
+/// only if, at its pixel, compositing every layer bottom-to-top (texture RGB, alpha = `mask ∪
+/// fillMask`, `core::blend_straight_pixel` — the effective rest composite) gives the same 8-bit
+/// RGBA as the baseline; candidates are accepted or rejected per pixel as a whole. Falls back to
+/// `current` when the two runs disagree on the layer list or visible partition (never expected:
+/// the rig does not change segmentation).
+fn merge_rest_invariant(
+    base: TemplateSynthesisOutput,
+    mut current: TemplateSynthesisOutput,
+    w: usize,
+    h: usize,
+) -> TemplateSynthesisOutput {
+    let n = w * h;
+    if base.part_ids != current.part_ids || base.masks != current.masks {
+        return current;
+    }
+    let layers = current.part_ids.len();
+    let tex_b: Vec<Option<Vec<u8>>> = base.textures.iter().map(|t| decode_texture_rgba(t, n)).collect();
+    let tex_c: Vec<Option<Vec<u8>>> =
+        current.textures.iter().map(|t| decode_texture_rgba(t, n)).collect();
+    let candidate = |p: usize, i: usize| {
+        current.fill_masks[p][i] > 0
+            && base.fill_masks[p][i] == 0
+            && tex_b[p].is_some()
+            && tex_c[p].is_some()
+    };
+    let mut accept = vec![false; n];
+    for (i, acc) in accept.iter_mut().enumerate() {
+        if !(0..layers).any(|p| candidate(p, i)) {
+            continue;
+        }
+        let (mut out_b, mut out_c) = ([0u8; 4], [0u8; 4]);
+        for p in 0..layers {
+            let vis = base.masks[p][i];
+            let ab = vis.max(base.fill_masks[p][i]);
+            let px = |t: &Option<Vec<u8>>, a: u8| -> [u8; 4] {
+                match t {
+                    Some(t) => [t[i * 4], t[i * 4 + 1], t[i * 4 + 2], a],
+                    None => [0, 0, 0, 0],
+                }
+            };
+            if ab > 0 && tex_b[p].is_some() {
+                crate::core::blend_straight_pixel(&mut out_b, px(&tex_b[p], ab));
+            }
+            if candidate(p, i) {
+                let ac = vis.max(current.fill_masks[p][i]);
+                crate::core::blend_straight_pixel(&mut out_c, px(&tex_c[p], ac));
+            } else if ab > 0 && tex_b[p].is_some() {
+                crate::core::blend_straight_pixel(&mut out_c, px(&tex_b[p], ab));
+            }
+        }
+        *acc = out_b == out_c;
+    }
+    let mut merged_fills = Vec::with_capacity(layers);
+    let mut merged_tex = Vec::with_capacity(layers);
+    for p in 0..layers {
+        let mut merged = base.fill_masks[p].clone();
+        let mut tex = tex_b[p].clone();
+        for i in 0..n {
+            if candidate(p, i) && accept[i] {
+                merged[i] = current.fill_masks[p][i];
+                if let (Some(t), Some(c)) = (tex.as_mut(), tex_c[p].as_ref()) {
+                    t[i * 4..i * 4 + 4].copy_from_slice(&c[i * 4..i * 4 + 4]);
+                }
+            }
+        }
+        merged_fills.push(merged);
+        merged_tex.push(match tex {
+            Some(t) => encode_texture_rgba(&t, w, h),
+            None => base.textures[p].clone(),
+        });
+    }
+    current.fill_masks = merged_fills;
+    current.textures = merged_tex;
+    current
+}
+
+#[allow(clippy::too_many_arguments)]
+fn synthesize_template_bank_for_stage_raw(
     rgba: &[u8],
     w: usize,
     h: usize,
@@ -7116,6 +7251,10 @@ fn apply_motion_proportional_underlaps(
         .map(|id| crate::core::infer_part_role(id, None))
         .collect();
     let seam_graph = seams::extract_seam_graph(final_layer_ids, &roles, final_visible_masks, w, h);
+    // T10: eye layers deform with the aperture lines of these visible masks.
+    let rig_lm = landmarks.with_eye_frames(final_layer_ids, final_visible_masks, w, h);
+    let landmarks = &rig_lm;
+    let hidden_env = seams::hidden_area_envelope();
     let table = seams::SeamMarginTable::new(seams::hidden_area_seam_requirements(
         &seam_graph,
         final_visible_masks,
@@ -7123,7 +7262,7 @@ fn apply_motion_proportional_underlaps(
         landmarks,
         w,
         h,
-        &seams::pose_envelope().poses,
+        &hidden_env,
         seams::DEFAULT_MAX_SAMPLES_PER_SEAM,
     ));
     // Requirements are Euclidean; `dilate_mask` is 4-connected (Manhattan), so a Euclidean reach
@@ -7186,6 +7325,12 @@ fn apply_motion_proportional_underlaps(
                 continue;
             }
             let Some(q) = vis_owner[i] else { continue };
+            // T10: the closing lids sweep the whole eye socket, so the skin continues under every
+            // eye-layer pixel (not only within the eye/face seam requirement of the face edge).
+            if q > fi && roles[q] == R::Eye && !crate::core::legacy_eye_rig_enabled() {
+                final_tpl_masks[fi][i] = final_tpl_masks[fi][i].max(ev.fg_alpha[i]);
+                continue;
+            }
             if q <= fi || !face_upper_ok(q, roles[q]) || !within(&face_dist, i, reach[q]) {
                 continue;
             }
@@ -7452,6 +7597,72 @@ fn apply_motion_proportional_underlaps(
         }
     }
 
+    // 5c. Lash line under occluders (T10): where bangs, brows or glasses hide the lash band at rest,
+    // the closing lid carries it below them, so the upper lid continues along the rest lash line
+    // (`EyeFrames`) with the median visible lash-band thickness (at least the closed-lid lash band). Without it the closed lid line has
+    // a hole there (Rritteang L eye under the bangs).
+    if !crate::core::legacy_eye_rig_enabled() {
+        let hf0 = HeadFrame::from_landmarks(landmarks, 0, 0);
+        for p in 0..final_len {
+            let id = &final_layer_ids[p];
+            if roles[p] != R::Eye || !id.contains("_upper") || id.contains("_sub_") {
+                continue;
+            }
+            let Some(side) = crate::core::eye_layer_side(id) else { continue };
+            let Some(samples) = landmarks
+                .eye_frames
+                .as_ref()
+                .and_then(|f| if side == 'L' { f.l.as_ref() } else { f.r.as_ref() })
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let (u_lo, u_hi) = (samples[0].u, samples[samples.len() - 1].u);
+            // Median per-column thickness of the visible lid run just above the lash line.
+            let mut col_count: BTreeMap<i64, usize> = BTreeMap::new();
+            for (i, &a) in final_visible_masks[p].iter().enumerate() {
+                if a == 0 {
+                    continue;
+                }
+                let (u, v) = hf0.to_local(DVec2::new((i % w) as f64 + 0.5, (i / w) as f64 + 0.5));
+                if u < u_lo || u > u_hi {
+                    continue;
+                }
+                let (lash, _) = crate::core::eye_lines_at(samples, u);
+                if v >= lash - eye_dist * 0.15 && v <= lash + 1.0 {
+                    *col_count.entry(u.floor() as i64).or_default() += 1;
+                }
+            }
+            let mut counts: Vec<usize> = col_count.values().copied().collect();
+            if counts.is_empty() {
+                continue;
+            }
+            counts.sort_unstable();
+            // At least the closed-lid lash band (`EYE_LASH_KEEP_ED`): a thinner hidden strip is
+            // dropped by the ArtMesh contour and would never render.
+            let band = (counts[counts.len() / 2] as f64)
+                .max(eye_dist * crate::core::EYE_LASH_KEEP_ED)
+                .clamp(2.0, eye_dist * 0.06);
+            for i in 0..n {
+                if ev.fg_alpha[i] == 0 {
+                    continue;
+                }
+                let Some(q) = vis_owner[i] else { continue };
+                if q <= p || roles[q] == R::Eye {
+                    continue;
+                }
+                let (u, v) = hf0.to_local(DVec2::new((i % w) as f64 + 0.5, (i / w) as f64 + 0.5));
+                if u < u_lo || u > u_hi {
+                    continue;
+                }
+                let (lash, _) = crate::core::eye_lines_at(samples, u);
+                if v >= lash - band && v <= lash + 1.0 {
+                    final_tpl_masks[p][i] = final_tpl_masks[p][i].max(ev.fg_alpha[i]);
+                }
+            }
+        }
+    }
+
     // 6. Hair seam underlaps for every hair layer by role (`hair_front*`, `hair_side*`, `hair_back*`).
     let front_root_fallback = fallback.hair_hat_root.max(fallback.hair_side_front_seam);
     for fi in (0..final_len).filter(|&p| roles[p] == R::HairFront) {
@@ -7659,6 +7870,7 @@ mod tests {
             mouth: Point { x: 128.0, y: 118.0 },
             chin: Point { x: 128.0, y: 140.0 },
             crown: Point { x: 128.0, y: 24.0 },
+            eye_frames: None,
         };
         let mut face_m = vec![0u8; n];
         let mut clothes_m = vec![0u8; n];
@@ -7745,6 +7957,7 @@ mod tests {
             mouth: Point { x: 128.0, y: 146.0 },
             chin: Point { x: 128.0, y: 164.0 },
             crown: Point { x: 128.0, y: 40.0 },
+            eye_frames: None,
         };
         let mut sd_rgba = vec![0u8; n * 4];
         let mut sd_face = vec![0u8; n];
@@ -7925,6 +8138,7 @@ mod tests {
             mouth: Point { x: 128.0, y: 118.0 },
             chin: Point { x: 128.0, y: 140.0 },
             crown: Point { x: 128.0, y: 24.0 },
+            eye_frames: None,
         };
         let mut face_m = vec![0u8; n];
         let mut clothes_m = vec![0u8; n];
@@ -8055,6 +8269,7 @@ mod tests {
             mouth: Point { x: 128.0, y: 136.0 },
             chin: Point { x: 128.0, y: 158.0 },
             crown: Point { x: 128.0, y: 34.0 },
+            eye_frames: None,
         };
         let mut face_m = vec![0u8; n];
         let mut clothes_m = vec![0u8; n];
@@ -8279,6 +8494,7 @@ mod tests {
             mouth: crate::core::Point { x: 128.0, y: 138.0 },
             chin: crate::core::Point { x: 128.0, y: 158.0 },
             crown: crate::core::Point { x: 128.0, y: 38.0 },
+            eye_frames: None,
         };
         let mut rgba = vec![0u8; n * 4];
         let mut hf_m = vec![0u8; n];
@@ -8426,6 +8642,7 @@ mod tests {
             mouth: Point { x: 512.0, y: 492.0 },
             chin: Point { x: 512.0, y: 560.0 },
             crown: Point { x: 512.0, y: 120.0 },
+            eye_frames: None,
         };
         let mut face_m = vec![0u8; n];
         let mut neck_m = vec![0u8; n];
@@ -8557,6 +8774,7 @@ mod tests {
             mouth: Point { x: 512.0, y: 492.0 },
             chin: Point { x: 512.0, y: 560.0 },
             crown: Point { x: 512.0, y: 120.0 },
+            eye_frames: None,
         };
         let ids: Vec<String> = [
             "hair_back",
@@ -8846,6 +9064,131 @@ mod tests {
         })
     }
 
+    /// T10 rest invariance: the guarded synthesis has the same effective rest composite (texture
+    /// RGB, alpha = mask ∪ fillMask, straight-alpha over) as the baseline synthesis (pre-T10 eye
+    /// formulas + pre-T10 envelope), and keeps every baseline hidden texel.
+    #[test]
+    fn t10_rest_composite_matches_baseline_synthesis_exactly() {
+        let (w, h, rgba, lm, ids, masks) = t13_fixture_1024();
+        let n = w * h;
+        let args = (&vec!["model".to_string(); ids.len()], &vec![0.92; ids.len()]);
+        let guarded = synthesize_template_bank_for_stage(
+            &rgba, w, h, &lm, &[], &ids, &masks, args.0, args.1, &TemplateStyleSelection::default(), "full",
+        );
+        let base = crate::core::with_legacy_eye_rig(true, || {
+            seams::with_base_envelope(|| {
+                synthesize_template_bank_for_stage_raw(
+                    &rgba, w, h, &lm, &[], &ids, &masks, args.0, args.1, &TemplateStyleSelection::default(), "full",
+                )
+            })
+        });
+        assert_eq!(guarded.part_ids, base.part_ids);
+        assert_eq!(guarded.masks, base.masks);
+        let composite = |out: &TemplateSynthesisOutput| {
+            let mut dst = vec![0u8; n * 4];
+            for p in 0..out.part_ids.len() {
+                let Some(tex) = decode_texture_rgba(&out.textures[p], n) else { continue };
+                for i in 0..n {
+                    let a = out.masks[p][i].max(out.fill_masks[p][i]);
+                    if a > 0 {
+                        crate::core::blend_straight_pixel(
+                            &mut dst[i * 4..i * 4 + 4],
+                            [tex[i * 4], tex[i * 4 + 1], tex[i * 4 + 2], a],
+                        );
+                    }
+                }
+            }
+            dst
+        };
+        let (cg, cb) = (composite(&guarded), composite(&base));
+        let changed = (0..n).filter(|&i| cg[i * 4..i * 4 + 4] != cb[i * 4..i * 4 + 4]).count();
+        assert_eq!(changed, 0, "rest composite changed at {changed} px");
+        let mut added = 0usize;
+        for p in 0..base.part_ids.len() {
+            for i in 0..n {
+                if base.fill_masks[p][i] > 0 {
+                    assert!(guarded.fill_masks[p][i] > 0, "{}: baseline hidden texel lost", base.part_ids[p]);
+                } else if guarded.fill_masks[p][i] > 0 {
+                    added += 1;
+                }
+            }
+        }
+        println!("T10_REST_INVARIANT added hidden texels = {added}, composite changed = {changed}");
+    }
+
+    /// T10 on the 1024px fixture: the whole pipeline (hidden-area synthesis + seal check) with the
+    /// pre-T10 eye formulas vs the sealed rig. Printed with `T10_1024` (`cargo test --lib t10_ -- --nocapture`).
+    #[test]
+    fn t10_eye_seal_on_1024_artwork() {
+        let (w, h, rgba, lm, ids, masks) = t13_fixture_1024();
+        let run = |legacy: bool| {
+            crate::core::with_legacy_eye_rig(legacy, || {
+                let out = synthesize_template_bank_for_stage(
+                    &rgba,
+                    w,
+                    h,
+                    &lm,
+                    &[],
+                    &ids,
+                    &masks,
+                    &vec!["model".into(); ids.len()],
+                    &vec![0.92; ids.len()],
+                    &TemplateStyleSelection::default(),
+                    "full",
+                );
+                let poses = crate::rig::eye_seal::eye_seal_poses(&seams::pose_envelope().poses);
+                let report = crate::rig::eye_seal::check_eye_seal(
+                    &out.part_ids,
+                    &out.masks,
+                    &out.fill_masks,
+                    &lm,
+                    w,
+                    h,
+                    &poses,
+                );
+                (out, report)
+            })
+        };
+        let (bo, before) = run(true);
+        let (ao, after) = run(false);
+        assert_eq!(bo.part_ids, ao.part_ids);
+        for (tag, r) in [("legacy", &before), ("T10", &after)] {
+            println!(
+                "T10_1024 | {tag} | rows={} leak={} (raw {}) gap={} breaks={} defect_rows={} max_iris={:.2} max_lash={:.2}",
+                r.rows.len(),
+                r.leak_excess_px_total,
+                r.leak_px_total,
+                r.gap_excess_px_total,
+                r.lid_break_excess_total,
+                r.rows_with_defect,
+                r.max_iris_shift_px,
+                r.max_lash_drop_px
+            );
+        }
+        for r in after
+            .rows
+            .iter()
+            .filter(|r| r.leak_excess_px + r.gap_excess_px + r.lid_break_excess > 0)
+            .take(12)
+        {
+            println!(
+                "T10_1024_ROW | {} | {} | leak={} ({:?} @ {:?}) gap={} breaks={}",
+                r.pose, r.side, r.leak_excess_px, r.leak_layer, r.leak_at, r.gap_excess_px, r.lid_break_excess
+            );
+        }
+        // Hidden areas never shrink because of the sealed rig.
+        for (p, id) in ao.part_ids.iter().enumerate() {
+            let fb = bo.fill_masks[p].iter().filter(|&&a| a > 0).count();
+            let fa = ao.fill_masks[p].iter().filter(|&&a| a > 0).count();
+            println!("T10_1024_FILL | {id} | {fb} → {fa}");
+            assert!(fa >= fb, "{id}: fillMask shrank {fb} -> {fa}");
+            assert_eq!(bo.masks[p], ao.masks[p], "{id}: visible partition changed");
+        }
+        assert!(after.leak_excess_px_total * 20 <= before.leak_excess_px_total.max(1));
+        assert!(after.max_lash_drop_px >= before.max_lash_drop_px - 1e-9);
+        assert!(after.max_iris_shift_px >= before.max_iris_shift_px - 1e-9);
+    }
+
     /// T13b on the 1024px fixture: coupled vs uncoupled `deform` end to end (hidden-area synthesis,
     /// seam requirements, coverage, exposure map), plus the brow / upper-lid hidden-area decision.
     /// Numbers are printed with `T13B_*` prefixes (`cargo test --lib t13b_ -- --nocapture`).
@@ -8931,13 +9274,19 @@ mod tests {
         );
         assert_eq!(after.coverage.holes, 0, "{:?}", after.coverage.violations.first());
         for a in &after.reqs {
-            assert_eq!(
-                Some(a.required_underlap_px),
-                a.coupled_underlap_px.max(a.uncoupled_underlap_px),
-                "{}/{}",
-                a.upper_id,
-                a.lower_id
-            );
+            // T10: eye seams may adopt the legacy-eye measurement (never shrink a hidden area;
+            // white/iris lowers keep it — see `seams::hidden_area_seam_requirements`).
+            let expected = if a.adopted == Some("legacyEye") {
+                a.legacy_eye_underlap_px
+            } else {
+                a.coupled_underlap_px.max(a.uncoupled_underlap_px)
+            };
+            assert_eq!(Some(a.required_underlap_px), expected, "{}/{}", a.upper_id, a.lower_id);
+            if let Some(l) = a.legacy_eye_underlap_px {
+                if !crate::core::is_eye_interior_layer(&a.lower_id) {
+                    assert!(a.required_underlap_px >= l, "{}/{}", a.upper_id, a.lower_id);
+                }
+            }
         }
         // Coupling never shrinks a hidden area (PSD hand-off continuity): every layer of the
         // coupled run keeps at least the uncoupled run's hidden texels.

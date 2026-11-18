@@ -124,20 +124,36 @@ impl ExposureMap {
 
 /// Clipping targets matching `src/rig/render.ts`: `eye*_iris` → its `_white`, and when `face` has a
 /// hidden area `face_detail` and `mouth_*` → `face`. Only targets drawn *below* the child are used.
+///
+/// T10 single rule (TS `defaultClippingTargets` in `render.ts`, same conditions for every render
+/// path and pose): an iris layer (`eye{L,R}_iris`, numbered extras by suffix) clips to its side's
+/// `eye{L,R}_white` when that white has a hidden area (`fillMask`) — the white must extend under the
+/// iris, otherwise clipping would erase visible iris pixels at rest; `face_detail` and `mouth_*`
+/// clip to `face` when `face` has a hidden area. The pose never changes the rule.
 pub fn default_clip_targets(ids: &[String], fill: &[Vec<u8>]) -> Vec<Option<usize>> {
     let idx = |id: &str| ids.iter().position(|x| x == id);
+    let has_fill = |t: usize| fill.get(t).is_some_and(|m| m.iter().any(|&a| a > 0));
     let face = idx("face");
-    let face_has_fill = face.is_some_and(|f| fill.get(f).is_some_and(|m| m.iter().any(|&a| a > 0)));
+    let face_has_fill = face.is_some_and(has_fill);
+    let legacy = crate::core::legacy_eye_rig_enabled();
     ids.iter()
         .enumerate()
         .map(|(p, id)| {
-            let target = if let Some(side) = id.strip_suffix("_iris") {
-                idx(&format!("{side}_white"))
-            } else if face_has_fill && (id == "face_detail" || id.starts_with("mouth")) {
-                face
+            let target = if legacy {
+                // Pre-T10 rule (measurement only): iris → white regardless of the white's fill.
+                id.strip_suffix("_iris").and_then(|side| idx(&format!("{side}_white")))
+            } else if crate::core::is_eye_iris_layer(id) {
+                crate::core::eye_layer_side(id)
+                    .and_then(|s| idx(&format!("eye{s}_white")))
+                    .filter(|&t| has_fill(t))
             } else {
                 None
             };
+            let target = target.or_else(|| {
+                (face_has_fill && (id == "face_detail" || id.starts_with("mouth")))
+                    .then_some(face)
+                    .flatten()
+            });
             target.filter(|&t| t < p)
         })
         .collect()
@@ -154,6 +170,14 @@ pub fn compute_exposure_map(
     h: usize,
     poses: &[EnvelopePose],
 ) -> ExposureMap {
+    // T10: the eye rig needs the aperture lines of these masks (unless the caller derived them).
+    let derived;
+    let lm = if lm.eye_frames.is_some() {
+        lm
+    } else {
+        derived = lm.with_eye_frames(ids, visible, w, h);
+        &derived
+    };
     let meshes: Vec<Mesh> = ids
         .iter()
         .enumerate()
@@ -167,13 +191,13 @@ pub fn compute_exposure_map(
     })
 }
 
-struct PoseRaster {
-    top_layer: Vec<i16>,
-    top_src: Vec<u32>,
+pub(crate) struct PoseRaster {
+    pub(crate) top_layer: Vec<i16>,
+    pub(crate) top_src: Vec<u32>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn raster_pose<D>(
+pub(crate) fn raster_pose<D>(
     ids: &[String],
     eff: &[Vec<u8>],
     meshes: &[Mesh],
@@ -754,6 +778,9 @@ mod tests {
             .collect();
         let n = 4;
         let mut fill = vec![vec![0u8; n]; 4];
+        // T10: the iris clips to the white only when the white extends under it (hidden area).
+        assert_eq!(default_clip_targets(&ids, &fill), vec![None, None, None, None]);
+        fill[1][0] = 255;
         assert_eq!(
             default_clip_targets(&ids, &fill),
             vec![None, None, Some(1), None]
@@ -763,5 +790,12 @@ mod tests {
             default_clip_targets(&ids, &fill),
             vec![None, None, Some(1), Some(0)]
         );
+        // Numbered extra iris layers follow the suffix rule; a white above the iris is ignored.
+        let ids: Vec<String> = ["eyeR_white", "eyeR_iris_2", "eyeL_iris", "eyeL_white"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let fill = vec![vec![255u8; n]; 4];
+        assert_eq!(default_clip_targets(&ids, &fill), vec![None, Some(0), None, None]);
     }
 }
