@@ -248,7 +248,7 @@ export interface Part {
   role?: PartRole;
   /** Layer blend mode strictly restricted to normal, multiply, or additive. */
   blendMode?: BlendMode;
-  /** Strictly non-overlapping visible mask extracted from the original artwork. */
+  /** Visible (uncovered) alpha: non-overlapping for single-image separation, alpha-weighted with shared anti-aliased edges for layer input (AGENTS.md 2). */
   mask: Uint8Array;
   /** Reconstructed behind-occlusion pixels added independently of `mask`. */
   fillMask?: Uint8Array;
