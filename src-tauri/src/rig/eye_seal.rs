@@ -2,10 +2,12 @@
 //! silhouette, (b) skin/background gaps on the lid seams, and (c) breaks in the posed upper-lid
 //! line, on the same ArtMesh raster (and clipping rule) as the exposure map (`exposure.rs`).
 //!
-//! The raster is geometric: every layer is drawn opaque (no app-side alpha fades such as the white
-//! fading out below `eye = 0.03`), so a sealed result means the lids cover the interior by geometry
-//! alone. Sampling runs on a head-local grid around each eye (1 px steps along the head axes), so
-//! columns follow the head tilt.
+//! The underlying raster is geometric (every layer drawn opaque), while screen-visible leak
+//! (`leak_px`) gates white/iris samples by `raster::layer_opacity(id, pose) > 0.01` so closed eyes
+//! where the app fades white/iris out (`eye <= 0.03` / `0.06`) report 0 screen leak and partial
+//! blinks (`blink0.15`) are still checked; the opacity-ignored count is kept as
+//! `geometric_leak_px` for diagnosis. Sampling runs on a head-local grid around each eye (1 px
+//! steps along the head axes), so columns follow the head tilt.
 //!
 //! Definitions (side `s`; `I` = white/iris layers, `U` = upper lid, `Lo` = lower lid, skin = no layer
 //! or a layer below every eye layer of the side, occluder = a non-eye layer above the eye stack):
@@ -37,7 +39,10 @@ pub struct EyeSealRow {
     pub group: String,
     pub side: String,
     pub open: f64,
+    /// Screen-visible white/iris leak (gated by `raster::layer_opacity(id, pose) > 0.01`).
     pub leak_px: usize,
+    /// Opacity-ignored geometric white/iris leak (diagnostic).
+    pub geometric_leak_px: usize,
     /// `leak_px` minus the rest-pose value for open eyes (rest leaks are segmented art inside
     /// the lash wing); equal to `leak_px` when this eye is closed (`eye = 0`).
     pub leak_excess_px: usize,
@@ -66,6 +71,7 @@ pub struct EyeSealReport {
     /// Rest-pose rows (baseline art: open eyes, centred gaze).
     pub rest: Vec<EyeSealRow>,
     pub leak_px_total: usize,
+    pub geometric_leak_px_total: usize,
     pub leak_excess_px_total: usize,
     pub gap_excess_px_total: usize,
     pub lid_break_excess_total: usize,
@@ -166,6 +172,7 @@ fn eye_grid(lm: &Landmarks, hf: &HeadFrame, side: char) -> Grid {
 fn measure_side(
     top: &[i16],
     top_src: &[u32],
+    layer_visible: &[bool],
     visible: &[Vec<u8>],
     w: usize,
     h: usize,
@@ -197,6 +204,8 @@ fn measure_side(
     let mut cells = vec![Class::Skin; grid.cols * grid.rows];
     // Interior samples whose source texel is a hidden (`fillMask`) texel, not drawn art.
     let mut src_hidden = vec![false; grid.cols * grid.rows];
+    // Whether the topmost layer at this cell is visible on screen (`layer_opacity > 0.01`).
+    let mut screen_visible = vec![false; grid.cols * grid.rows];
     for r in 0..grid.rows {
         for c in 0..grid.cols {
             let p = hf.to_world(grid.u0 + c as f64, grid.v0 + r as f64);
@@ -208,6 +217,7 @@ fn measure_side(
                 let t = top[di];
                 if t >= 0 {
                     src_hidden[r * grid.cols + c] = visible[t as usize][top_src[di] as usize] < 128;
+                    screen_visible[r * grid.cols + c] = layer_visible[t as usize];
                 }
                 class_of(t)
             };
@@ -215,7 +225,7 @@ fn measure_side(
         }
     }
     let at = |r: usize, c: usize| cells[r * grid.cols + c];
-    let (mut leak, mut gap) = (0usize, 0usize);
+    let (mut leak, mut geometric_leak, mut gap) = (0usize, 0usize, 0usize);
     let mut leak_at: Option<(Point, usize)> = None;
     let world = |r: usize, c: usize| -> Point { hf.to_world(grid.u0 + c as f64, grid.v0 + r as f64).into() };
     let mut upper_rows: Option<(usize, usize)> = None;
@@ -247,8 +257,11 @@ fn measure_side(
                 None => hidden_src,
             };
             if closed || outside {
-                leak += 1;
-                leak_at.get_or_insert_with(|| (world(r, c), c * grid.rows + r));
+                geometric_leak += 1;
+                if screen_visible[r * grid.cols + c] {
+                    leak += 1;
+                    leak_at.get_or_insert_with(|| (world(r, c), c * grid.rows + r));
+                }
             }
         }
         // Skin between the lid's lower edge and the next eye-layer sample.
@@ -293,6 +306,7 @@ fn measure_side(
     }
     SideMeasure {
         leak,
+        geometric_leak,
         gap,
         breaks,
         leak_at,
@@ -331,6 +345,7 @@ impl PosedLines {
 
 struct SideMeasure {
     leak: usize,
+    geometric_leak: usize,
     gap: usize,
     breaks: usize,
     leak_at: Option<(Point, usize)>,
@@ -430,6 +445,10 @@ pub fn check_eye_seal_with(
     };
     let run = |name: &str, group: &str, pose: &Pose| -> Vec<EyeSealRow> {
         let raster = raster_pose(ids, &eff, meshes, &clip, w, h, pose, &deform_fn);
+        let layer_visible: Vec<bool> = ids
+            .iter()
+            .map(|id| crate::rig::raster::layer_opacity(id, pose) > 0.01)
+            .collect();
         sides
             .iter()
             .zip(&grids)
@@ -439,6 +458,7 @@ pub fn check_eye_seal_with(
                 let m = measure_side(
                     &raster.top_layer,
                     &raster.top_src,
+                    &layer_visible,
                     visible,
                     w,
                     h,
@@ -462,6 +482,7 @@ pub fn check_eye_seal_with(
                     side: sl.side.to_string(),
                     open,
                     leak_px: m.leak,
+                    geometric_leak_px: m.geometric_leak,
                     leak_excess_px: m.leak,
                     gap_px: m.gap,
                     lid_breaks: m.breaks,
@@ -500,12 +521,16 @@ pub fn check_eye_seal_with(
         version: EYE_SEAL_VERSION,
         poses: poses.len(),
         sides: sides.iter().map(|s| s.side.to_string()).collect(),
-        definition: "geometric ArtMesh raster with the shared clipping rule (no app alpha fades); \
-                     head-local 1px grid per eye; leak = white/iris shown at eye=0, above the upper \
-                     lid or below the lower lid; gap = skin/background between the lid and the \
-                     white/lower lid; lid breaks = column runs without the upper lid or an occluder \
-                     between its first and last column (excess = above the rest pose)",
+        definition: "geometric ArtMesh raster with the shared clipping rule; head-local 1px grid \
+                     per eye; leakPx = white/iris shown at eye=0, above the upper lid or below the \
+                     lower lid, gated by raster::layer_opacity(id, pose) > 0.01 (screen-visible \
+                     leak); geometricLeakPx = opacity-ignored geometric count for diagnosis; gap = \
+                     skin/background between the lid and the white/lower lid; lid breaks = column \
+                     runs without the upper lid or an occluder between its first and last column \
+                     (excess = above the rest pose); diagnostic eye_seal/*.png renders are opaque \
+                     (alpha=255, no alpha fades) and are not for pixel-quality judgment",
         leak_px_total: rows.iter().map(|r| r.leak_px).sum(),
+        geometric_leak_px_total: rows.iter().map(|r| r.geometric_leak_px).sum(),
         leak_excess_px_total: rows.iter().map(|r| r.leak_excess_px).sum(),
         gap_excess_px_total: rows.iter().map(|r| r.gap_excess_px).sum(),
         lid_break_excess_total: rows.iter().map(|r| r.lid_break_excess).sum(),
@@ -529,9 +554,10 @@ pub fn eye_seal_poses(env: &[EnvelopePose]) -> Vec<EnvelopePose> {
         .collect()
 }
 
-/// Hard (no anti-aliasing) RGBA render of one pose on the seal raster: each pixel takes the top
-/// layer's texel colour; also returns the posed top-layer index per pixel (`-1` = none). For
-/// before/after comparison images and defect diagnosis only.
+/// Hard (no anti-aliasing, opaque `alpha = 255` without app alpha fades) RGBA render of one pose
+/// on the seal raster: each pixel takes the top layer's texel colour; also returns the posed
+/// top-layer index per pixel (`-1` = none). For diagnostic `eye_seal/*.png` comparison only, not
+/// for pixel-quality judgment.
 #[allow(clippy::too_many_arguments)]
 pub fn render_pose_rgba(
     ids: &[String],
@@ -730,8 +756,13 @@ pub(crate) mod tests {
             );
         }
         assert!(
-            before.leak_excess_px_total > 1000,
-            "legacy must leak: {}",
+            before.geometric_leak_px_total > 1000,
+            "legacy must leak geometrically: {}",
+            before.geometric_leak_px_total
+        );
+        assert!(
+            before.leak_excess_px_total > 100,
+            "legacy must leak on screen in partial blinks: {}",
             before.leak_excess_px_total
         );
         // Not zero: 1–3 px slivers remain where the white reaches past the aperture end under the
@@ -764,6 +795,54 @@ pub(crate) mod tests {
             }
         }
         assert!(after.max_iris_shift_px >= before.max_iris_shift_px - 1e-9);
+    }
+
+    #[test]
+    fn closed_eye_screen_leak_is_zero_while_partial_blink_is_checked() {
+        let env_poses = eye_seal_poses(&pose_envelope().poses);
+        let closed_poses: Vec<_> = env_poses
+            .iter()
+            .filter(|p| p.pose.eye_l <= 1e-9 || p.pose.eye_r <= 1e-9)
+            .collect();
+        assert!(!closed_poses.is_empty());
+
+        let blink015: Vec<_> = env_poses
+            .iter()
+            .filter(|p| p.name.contains("blink0.15"))
+            .collect();
+        assert!(!blink015.is_empty());
+        for pe in &blink015 {
+            assert!(crate::rig::raster::layer_opacity("eyeL_white", &pe.pose) > 0.01);
+            assert!(crate::rig::raster::layer_opacity("eyeL_iris", &pe.pose) > 0.01);
+            assert!(crate::rig::raster::layer_opacity("eyeR_white", &pe.pose) > 0.01);
+            assert!(crate::rig::raster::layer_opacity("eyeR_iris", &pe.pose) > 0.01);
+        }
+
+        // Legacy rig leaks geometrically when closed, but screen-visible leak_px must be 0 at eye=0
+        // and > 0 at blink0.15 (where layer_opacity > 0.01).
+        let legacy = seal(true);
+        let closed_legacy: Vec<_> = legacy.rows.iter().filter(|r| r.open <= 1e-9).collect();
+        assert!(!closed_legacy.is_empty());
+        assert!(closed_legacy.iter().any(|r| r.geometric_leak_px > 0));
+        for r in &closed_legacy {
+            assert_eq!(r.leak_px, 0, "closed eye must have 0 screen leak: {r:?}");
+            assert_eq!(r.leak_excess_px, 0, "closed eye must have 0 screen excess: {r:?}");
+        }
+        let blink015_legacy: Vec<_> = legacy
+            .rows
+            .iter()
+            .filter(|r| r.pose.contains("blink0.15"))
+            .collect();
+        assert!(!blink015_legacy.is_empty());
+        assert!(blink015_legacy.iter().all(|r| r.leak_px > 0 && r.leak_px == r.geometric_leak_px));
+
+        // Current T10 rig also reports 0 screen leak at eye=0.
+        let current = seal(false);
+        for r in current.rows.iter().filter(|r| r.open <= 1e-9) {
+            assert_eq!(r.leak_px, 0, "closed eye must have 0 screen leak: {r:?}");
+            assert_eq!(r.leak_excess_px, 0, "closed eye must have 0 screen excess: {r:?}");
+        }
+        assert!(current.leak_px_total <= current.geometric_leak_px_total);
     }
 
     /// Shared Rust/TS fixture for the T10 eye rig: analytic eye masks (TS rebuilds them), the

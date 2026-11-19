@@ -2400,6 +2400,108 @@ describe("T10 sealed eye rig", () => {
       ),
     ).toEqual({});
   });
+
+  it("B4 followup: Canvas2D fallback renders deformed meshes without interior-edge double compositing or AA cracks", () => {
+    const w = 64;
+    const h = 64;
+    const makeQuadProject = (alpha: number) => {
+      const mask = new Uint8Array(w * h);
+      const px = new Uint8ClampedArray(w * h * 4);
+      for (let y = 12; y < 52; y++) {
+        for (let x = 12; x < 52; x++) {
+          const i = y * w + x;
+          mask[i] = alpha;
+          px[i * 4] = 200;
+          px[i * 4 + 1] = 80;
+          px[i * 4 + 2] = 60;
+          px[i * 4 + 3] = alpha;
+        }
+      }
+      const part = {
+        id: "generic_quad",
+        name: "Quad",
+        group: "기타",
+        color: "#60a5fa",
+        role: "other" as const,
+        visible: true,
+        status: "draft" as const,
+        mask,
+        compositeOrder: 0,
+      };
+      const proj: Project = {
+        ...fixture(),
+        parts: [part],
+        landmarks: {
+          eyeL: { x: 40, y: 24 },
+          eyeR: { x: 24, y: 24 },
+          mouth: { x: 32, y: 38 },
+          chin: { x: 32, y: 50 },
+          crown: { x: 32, y: 10 },
+        },
+        ...createDefaultProjectRigState("ld"),
+      };
+      const tex = createCanvas(w, h);
+      const tCtx = tex.getContext("2d");
+      const img = tCtx.createImageData(w, h);
+      img.data.set(px);
+      tCtx.putImageData(img, 0, 0);
+      const partTextures = new Map<string, HTMLCanvasElement>([
+        [part.id, tex as unknown as HTMLCanvasElement],
+      ]);
+      // Two triangles sharing the exact diagonal (16.5,16.5) -> (47.5,47.5) through pixel centres.
+      const meshes = new Map([
+        [
+          part.id,
+          {
+            vertices: [
+              { x: 16.5, y: 16.5 },
+              { x: 47.5, y: 16.5 },
+              { x: 47.5, y: 47.5 },
+              { x: 16.5, y: 47.5 },
+            ],
+            uv: [
+              { x: 16.5 / w, y: 16.5 / h },
+              { x: 47.5 / w, y: 16.5 / h },
+              { x: 47.5 / w, y: 47.5 / h },
+              { x: 16.5 / w, y: 47.5 / h },
+            ],
+            triangles: [0, 1, 2, 0, 2, 3],
+          },
+        ],
+      ]);
+      return { proj, partTextures, meshes };
+    };
+
+    for (const alpha of [128, 255]) {
+      const { proj, partTextures, meshes } = makeQuadProject(alpha);
+      const evaluated = evaluateRigFrame({
+        project: proj,
+        userOffsets: { angleX: 15 },
+        deterministic: true,
+        playing: false,
+      });
+      const out = createCanvas(w, h);
+      renderCharacterFrame({
+        ctx: out.getContext("2d") as unknown as CanvasRenderingContext2D,
+        project: proj,
+        evaluated,
+        partTextures,
+        meshes,
+        previewDeform: true,
+        enableGpu: false,
+      });
+      const data = out.getContext("2d").getImageData(0, 0, w, h).data;
+      let interiorChecked = 0;
+      for (let y = 22; y < 42; y++) {
+        for (let x = 22; x < 42; x++) {
+          const a = data[(y * w + x) * 4 + 3];
+          expect(a, `alpha=${alpha} at (${x},${y})`).toBe(alpha);
+          interiorChecked++;
+        }
+      }
+      expect(interiorChecked).toBe(400);
+    }
+  });
 });
 
 describe("B2 hair_body seam coupling parity", () => {

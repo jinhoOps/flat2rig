@@ -9375,7 +9375,8 @@ mod tests {
             assert!(fa >= fb, "{id}: fillMask shrank {fb} -> {fa}");
             assert_eq!(bo.masks[p], ao.masks[p], "{id}: visible partition changed");
         }
-        assert!(after.leak_excess_px_total * 20 <= before.leak_excess_px_total.max(1));
+        assert!(after.leak_excess_px_total * 3 <= before.leak_excess_px_total.max(1));
+        assert!(after.rows.iter().filter(|r| r.open <= 1e-9).all(|r| r.leak_px == 0));
         assert!(after.max_lash_drop_px >= before.max_lash_drop_px - 1e-9);
         assert!(after.max_iris_shift_px >= before.max_iris_shift_px - 1e-9);
     }

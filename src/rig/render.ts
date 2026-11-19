@@ -30,6 +30,7 @@ import { GlMeshCompositor, type GlLayerDrawSpec } from "./glRenderer";
 export interface RenderScratch {
   scleraTargets: Map<string, HTMLCanvasElement>;
   iris: HTMLCanvasElement;
+  meshCanvas?: HTMLCanvasElement;
   gl?: GlMeshCompositor | null;
 }
 
@@ -98,32 +99,221 @@ export function drawTexturedTriangle(
   const sh = sy1 - sy0;
   if (sw <= 0 || sh <= 0) return;
 
-  // Dilate only the destination clip polygon slightly outward (~0.72px from centroid)
-  // while keeping the exact affine transform so adjacent interior edges overlap cleanly without AA cracks.
-  const kCx = (p.x + q.x + r.x) / 3;
-  const kCy = (p.y + q.y + r.y) / 3;
-  const dilateClip = (pt: Point): Point => {
-    const dx = pt.x - kCx;
-    const dy = pt.y - kCy;
-    const len = Math.hypot(dx, dy);
-    if (len < 1e-4) return pt;
-    const pad = 0.72;
-    return { x: pt.x + (dx / len) * pad, y: pt.y + (dy / len) * pad };
-  };
-  const dp = dilateClip(p);
-  const dq = dilateClip(q);
-  const dr = dilateClip(r);
-
   ctx.save();
   ctx.beginPath();
-  ctx.moveTo(dp.x, dp.y);
-  ctx.lineTo(dq.x, dq.y);
-  ctx.lineTo(dr.x, dr.y);
+  ctx.moveTo(p.x, p.y);
+  ctx.lineTo(q.x, q.y);
+  ctx.lineTo(r.x, r.y);
   ctx.closePath();
   ctx.clip();
   ctx.transform(aa, bb, cc, dd, ee, ff);
   ctx.drawImage(texture, sx0, sy0, sw, sh, sx0, sy0, sw, sh);
   ctx.restore();
+}
+
+const SUBPIXEL = 256;
+
+function isTopLeftEdge(ax: number, ay: number, bx: number, by: number): boolean {
+  const dx = bx - ax;
+  const dy = by - ay;
+  return (dy === 0 && dx > 0) || dy < 0;
+}
+
+/**
+ * Rasterises a deformed ArtMesh once into a tight bounding-box ImageData using the same
+ * 1/256 px top-left fill rule and premultiplied bilinear sampling as `rig::raster`, avoiding both
+ * interior-edge double compositing on semi-transparent layers and Canvas2D AA clip cracks.
+ */
+function drawMeshTopLeft(
+  targetCtx: CanvasRenderingContext2D,
+  texture: HTMLCanvasElement,
+  mesh: Mesh,
+  posed: Point[],
+  scratch?: RenderScratch,
+  texPixelsCache?: Map<HTMLCanvasElement, Uint8ClampedArray>,
+): void {
+  const tw = texture.width;
+  const th = texture.height;
+  if (tw <= 0 || th <= 0 || mesh.triangles.length === 0) return;
+
+  let minXf = Infinity;
+  let minYf = Infinity;
+  let maxXf = -Infinity;
+  let maxYf = -Infinity;
+  for (let i = 0; i < posed.length; i++) {
+    const pt = posed[i];
+    if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) continue;
+    if (pt.x < minXf) minXf = pt.x;
+    if (pt.y < minYf) minYf = pt.y;
+    if (pt.x > maxXf) maxXf = pt.x;
+    if (pt.y > maxYf) maxYf = pt.y;
+  }
+  const ox = Math.max(0, Math.floor(minXf));
+  const oy = Math.max(0, Math.floor(minYf));
+  const ex = Math.min(tw, Math.ceil(maxXf));
+  const ey = Math.min(th, Math.ceil(maxYf));
+  const bw = ex - ox;
+  const bh = ey - oy;
+  if (bw <= 0 || bh <= 0) return;
+
+  let src = texPixelsCache?.get(texture);
+  if (!src) {
+    const sCtx = texture.getContext("2d");
+    if (!sCtx) return;
+    src = sCtx.getImageData(0, 0, tw, th).data;
+    texPixelsCache?.set(texture, src);
+  }
+
+  let offscreen = scratch?.meshCanvas;
+  if (!offscreen) {
+    offscreen = canvas(bw, bh);
+    if (scratch) scratch.meshCanvas = offscreen;
+  } else if (offscreen.width !== bw || offscreen.height !== bh) {
+    offscreen.width = bw;
+    offscreen.height = bh;
+  }
+  const oCtx = offscreen.getContext("2d");
+  if (!oCtx) return;
+  const imgData = oCtx.createImageData(bw, bh);
+  const dst = imgData.data;
+
+  const verts = mesh.vertices;
+  const tris = mesh.triangles;
+  const halfSub = SUBPIXEL / 2;
+
+  for (let t = 0; t < tris.length; t += 3) {
+    const i0 = tris[t];
+    const i1 = tris[t + 1];
+    const i2 = tris[t + 2];
+    const p0 = posed[i0];
+    const p1 = posed[i1];
+    const p2 = posed[i2];
+    if (
+      !Number.isFinite(p0.x) ||
+      !Number.isFinite(p0.y) ||
+      !Number.isFinite(p1.x) ||
+      !Number.isFinite(p1.y) ||
+      !Number.isFinite(p2.x) ||
+      !Number.isFinite(p2.y)
+    ) {
+      continue;
+    }
+
+    let ax = Math.round(p0.x * SUBPIXEL);
+    let ay = Math.round(p0.y * SUBPIXEL);
+    let bx = Math.round(p1.x * SUBPIXEL);
+    let by = Math.round(p1.y * SUBPIXEL);
+    let cx = Math.round(p2.x * SUBPIXEL);
+    let cy = Math.round(p2.y * SUBPIXEL);
+
+    let s0 = verts[i0];
+    let s1 = verts[i1];
+    let s2 = verts[i2];
+
+    let area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (area === 0) continue;
+    if (area < 0) {
+      const tx = bx;
+      const ty = by;
+      bx = cx;
+      by = cy;
+      cx = tx;
+      cy = ty;
+      const ts = s1;
+      s1 = s2;
+      s2 = ts;
+      area = -area;
+    }
+
+    const triMinX = Math.min(ax, bx, cx);
+    const triMaxX = Math.max(ax, bx, cx);
+    const triMinY = Math.min(ay, by, cy);
+    const triMaxY = Math.max(ay, by, cy);
+
+    const x0 = Math.max(ox, Math.floor((triMinX - halfSub) / SUBPIXEL));
+    const x1 = Math.min(ex - 1, Math.floor((triMaxX - halfSub) / SUBPIXEL) + 1);
+    const y0 = Math.max(oy, Math.floor((triMinY - halfSub) / SUBPIXEL));
+    const y1 = Math.min(ey - 1, Math.floor((triMaxY - halfSub) / SUBPIXEL) + 1);
+    if (x0 > x1 || y0 > y1) continue;
+
+    const bias0 = isTopLeftEdge(bx, by, cx, cy) ? 0 : -1;
+    const bias1 = isTopLeftEdge(cx, cy, ax, ay) ? 0 : -1;
+    const bias2 = isTopLeftEdge(ax, ay, bx, by) ? 0 : -1;
+    const invArea = 1 / area;
+
+    for (let y = y0; y <= y1; y++) {
+      const py = y * SUBPIXEL + halfSub;
+      const rowOff = (y - oy) * bw;
+      for (let x = x0; x <= x1; x++) {
+        const px = x * SUBPIXEL + halfSub;
+        const e0 = (cx - bx) * (py - by) - (cy - by) * (px - bx);
+        if (e0 + bias0 < 0) continue;
+        const e1 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx);
+        if (e1 + bias1 < 0) continue;
+        const e2 = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+        if (e2 + bias2 < 0) continue;
+
+        const w0 = e0 * invArea;
+        const w1 = e1 * invArea;
+        const w2 = 1 - w0 - w1;
+        const sx = w0 * s0.x + w1 * s1.x + w2 * s2.x;
+        const sy = w0 * s0.y + w1 * s1.y + w2 * s2.y;
+
+        const u = Math.min(Math.max(sx - 0.5, 0), tw - 1);
+        const v = Math.min(Math.max(sy - 0.5, 0), th - 1);
+        const ix0 = Math.floor(u);
+        const iy0 = Math.floor(v);
+        const ix1 = Math.min(ix0 + 1, tw - 1);
+        const iy1 = Math.min(iy0 + 1, th - 1);
+        const fx = u - ix0;
+        const fy = v - iy0;
+
+        const k00 = (iy0 * tw + ix0) * 4;
+        const k10 = (iy0 * tw + ix1) * 4;
+        const k01 = (iy1 * tw + ix0) * 4;
+        const k11 = (iy1 * tw + ix1) * 4;
+
+        const w00 = (1 - fx) * (1 - fy);
+        const w10 = fx * (1 - fy);
+        const w01 = (1 - fx) * fy;
+        const w11 = fx * fy;
+
+        const a00 = src[k00 + 3] / 255;
+        const a10 = src[k10 + 3] / 255;
+        const a01 = src[k01 + 3] / 255;
+        const a11 = src[k11 + 3] / 255;
+
+        const a = w00 * a00 + w10 * a10 + w01 * a01 + w11 * a11;
+        const a8 = Math.round(a * 255);
+        if (a8 <= 0) continue;
+
+        const pr =
+          w00 * src[k00] * a00 +
+          w10 * src[k10] * a10 +
+          w01 * src[k01] * a01 +
+          w11 * src[k11] * a11;
+        const pg =
+          w00 * src[k00 + 1] * a00 +
+          w10 * src[k10 + 1] * a10 +
+          w01 * src[k01 + 1] * a01 +
+          w11 * src[k11 + 1] * a11;
+        const pb =
+          w00 * src[k00 + 2] * a00 +
+          w10 * src[k10 + 2] * a10 +
+          w01 * src[k01 + 2] * a01 +
+          w11 * src[k11 + 2] * a11;
+
+        const di = (rowOff + (x - ox)) * 4;
+        dst[di] = Math.min(255, Math.max(0, Math.round(pr / a)));
+        dst[di + 1] = Math.min(255, Math.max(0, Math.round(pg / a)));
+        dst[di + 2] = Math.min(255, Math.max(0, Math.round(pb / a)));
+        dst[di + 3] = a8;
+      }
+    }
+  }
+
+  oCtx.putImageData(imgData, 0, 0);
+  targetCtx.drawImage(offscreen, ox, oy);
 }
 
 export function blendModeToCanvasOp(
@@ -167,23 +357,15 @@ function drawPartMeshOrImage(
   shapeDeform: ShapeDeformInput,
   moving: boolean,
   precomputedPosed?: Point[] | null,
+  scratch?: RenderScratch,
+  texPixelsCache?: Map<HTMLCanvasElement, Uint8ClampedArray>,
 ): Point[] | null {
   const posed =
     precomputedPosed !== undefined
       ? precomputedPosed
       : computePosedPoints(mesh, part, project, params, shapeDeform, moving);
   if (posed && mesh && mesh.triangles.length > 0) {
-    for (let t = 0; t < mesh.triangles.length; t += 3) {
-      const i0 = mesh.triangles[t];
-      const i1 = mesh.triangles[t + 1];
-      const i2 = mesh.triangles[t + 2];
-      drawTexturedTriangle(
-        targetCtx,
-        texture,
-        [mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2]],
-        [posed[i0], posed[i1], posed[i2]],
-      );
-    }
+    drawMeshTopLeft(targetCtx, texture, mesh, posed, scratch, texPixelsCache);
     return posed;
   }
   targetCtx.drawImage(texture, 0, 0);
@@ -647,6 +829,7 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
 
   const renderedSclera = new Map<string, HTMLCanvasElement>();
   const scleraSet = new Set(Object.values(clippingTargets));
+  const texPixelsCache = new Map<HTMLCanvasElement, Uint8ClampedArray>();
 
   for (const entry of layerEntries) {
     const { spec, partObj, isBasePart } = entry;
@@ -670,6 +853,8 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
           shapeDeform,
           moving,
           spec.posedPoints,
+          scratch,
+          texPixelsCache,
         );
         if (!soloPartId) {
           let targetCanvas = scratch.scleraTargets.get(partObj.id);
@@ -694,6 +879,8 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
             shapeDeform,
             moving,
             spec.posedPoints,
+            scratch,
+            texPixelsCache,
           );
           renderedSclera.set(partObj.id, targetCanvas);
         }
@@ -713,6 +900,8 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
             shapeDeform,
             moving,
             spec.posedPoints,
+            scratch,
+            texPixelsCache,
           );
           iCtx.globalCompositeOperation = "destination-in";
           iCtx.drawImage(sclera, 0, 0);
@@ -729,6 +918,8 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
             shapeDeform,
             moving,
             spec.posedPoints,
+            scratch,
+            texPixelsCache,
           );
         }
       } else {
@@ -742,6 +933,8 @@ export function renderCharacterFrame(opts: RenderFrameOptions): RenderScratch {
           shapeDeform,
           moving,
           spec.posedPoints,
+          scratch,
+          texPixelsCache,
         );
       }
       ctx.restore();
