@@ -170,21 +170,28 @@ pub fn compute_exposure_map(
     h: usize,
     poses: &[EnvelopePose],
 ) -> ExposureMap {
-    // T10: the eye rig needs the aperture lines of these masks (unless the caller derived them).
+    // T10 + B2: derive eye aperture lines and torso top line unless the caller already did.
+    let effs: Vec<Vec<u8>> = (0..ids.len())
+        .map(|p| effective_part_mask(&visible[p], fill.get(p).map(|f| f.as_slice())))
+        .collect();
     let derived;
-    let lm = if lm.eye_frames.is_some() {
+    let lm = if lm.eye_frames.is_some() && lm.torso_frame.is_some() {
         lm
     } else {
-        derived = lm.with_eye_frames(ids, visible, w, h);
+        let mut d = lm.clone();
+        if d.eye_frames.is_none() {
+            d = d.with_eye_frames(ids, visible, w, h);
+        }
+        if d.torso_frame.is_none() {
+            d = d.with_torso_frame(ids, &effs, w, h);
+        }
+        derived = d;
         &derived
     };
     let meshes: Vec<Mesh> = ids
         .iter()
         .enumerate()
-        .map(|(p, id)| {
-            let eff = effective_part_mask(&visible[p], fill.get(p).map(|f| f.as_slice()));
-            art_mesh_for_part(&eff, w, h, MESH_DENSITY, id, lm)
-        })
+        .map(|(p, id)| art_mesh_for_part(&effs[p], w, h, MESH_DENSITY, id, lm))
         .collect();
     compute_exposure_map_with(ids, visible, fill, &meshes, w, h, poses, |p, id, pose| {
         deform(p, id, lm, pose)

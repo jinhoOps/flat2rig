@@ -7334,8 +7334,10 @@ fn apply_motion_proportional_underlaps(
         .map(|id| crate::core::infer_part_role(id, None))
         .collect();
     let seam_graph = seams::extract_seam_graph(final_layer_ids, &roles, final_visible_masks, w, h);
-    // T10: eye layers deform with the aperture lines of these visible masks.
-    let rig_lm = landmarks.with_eye_frames(final_layer_ids, final_visible_masks, w, h);
+    // T10 + B2: eye layers deform with the aperture lines; hair blends to torso below the chin.
+    let rig_lm = landmarks
+        .with_eye_frames(final_layer_ids, final_visible_masks, w, h)
+        .with_torso_frame(final_layer_ids, final_visible_masks, w, h);
     let landmarks = &rig_lm;
     let hidden_env = seams::hidden_area_envelope();
     let table = seams::SeamMarginTable::new(seams::hidden_area_seam_requirements(
@@ -7955,6 +7957,7 @@ mod tests {
             chin: Point { x: 128.0, y: 140.0 },
             crown: Point { x: 128.0, y: 24.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let mut face_m = vec![0u8; n];
         let mut clothes_m = vec![0u8; n];
@@ -8042,6 +8045,7 @@ mod tests {
             chin: Point { x: 128.0, y: 164.0 },
             crown: Point { x: 128.0, y: 40.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let mut sd_rgba = vec![0u8; n * 4];
         let mut sd_face = vec![0u8; n];
@@ -8223,6 +8227,7 @@ mod tests {
             chin: Point { x: 128.0, y: 140.0 },
             crown: Point { x: 128.0, y: 24.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let mut rgba = vec![0u8; n * 4];
         let (mut face_m, mut hair_m, mut clothes_m) = (vec![0u8; n], vec![0u8; n], vec![0u8; n]);
@@ -8320,6 +8325,7 @@ mod tests {
             chin: Point { x: 128.0, y: 140.0 },
             crown: Point { x: 128.0, y: 24.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let mut face_m = vec![0u8; n];
         let mut clothes_m = vec![0u8; n];
@@ -8451,6 +8457,7 @@ mod tests {
             chin: Point { x: 128.0, y: 158.0 },
             crown: Point { x: 128.0, y: 34.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let mut face_m = vec![0u8; n];
         let mut clothes_m = vec![0u8; n];
@@ -8676,6 +8683,7 @@ mod tests {
             chin: crate::core::Point { x: 128.0, y: 158.0 },
             crown: crate::core::Point { x: 128.0, y: 38.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let mut rgba = vec![0u8; n * 4];
         let mut hf_m = vec![0u8; n];
@@ -8824,6 +8832,7 @@ mod tests {
             chin: Point { x: 512.0, y: 560.0 },
             crown: Point { x: 512.0, y: 120.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let mut face_m = vec![0u8; n];
         let mut neck_m = vec![0u8; n];
@@ -8956,6 +8965,7 @@ mod tests {
             chin: Point { x: 512.0, y: 560.0 },
             crown: Point { x: 512.0, y: 120.0 },
             eye_frames: None,
+            torso_frame: None,
         };
         let ids: Vec<String> = [
             "hair_back",

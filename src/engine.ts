@@ -1731,11 +1731,22 @@ export interface EyeFrames {
   R?: EyeFrameSample[];
 }
 
+/** One torso attachment column sample in world canvas coordinates relative to `HeadFrame.originX`. */
+export interface TorsoFrameSample {
+  /** Horizontal offset from `hf.originX` (`x - cx`, canvas pixels). */
+  u: number;
+  /** Smoothed top canvas Y of the torso (`body`/`clothes`/`hands`) layers in this column. */
+  top: number;
+}
+
 /**
- * Landmarks plus the derived eye aperture lines. Never stored in the project (`project.landmarks`
- * stays the five points); renderers derive it with `rigLandmarks`.
+ * Landmarks plus the derived eye aperture lines and B2 torso attachment line. Never stored in the
+ * project (`project.landmarks` stays the five points); renderers derive it with `rigLandmarks`.
  */
-export type RigLandmarks = Landmarks & { eyeFrames?: EyeFrames };
+export type RigLandmarks = Landmarks & {
+  eyeFrames?: EyeFrames;
+  torsoFrame?: TorsoFrameSample[];
+};
 
 export function eyeLayerSide(id: string): "L" | "R" | null {
   if (id.startsWith("eyeL")) return "L";
@@ -1887,10 +1898,10 @@ const rigLandmarksCache = new WeakMap<
   { landmarks: Landmarks; width: number; height: number; value: RigLandmarks }
 >();
 
-/** `project.landmarks` with eye frames derived from the project's visible eye masks (memoised). */
+/** `project.landmarks` with eye frames and torso frame derived from the project's masks (memoised). */
 export function rigLandmarks(project: {
   landmarks: Landmarks;
-  parts: ReadonlyArray<Pick<Part, "id" | "mask">>;
+  parts: ReadonlyArray<Pick<Part, "id" | "mask"> & Partial<Pick<Part, "role" | "fillMask">>>;
   width: number;
   height: number;
 }): RigLandmarks {
@@ -1907,6 +1918,7 @@ export function rigLandmarks(project: {
   const value: RigLandmarks = {
     ...project.landmarks,
     eyeFrames: deriveEyeFrames(project.landmarks, project.parts, project.width, project.height),
+    torsoFrame: deriveTorsoFrame(project.landmarks, project.parts, project.width, project.height),
   };
   rigLandmarksCache.set(key, {
     landmarks: project.landmarks,
@@ -2126,6 +2138,116 @@ export const HAIR_ROOT_COUPLING_BAND_HH = 0.25;
 export const COLLAR_COUPLING_INNER_ED = 0.35;
 /** …fading to none at this |u|. */
 export const COLLAR_COUPLING_OUTER_ED = 0.6;
+/** B2 torso frame column width (eye distances). */
+export const TORSO_FRAME_BIN_ED = 0.125;
+/** B2 maximum slope |d(top)/dx| of the smoothed torso top line. */
+export const TORSO_FRAME_MAX_SLOPE = 0.5;
+/** B2 minimum hair → body vertical transition band (head heights). */
+export const HAIR_BODY_MIN_BAND_HH = 0.22;
+/** B2 lateral scaling of the hair → body transition band (`band >= ratio · |x - cx|`). */
+export const HAIR_BODY_BAND_X_RATIO = 1.15;
+/** B2 outside the face (`|pu| ≥ inner·ed` → `outer·ed`), floor rises from `mouth_v` to `eye_mid_v`. */
+export const HAIR_BODY_OUTER_START_INNER_ED = 0.7;
+export const HAIR_BODY_OUTER_START_OUTER_ED = 1.1;
+/** B2 `hair_back` directly behind the neck blends toward `neck`, fading to `clothes`. */
+export const HAIR_BACK_NECK_INNER_ED = 0.45;
+export const HAIR_BACK_NECK_OUTER_ED = 0.65;
+export const HAIR_BACK_NECK_MAX_SHARE = 0.75;
+
+/** B2: smoothed top line of the torso layers (roles `body` / `clothes` / `hands`, effective alpha
+ * ≥ 128, canvas `y ≥ mouth.y`) per `TORSO_FRAME_BIN_ED`-wide column relative to `hf.originX`.
+ * Mirrors Rust `core::derive_torso_frame`. */
+export function deriveTorsoFrame(
+  lm: Landmarks,
+  parts: ReadonlyArray<Pick<Part, "id" | "mask"> & Partial<Pick<Part, "role" | "fillMask">>>,
+  w: number,
+  h: number,
+): TorsoFrameSample[] | undefined {
+  const hf = buildHeadFrame(lm, 0, 0);
+  const bin = hf.eyeDist * TORSO_FRAME_BIN_ED;
+  const cx = hf.originX;
+  const minY = lm.mouth.y;
+  const tops = new Map<number, number>();
+  for (const part of parts) {
+    const role = inferPartRole(part.id, part.role);
+    if (role !== "body" && role !== "clothes" && role !== "hands") continue;
+    const m = part.mask;
+    const f = part.fillMask;
+    if (!m && !f) continue;
+    for (let y = 0; y < h; y++) {
+      if (y + 0.5 < minY) continue;
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        const idx = row + x;
+        const eff = Math.max(m ? m[idx] : 0, f ? f[idx] : 0);
+        if (eff < 128) continue;
+        const dx = x + 0.5 - cx;
+        const k = Math.floor(dx / bin);
+        const prev = tops.get(k);
+        if (prev === undefined || y < prev) tops.set(k, y);
+      }
+    }
+  }
+  if (tops.size === 0) return undefined;
+  const keys = Array.from(tops.keys()).sort((a, b) => a - b);
+  const k0 = keys[0];
+  const k1 = keys[keys.length - 1];
+  const n = k1 - k0 + 1;
+  const raw = new Float64Array(n);
+  let ki = 0;
+  for (let i = 0; i < n; i++) {
+    const k = k0 + i;
+    const hit = tops.get(k);
+    if (hit !== undefined) {
+      raw[i] = hit;
+      while (ki < keys.length && keys[ki] <= k) ki++;
+    } else {
+      const ka = keys[ki - 1];
+      const kb = keys[ki];
+      const ta = tops.get(ka)!;
+      const tb = tops.get(kb)!;
+      raw[i] = ta + ((tb - ta) * (k - ka)) / (kb - ka);
+    }
+  }
+  const maxStep = TORSO_FRAME_MAX_SLOPE * bin;
+  for (let i = 1; i < n; i++) {
+    raw[i] = Math.min(raw[i], raw[i - 1] + maxStep);
+  }
+  for (let i = n - 2; i >= 0; i--) {
+    raw[i] = Math.min(raw[i], raw[i + 1] + maxStep);
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    const prev = Float64Array.from(raw);
+    for (let i = 0; i < n; i++) {
+      const a = prev[Math.max(0, i - 1)];
+      const c = prev[Math.min(n - 1, i + 1)];
+      raw[i] = 0.25 * a + 0.5 * prev[i] + 0.25 * c;
+    }
+  }
+  const out: TorsoFrameSample[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = { u: (k0 + i + 0.5) * bin, top: raw[i] };
+  }
+  return out;
+}
+
+/** Torso top at column offset `u = x - cx` (piecewise linear, constant beyond ends). Mirrors Rust
+ * `core::torso_top_at`. */
+export function torsoTopAt(samples: readonly TorsoFrameSample[], u: number): number {
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  if (u <= first.u) return first.top;
+  if (u >= last.u) return last.top;
+  for (let i = 0; i + 1 < samples.length; i++) {
+    const a = samples[i];
+    const b = samples[i + 1];
+    if (u <= b.u) {
+      const t = b.u > a.u ? (u - a.u) / (b.u - a.u) : 0;
+      return a.top + (b.top - a.top) * t;
+    }
+  }
+  return last.top;
+}
 
 function smoothstep01(edge0: number, edge1: number, x: number): number {
   if (edge1 <= edge0) return x >= edge1 ? 1 : 0;
@@ -2138,6 +2260,7 @@ export interface SeamCouplingWeights {
   neckBody: number;
   collar: number;
   hairRoot: number;
+  hairBody: number;
 }
 
 type CouplingClass = "neck" | "collar" | "hair" | "none";
@@ -2162,11 +2285,11 @@ function neckCoupling(hf: HeadFrame, pv: number): [number, number] {
 export function seamCouplingWeights(
   p: Point,
   part: Pick<Part, "id" | "role">,
-  lm: Landmarks,
+  lm: RigLandmarks,
 ): SeamCouplingWeights {
   const hf = buildHeadFrame(lm, 0, 0);
   const [pu, pv] = toHeadLocal(hf, p.x, p.y);
-  const out: SeamCouplingWeights = { neckHead: 0, neckBody: 0, collar: 0, hairRoot: 0 };
+  const out: SeamCouplingWeights = { neckHead: 0, neckBody: 0, collar: 0, hairRoot: 0, hairBody: 0 };
   const cls = couplingClass(part);
   if (cls === "neck") {
     [out.neckHead, out.neckBody] = neckCoupling(hf, pv);
@@ -2189,8 +2312,52 @@ export function seamCouplingWeights(
     const rootY = lm.crown.y + hf.hh * rootOffset;
     const t = (p.y - rootY) / hf.hh;
     out.hairRoot = 1 - smoothstep01(0, HAIR_ROOT_COUPLING_BAND_HH, t);
+    out.hairBody = hairBodyWeight(hf, lm, p);
   }
   return out;
+}
+
+function hairBodyBand(hf: HeadFrame, lm: RigLandmarks, p: Point): [number, number] | null {
+  const frame = lm.torsoFrame;
+  if (!frame || frame.length === 0) return null;
+  const [pu] = toHeadLocal(hf, p.x, p.y);
+  const [, mouthV] = toHeadLocal(hf, lm.mouth.x, lm.mouth.y);
+  const [, eyeLV] = toHeadLocal(hf, lm.eyeL.x, lm.eyeL.y);
+  const [, eyeRV] = toHeadLocal(hf, lm.eyeR.x, lm.eyeR.y);
+  const eyeMidV = (eyeLV + eyeRV) * 0.5;
+  const outerT = smoothstep01(
+    hf.eyeDist * HAIR_BODY_OUTER_START_INNER_ED,
+    hf.eyeDist * HAIR_BODY_OUTER_START_OUTER_ED,
+    Math.abs(pu),
+  );
+  const vFloor = mouthV + (eyeMidV - mouthV) * outerT;
+  const yFloor = hf.originY + pu * hf.exY + vFloor * hf.eyY;
+  const dx = p.x - hf.originX;
+  const minBand = Math.max(hf.hh * HAIR_BODY_MIN_BAND_HH, Math.abs(dx) * HAIR_BODY_BAND_X_RATIO);
+  const top = torsoTopAt(frame, dx);
+  const y0 = Math.max(top - minBand, yFloor);
+  const y1 = Math.max(top, y0 + minBand);
+  return [y0, y1];
+}
+
+function hairBodyWeight(hf: HeadFrame, lm: RigLandmarks, p: Point): number {
+  const band = hairBodyBand(hf, lm, p);
+  if (!band) return 0;
+  return smoothstep01(band[0], band[1], p.y);
+}
+
+function hairBackNeckShare(hf: HeadFrame, part: Pick<Part, "id" | "role">, p: Point): number {
+  if (inferPartRole(part.id, part.role) !== "hair_back") return 0;
+  const absDx = Math.abs(p.x - hf.originX);
+  return (
+    HAIR_BACK_NECK_MAX_SHARE *
+    (1 -
+      smoothstep01(
+        hf.eyeDist * HAIR_BACK_NECK_INNER_ED,
+        hf.eyeDist * HAIR_BACK_NECK_OUTER_ED,
+        absDx,
+      ))
+  );
 }
 
 function coupledNeckField(
@@ -2237,12 +2404,25 @@ export function deform(
       y: raw.y + (base.y - raw.y) * wts.collar,
     };
   }
-  if (wts.hairRoot <= 0) return raw;
+  if (wts.hairRoot <= 0 && wts.hairBody <= 0) return raw;
   const head = deformUncoupled(p, { id: "face" }, lm, params);
-  return {
-    x: raw.x + (head.x - raw.x) * wts.hairRoot,
-    y: raw.y + (head.y - raw.y) * wts.hairRoot,
-  };
+  let x = raw.x + (head.x - raw.x) * wts.hairRoot;
+  let y = raw.y + (head.y - raw.y) * wts.hairRoot;
+  if (wts.hairBody > 0) {
+    let torso = deform(p, { id: "clothes" }, lm, params);
+    const hf = buildHeadFrame(lm, 0, 0);
+    const neckShare = hairBackNeckShare(hf, part, p);
+    if (neckShare > 0) {
+      const neck = deform(p, { id: "neck" }, lm, params);
+      torso = {
+        x: torso.x + (neck.x - torso.x) * neckShare,
+        y: torso.y + (neck.y - torso.y) * neckShare,
+      };
+    }
+    x += (torso.x - head.x) * wts.hairBody;
+    y += (torso.y - head.y) * wts.hairBody;
+  }
+  return { x, y };
 }
 
 /** T13b uncoupled per-layer field (the pre-T13b `deform`); mirrors Rust `core::deform_uncoupled`.

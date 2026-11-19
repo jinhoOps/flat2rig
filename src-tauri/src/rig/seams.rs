@@ -205,6 +205,9 @@ pub enum SeamCouplingKind {
     Collar,
     /// Hair blends toward the head field inside its root band (hair / `face` or hair / hair).
     HairRoot,
+    /// B2: hair below the chin line exchanges its head-follow field for the torso field while
+    /// keeping its own sway displacement (`hair` / `body`|`clothes`|`hands`).
+    HairBody,
 }
 
 /// T13b coupling attached to a seam. Weights are the mean `core::seam_coupling_weights` blend of
@@ -231,6 +234,12 @@ fn coupling_kind(upper: PartRole, lower: PartRole) -> Option<SeamCouplingKind> {
         (a, b) if (is_hair(a) && (is_hair(b) || b == R::Face)) || (is_hair(b) && a == R::Face) => {
             Some(SeamCouplingKind::HairRoot)
         }
+        (a, b)
+            if (is_hair(a) && matches!(b, R::Body | R::Clothes | R::Hands))
+                || (is_hair(b) && matches!(a, R::Body | R::Clothes | R::Hands)) =>
+        {
+            Some(SeamCouplingKind::HairBody)
+        }
         _ => None,
     }
 }
@@ -250,13 +259,15 @@ fn side_weight(kind: SeamCouplingKind, p: Point, id: &str, lm: &Landmarks) -> f6
             }
         }
         SeamCouplingKind::HairRoot => w.hair_root,
+        SeamCouplingKind::HairBody => w.hair_body,
     }
 }
 
-/// Fills `SeamContract.coupling` for every coupled seam (T13b). Weights are read from
+/// Fills `SeamContract.coupling` for every coupled seam (T13b + B2). Weights are read from
 /// `core::seam_coupling_weights`, the same function `deform` uses, so they cannot drift.
 pub fn annotate_seam_couplings(graph: &mut SeamGraph, lm: &Landmarks) {
-    let hh = HeadFrame::from_landmarks(lm, 0, 0).hh;
+    let hf = HeadFrame::from_landmarks(lm, 0, 0);
+    let hh = hf.hh;
     for seam in &mut graph.seams {
         let Some(kind) = coupling_kind(seam.upper_role, seam.lower_role) else {
             seam.coupling = None;
@@ -270,12 +281,26 @@ pub fn annotate_seam_couplings(graph: &mut SeamGraph, lm: &Landmarks) {
                 pts.iter().map(|&p| side_weight(kind, p, id, lm)).sum::<f64>() / pts.len() as f64
             }
         };
-        let falloff_px = hh
-            * match kind {
-                SeamCouplingKind::NeckHead => crate::core::NECK_HEAD_COUPLING_FALLOFF_HH,
-                SeamCouplingKind::Collar => crate::core::NECK_SPAN_HH,
-                SeamCouplingKind::HairRoot => crate::core::HAIR_ROOT_COUPLING_BAND_HH,
-            };
+        let falloff_px = match kind {
+            SeamCouplingKind::NeckHead => hh * crate::core::NECK_HEAD_COUPLING_FALLOFF_HH,
+            SeamCouplingKind::Collar => hh * crate::core::NECK_SPAN_HH,
+            SeamCouplingKind::HairRoot => hh * crate::core::HAIR_ROOT_COUPLING_BAND_HH,
+            SeamCouplingKind::HairBody => {
+                if lm.torso_frame.as_deref().is_some_and(|f| !f.is_empty()) {
+                    if pts.is_empty() {
+                        hh * crate::core::HAIR_BODY_MIN_BAND_HH
+                    } else {
+                        pts.iter()
+                            .filter_map(|&p| crate::core::hair_body_band(&hf, lm, p))
+                            .map(|(y0, y1)| y1 - y0)
+                            .sum::<f64>()
+                            / pts.len() as f64
+                    }
+                } else {
+                    0.0
+                }
+            }
+        };
         seam.coupling = Some(SeamCoupling {
             kind,
             upper_weight: mean(&seam.upper_id),
@@ -1220,6 +1245,7 @@ mod tests {
             chin: Point { x: 512.0, y: 560.0 },
             crown: Point { x: 512.0, y: 120.0 },
             eye_frames: None,
+            torso_frame: None,
         }
     }
 
@@ -1850,8 +1876,20 @@ mod tests {
         assert!(cn.lower_weight > 0.2, "{cn:?}");
         let hf = graph.find("hair_front", "face").unwrap().coupling.unwrap();
         assert_eq!(hf.kind, SeamCouplingKind::HairRoot);
-        assert!(graph.find("clothes", "hair_back").unwrap().coupling.is_none());
+        let ch_no_frame = graph.find("clothes", "hair_back").unwrap().coupling.unwrap();
+        assert_eq!(ch_no_frame.kind, SeamCouplingKind::HairBody);
+        assert_eq!(ch_no_frame.upper_weight, 0.0);
+        assert_eq!(ch_no_frame.lower_weight, 0.0);
+        assert_eq!(ch_no_frame.falloff_px, 0.0);
         assert!(graph.find("face", "hair_back").unwrap().coupling.is_some());
+
+        let lm_with_torso = lm.with_torso_frame(&ids, &masks, w, h);
+        annotate_seam_couplings(&mut graph, &lm_with_torso);
+        let ch = graph.find("clothes", "hair_back").unwrap().coupling.unwrap();
+        assert_eq!(ch.kind, SeamCouplingKind::HairBody);
+        assert_eq!(ch.upper_weight, 0.0);
+        assert!(ch.lower_weight > 0.5, "{ch:?}");
+        assert!(ch.falloff_px > 0.0, "{ch:?}");
     }
 
     /// Shared Rust/TS fixture: the envelope as each side interprets it, the max relative
@@ -1960,6 +1998,174 @@ mod tests {
         for (a, b) in fw.iter().zip(&weights) {
             for k in ["neckHead", "neckBody", "collar", "hairRoot"] {
                 close(&a["weights"][k], &b["weights"][k], k);
+            }
+        }
+    }
+
+    /// B2 shared Rust/TS parity fixture: `derive_torso_frame` (including `clothes` + `hands`,
+    /// tilted head, and scattered low-alpha noise pixels), `seam_coupling_weights` (`hair_body`),
+    /// and coupled `deform` across extreme poses. Also checks bangs preservation and full sway
+    /// amplitude preservation. Regenerate with `FLAT2RIG_BLESS=1 cargo test b2_hair_body_parity`.
+    #[test]
+    fn b2_hair_body_parity_fixture_matches_rust_deform() {
+        let (w, h) = (256usize, 256usize);
+        let n = w * h;
+        // Tilted head (~-15°), matching Sutteang-style tilted geometry in miniature.
+        let base_lm = Landmarks {
+            eye_r: Point { x: 110.0, y: 98.0 },
+            eye_l: Point { x: 162.0, y: 84.0 },
+            mouth: Point { x: 144.0, y: 120.0 },
+            chin: Point { x: 150.0, y: 142.0 },
+            crown: Point { x: 120.0, y: 34.0 },
+            eye_frames: None,
+            torso_frame: None,
+        };
+        let ids: Vec<String> = ["clothes", "hands"].iter().map(|s| s.to_string()).collect();
+        let mut clothes = vec![0u8; n];
+        let mut hands = vec![0u8; n];
+        for y in 0..h {
+            for x in 0..w {
+                // Torso/sweater with shoulder slope + neck cutout.
+                if (y >= 152 && (56..=208).contains(&x))
+                    || (y >= 146 && (122..=156).contains(&x))
+                {
+                    clothes[y * w + x] = 255;
+                }
+                // Bare right shoulder labeled `hands` (like See-through Sutteang).
+                if (145..=192).contains(&y) && (46..=92).contains(&x) {
+                    hands[y * w + x] = 255;
+                }
+            }
+        }
+        // Scattered low-alpha noise (<128) above mouth must be ignored.
+        clothes[40 * w + 100] = 64;
+        hands[60 * w + 70] = 120;
+        let effs = vec![clothes, hands];
+        let lm = base_lm.with_torso_frame(&ids, &effs, w, h);
+        let frame = lm.torso_frame.as_ref().expect("torso frame derived");
+        assert!(frame.len() >= 10, "frame len {}", frame.len());
+
+        let points: Vec<(&str, (f64, f64))> = vec![
+            ("hair_front", (130.0, 68.0)),      // forehead bangs (above mouth -> hair_body == 0)
+            ("hair_front", (136.0, 108.0)),     // bangs near nose (above mouth -> hair_body == 0)
+            ("hair_front", (68.0, 162.0)),      // long lock over `hands` bare shoulder
+            ("hair_front", (184.0, 185.0)),     // long lock over sweater
+            ("hair_side_L", (174.0, 134.0)),    // cheek-side transition zone
+            ("hair_side_L_2", (180.0, 175.0)),  // dynamic extra side hair on torso
+            ("hair_side_R", (96.0, 165.0)),     // right side lock on torso
+            ("hair_back", (138.0, 152.0)),      // behind neck column (neck_share > 0)
+            ("hair_back", (195.0, 180.0)),      // outer back hair (neck_share == 0)
+            ("hair_back_2", (72.0, 190.0)),     // dynamic extra back hair
+        ];
+
+        // Invariant 1: bangs above mouth have hair_body == 0 and identical position with/without frame.
+        let env = &pose_envelope().poses;
+        let pose_names = [
+            "angleZ=30",
+            "angleZ=-30",
+            "opp3:head+-+/breath1",
+            "same3:head--+/breath1",
+            "hair=1",
+            "hair=-1",
+            "hairSide=1",
+            "hairBack=-1",
+        ];
+        let selected: Vec<&EnvelopePose> = pose_names
+            .iter()
+            .map(|&name| env.iter().find(|p| p.name == name).expect(name))
+            .collect();
+
+        for &(id, (x, y)) in &points[..2] {
+            let p = Point { x, y };
+            let wts = crate::core::seam_coupling_weights(p, id, &lm);
+            assert_eq!(wts.hair_body, 0.0, "bangs {id} ({x},{y}) must have hair_body == 0");
+            for ep in &selected {
+                let a = deform(p, id, &base_lm, &ep.pose);
+                let b = deform(p, id, &lm, &ep.pose);
+                assert!((a.x - b.x).abs() + (a.y - b.y).abs() < 1e-12);
+            }
+        }
+
+        // Invariant 2: hair sway amplitude `deform(hair=1) - deform(hair=-1)` is preserved.
+        let p_h_pos = &env.iter().find(|p| p.name == "hair=1").unwrap().pose;
+        let p_h_neg = &env.iter().find(|p| p.name == "hair=-1").unwrap().pose;
+        for &(id, (x, y)) in &points {
+            let p = Point { x, y };
+            let a1 = deform(p, id, &base_lm, p_h_pos);
+            let a2 = deform(p, id, &base_lm, p_h_neg);
+            let b1 = deform(p, id, &lm, p_h_pos);
+            let b2 = deform(p, id, &lm, p_h_neg);
+            let err = ((a1.x - a2.x) - (b1.x - b2.x)).hypot((a1.y - a2.y) - (b1.y - b2.y));
+            assert!(err < 1e-9, "sway amplitude changed for {id} ({x},{y}): {err}");
+        }
+
+        let weights_json: Vec<serde_json::Value> = points
+            .iter()
+            .map(|&(id, (x, y))| {
+                serde_json::json!({
+                    "id": id,
+                    "point": [x, y],
+                    "weights": crate::core::seam_coupling_weights(Point { x, y }, id, &lm),
+                })
+            })
+            .collect();
+        let cases_json: Vec<serde_json::Value> = selected
+            .iter()
+            .map(|ep| {
+                let out: Vec<[f64; 2]> = points
+                    .iter()
+                    .map(|&(id, (x, y))| {
+                        let q = deform(Point { x, y }, id, &lm, &ep.pose);
+                        [q.x, q.y]
+                    })
+                    .collect();
+                serde_json::json!({ "pose": ep.name, "out": out })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "description": "B2 hair_body Rust/TS parity: tilted-head derive_torso_frame (clothes+hands+noise), seam_coupling_weights, and coupled deform.",
+            "width": w,
+            "height": h,
+            "landmarks": base_lm,
+            "torsoFrame": frame,
+            "points": points.iter().map(|&(id, (x, y))| serde_json::json!({ "id": id, "point": [x, y] })).collect::<Vec<_>>(),
+            "weights": weights_json,
+            "cases": cases_json,
+        });
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/hair-body-parity.json");
+        if std::env::var("FLAT2RIG_BLESS").is_ok() {
+            std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("hair-body parity fixture present"))
+                .unwrap();
+        let close = |a: &serde_json::Value, b: &serde_json::Value, what: &str| {
+            let (x, y) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+            assert!((x - y).abs() < 1e-9, "{what}: fixture {x} vs rust {y}");
+        };
+        let ff = fixture["torsoFrame"].as_array().unwrap();
+        assert_eq!(ff.len(), frame.len());
+        for (i, (a, b)) in ff.iter().zip(frame).enumerate() {
+            close(&a["u"], &serde_json::json!(b.u), &format!("torsoFrame[{i}].u"));
+            close(&a["top"], &serde_json::json!(b.top), &format!("torsoFrame[{i}].top"));
+        }
+        let fw = fixture["weights"].as_array().unwrap();
+        assert_eq!(fw.len(), weights_json.len());
+        for (a, b) in fw.iter().zip(&weights_json) {
+            for k in ["neckHead", "neckBody", "collar", "hairRoot", "hairBody"] {
+                close(&a["weights"][k], &b["weights"][k], k);
+            }
+        }
+        let fc = fixture["cases"].as_array().unwrap();
+        assert_eq!(fc.len(), cases_json.len());
+        for (a, b) in fc.iter().zip(&cases_json) {
+            assert_eq!(a["pose"], b["pose"]);
+            let ao = a["out"].as_array().unwrap();
+            let bo = b["out"].as_array().unwrap();
+            for (i, (pa, pb)) in ao.iter().zip(bo).enumerate() {
+                close(&pa[0], &pb[0], &format!("{}[{i}].x", a["pose"]));
+                close(&pa[1], &pb[1], &format!("{}[{i}].y", a["pose"]));
             }
         }
     }

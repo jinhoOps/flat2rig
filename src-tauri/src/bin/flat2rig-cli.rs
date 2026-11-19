@@ -225,6 +225,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut proportion: Option<String> = None;
     let mut stage: Option<String> = None;
     let mut coupled = true;
+    let mut hair_body = true;
     let mut legacy_eye = false;
     let mut line_art = true;
     let mut rest_gate = true;
@@ -255,6 +256,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // T13b baseline: run the whole pipeline (hidden-area synthesis, seam requirements,
             // exposure map, motion previews) with the pre-T13b uncoupled `deform`.
             coupled = false;
+        } else if arg == "--no-hair-body" {
+            // B2 baseline (measurement only): disable B2 hair ↔ body coupling while keeping T13b.
+            hair_body = false;
         } else if arg == "--legacy-eye" {
             // T10 baseline (measurement only): the whole pipeline with the pre-T10 per-layer eye
             // formulas and clipping rule.
@@ -329,9 +333,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     core::with_legacy_eye_rig(legacy_eye, || {
         core::with_seam_coupling(coupled, || {
-            lineart::with_lineart(line_art, || {
-                let go = || run_pipeline(&input, proportion, stage, coupled, legacy_eye, &eval);
-                if rest_gate { go() } else { lineart::without_rest_gate(go) }
+            core::with_hair_body_coupling(hair_body, || {
+                lineart::with_lineart(line_art, || {
+                    let go = || run_pipeline(&input, proportion, stage, coupled, legacy_eye, &eval);
+                    if rest_gate { go() } else { lineart::without_rest_gate(go) }
+                })
             })
         })
     })
@@ -893,6 +899,7 @@ fn run_pipeline(
                     y: h as f64 * 0.08,
                 },
                 eye_frames: None,
+                torso_frame: None,
             }
         }
     };
@@ -937,9 +944,19 @@ fn run_pipeline(
             (p, Some(r))
         }
     };
-    // T10: eye layers deform with the aperture lines of the proposed visible masks (every motion
-    // preview, seam, coverage and exposure computation below uses these landmarks).
-    let landmarks = landmarks.with_eye_frames(&proposed.part_ids, &proposed.masks, w as usize, h as usize);
+    // T10 + B2: eye layers deform with the aperture lines of the proposed visible masks, and hair
+    // layers blend toward the torso field below the chin using the effective torso top line.
+    let effective_masks: Vec<Vec<u8>> = (0..proposed.part_ids.len())
+        .map(|i| {
+            core::effective_part_mask(
+                &proposed.masks[i],
+                proposed.fill_masks.get(i).and_then(|o| o.as_deref()),
+            )
+        })
+        .collect();
+    let landmarks = landmarks
+        .with_eye_frames(&proposed.part_ids, &proposed.masks, w as usize, h as usize)
+        .with_torso_frame(&proposed.part_ids, &effective_masks, w as usize, h as usize);
 
     let mut meshes = Vec::new();
     let mut mesh_quality = Vec::new();

@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use glam::DVec2;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 pub const IDS: [&str; 18] = [
     "hair_back",
@@ -51,6 +51,12 @@ pub struct Landmarks {
     /// falls back to `default_eye_frame` when it is absent (TS `RigLandmarks.eyeFrames`).
     #[serde(skip)]
     pub eye_frames: Option<EyeFrames>,
+    /// B2 torso attachment line (top of the body/clothes layers per head-local column) derived from
+    /// the effective masks (`derive_torso_frame`). Never serialized: consumers with the masks
+    /// derive it again (TS `RigLandmarks.torsoFrame`). `None` = no torso layer → hair is not
+    /// coupled to the body field.
+    #[serde(skip)]
+    pub torso_frame: Option<Vec<TorsoFrameSample>>,
 }
 impl Landmarks {
     /// Five-point landmarks without derived eye frames.
@@ -62,12 +68,20 @@ impl Landmarks {
             chin,
             crown,
             eye_frames: None,
+            torso_frame: None,
         }
     }
     /// Copy with eye frames derived from `ids`/`visible` (see `derive_eye_frames`).
     pub fn with_eye_frames(&self, ids: &[String], visible: &[Vec<u8>], w: usize, h: usize) -> Self {
         let mut out = self.clone();
         out.eye_frames = Some(derive_eye_frames(self, ids, visible, w, h));
+        out
+    }
+    /// Copy with the torso attachment line derived from `effective` (`mask ∪ fillMask` per layer,
+    /// see `derive_torso_frame`). Keeps any eye frames.
+    pub fn with_torso_frame(&self, ids: &[String], effective: &[Vec<u8>], w: usize, h: usize) -> Self {
+        let mut out = self.clone();
+        out.torso_frame = derive_torso_frame(self, ids, effective, w, h);
         out
     }
     pub fn validate(&self, w: usize, h: usize) -> Result<(), String> {
@@ -2233,9 +2247,163 @@ pub const HAIR_ROOT_COUPLING_BAND_HH: f64 = 0.25;
 pub const COLLAR_COUPLING_INNER_ED: f64 = 0.35;
 /// …fading to none at this |u|.
 pub const COLLAR_COUPLING_OUTER_ED: f64 = 0.60;
+/// B2 torso frame column width (eye distances).
+pub const TORSO_FRAME_BIN_ED: f64 = 0.125;
+/// B2 maximum slope |d(top)/dx| of the smoothed torso top line (prevents sharp shoulder cliffs).
+pub const TORSO_FRAME_MAX_SLOPE: f64 = 0.50;
+/// B2 minimum hair → body vertical transition band (head heights). Wide enough at `|dx| = 0` that
+/// `angleY` + `breath` never fold; grows linearly with `|dx|` via `HAIR_BODY_BAND_X_RATIO`.
+pub const HAIR_BODY_MIN_BAND_HH: f64 = 0.22;
+/// B2 lateral scaling of the hair → body transition band (`band >= ratio · |x - cx|`). Guarantees
+/// `(1.5 / band) · |x - cx| · sin(30°) ≤ 0.65 < 1` at any horizontal distance from the head axis.
+pub const HAIR_BODY_BAND_X_RATIO: f64 = 1.15;
+/// B2 outside the face (`|pu| ≥ outer_start_inner·ed` → `outer_start_outer·ed`), the floor for the
+/// transition start rises smoothly from `mouth_v` toward `eye_mid_v` for wide shoulder-draping hair.
+/// Inside the face (`|pu| ≤ inner·ed`), `y0 ≥ mouth_v` keeps bangs above the mouth 100% on the head.
+pub const HAIR_BODY_OUTER_START_INNER_ED: f64 = 0.70;
+pub const HAIR_BODY_OUTER_START_OUTER_ED: f64 = 1.10;
+/// B2 `hair_back` directly behind the neck (`|dx| ≤ inner·ed`) blends toward `neck`
+/// (`HAIR_BACK_NECK_MAX_SHARE`) so it stays behind `clothes > neck` gaps while still reducing
+/// `clothes > hair_back` separation; fades smoothly to `clothes` by `outer·ed`.
+pub const HAIR_BACK_NECK_INNER_ED: f64 = 0.45;
+pub const HAIR_BACK_NECK_OUTER_ED: f64 = 0.65;
+pub const HAIR_BACK_NECK_MAX_SHARE: f64 = 0.75;
 
 thread_local! {
     static SEAM_COUPLING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static HAIR_BODY_COUPLING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether `deform` applies the B2 hair ↔ body coupling on this thread (default `true`; also
+/// requires seam coupling and a torso frame).
+pub fn hair_body_coupling_enabled() -> bool {
+    HAIR_BODY_COUPLING.with(|c| c.get())
+}
+
+/// Runs `f` with the B2 hair ↔ body coupling enabled/disabled on the current thread only (the
+/// T13b couplings are unaffected). Used for before/after measurements (`flat2rig-cli --no-hair-body`).
+pub fn with_hair_body_coupling<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let prev = HAIR_BODY_COUPLING.with(|c| c.replace(enabled));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HAIR_BODY_COUPLING.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+/// One torso attachment column sample in world canvas coordinates relative to `HeadFrame::origin.x`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TorsoFrameSample {
+    /// Horizontal offset from `hf.origin.x` (`x - cx`, canvas pixels).
+    pub u: f64,
+    /// Smoothed top canvas Y of the torso (`body`/`clothes`/`hands`) layers in this column.
+    pub top: f64,
+}
+
+/// B2: smoothed top line of the torso layers (roles `body` / `clothes` / `hands`, effective alpha
+/// ≥ 128, canvas `y ≥ mouth.y`) per `TORSO_FRAME_BIN_ED`-wide column relative to `hf.origin.x`.
+/// World-space `(x, y)` keeps tilted heads from skewing the shoulder line; Lipschitz slope clamping
+/// and two binomial passes keep the transition C¹-smooth without shoulder cliffs.
+pub fn derive_torso_frame(
+    lm: &Landmarks,
+    ids: &[String],
+    effective: &[Vec<u8>],
+    w: usize,
+    h: usize,
+) -> Option<Vec<TorsoFrameSample>> {
+    let hf = HeadFrame::from_landmarks(lm, 0, 0);
+    let bin = hf.eye_dist * TORSO_FRAME_BIN_ED;
+    let cx = hf.origin.x;
+    let min_y = lm.mouth.y;
+    let mut tops: BTreeMap<i64, f64> = BTreeMap::new();
+    for (p, id) in ids.iter().enumerate() {
+        if !matches!(
+            infer_part_role(id, None),
+            PartRole::Body | PartRole::Clothes | PartRole::Hands
+        ) {
+            continue;
+        }
+        let Some(m) = effective.get(p) else { continue };
+        for y in 0..h {
+            let cy = y as f64 + 0.5;
+            if cy < min_y {
+                continue;
+            }
+            let row = y * w;
+            for x in 0..w {
+                if m[row + x] < 128 {
+                    continue;
+                }
+                let dx = x as f64 + 0.5 - cx;
+                let k = (dx / bin).floor() as i64;
+                let top = y as f64;
+                tops.entry(k)
+                    .and_modify(|t| *t = t.min(top))
+                    .or_insert(top);
+            }
+        }
+    }
+    let (&k0, _) = tops.iter().next()?;
+    let (&k1, _) = tops.iter().next_back()?;
+    let mut raw: Vec<f64> = (k0..=k1)
+        .map(|k| {
+            if let Some(&t) = tops.get(&k) {
+                return t;
+            }
+            let (&ka, &ta) = tops.range(..k).next_back().expect("k0 present");
+            let (&kb, &tb) = tops.range(k..).next().expect("k1 present");
+            ta + (tb - ta) * (k - ka) as f64 / (kb - ka) as f64
+        })
+        .collect();
+    let n = raw.len();
+    // Conservative Lipschitz slope cap: no downward cliff steeper than `TORSO_FRAME_MAX_SLOPE`.
+    let max_step = TORSO_FRAME_MAX_SLOPE * bin;
+    for i in 1..n {
+        raw[i] = raw[i].min(raw[i - 1] + max_step);
+    }
+    for i in (0..n.saturating_sub(1)).rev() {
+        raw[i] = raw[i].min(raw[i + 1] + max_step);
+    }
+    // Two binomial smoothing passes `[0.25, 0.5, 0.25]` to round shoulder corners.
+    for _ in 0..2 {
+        let prev = raw.clone();
+        for i in 0..n {
+            let a = prev[i.saturating_sub(1)];
+            let c = prev[(i + 1).min(n - 1)];
+            raw[i] = 0.25 * a + 0.5 * prev[i] + 0.25 * c;
+        }
+    }
+    Some(
+        (0..n)
+            .map(|i| TorsoFrameSample {
+                u: ((k0 + i as i64) as f64 + 0.5) * bin,
+                top: raw[i],
+            })
+            .collect(),
+    )
+}
+
+/// Torso top at head-local column `u` (piecewise linear, constant beyond the ends).
+pub fn torso_top_at(samples: &[TorsoFrameSample], u: f64) -> f64 {
+    let (first, last) = (samples[0], samples[samples.len() - 1]);
+    if u <= first.u {
+        return first.top;
+    }
+    if u >= last.u {
+        return last.top;
+    }
+    for pair in samples.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if u <= b.u {
+            let t = if b.u > a.u { (u - a.u) / (b.u - a.u) } else { 0.0 };
+            return a.top + (b.top - a.top) * t;
+        }
+    }
+    last.top
 }
 
 /// Whether `deform` applies the T13b seam coupling on this thread (default `true`).
@@ -2279,6 +2447,10 @@ pub struct SeamCouplingWeights {
     pub collar: f64,
     /// Hair → head field blend inside the root band.
     pub hair_root: f64,
+    /// B2 hair → torso (coupled `clothes`) field blend below the chin line: `0` at the chin line,
+    /// `1` at and below the torso top of the column (`torso_top_at`). Only the head-follow part of
+    /// the hair field is exchanged; the hair's own sway displacement is kept in full.
+    pub hair_body: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2293,7 +2465,10 @@ fn coupling_class(id: &str) -> CouplingClass {
     let role = infer_part_role(id, None);
     if role == PartRole::Neck {
         CouplingClass::Neck
-    } else if id.starts_with("hair") {
+    } else if matches!(
+        role,
+        PartRole::HairFront | PartRole::HairSideL | PartRole::HairSideR | PartRole::HairBack
+    ) {
         CouplingClass::Hair
     } else if matches!(role, PartRole::Body | PartRole::Clothes) {
         CouplingClass::Collar
@@ -2336,10 +2511,70 @@ pub fn seam_coupling_weights(point: Point, id: &str, lm: &Landmarks) -> SeamCoup
             let root_y = lm.crown.y + hf.hh * root_offset;
             let t = (point.y - root_y) / hf.hh;
             out.hair_root = 1.0 - smoothstep01(0.0, HAIR_ROOT_COUPLING_BAND_HH, t);
+            out.hair_body = hair_body_weight(&hf, lm, point);
         }
         CouplingClass::None => {}
     }
     out
+}
+
+/// B2 hair → torso transition band `(y0, y1)` in canvas Y at `point`. Unified across all hair roles
+/// so `hair_front`/`hair_side` and `hair_back` share the same field and never separate at hair-hair
+/// seams. Anchors `y1` at `torso_top_at` by pulling `y0 = (top - min_band).max(y_floor)` upward
+/// (clamped at `mouth_v` inside the face so bangs above the mouth stay 100% on the head, rising to
+/// `eye_mid_v` outside the face), then `y1 = top.max(y0 + min_band)` guarantees `y1 - y0 >= min_band`.
+pub(crate) fn hair_body_band(
+    hf: &HeadFrame,
+    lm: &Landmarks,
+    point: Point,
+) -> Option<(f64, f64)> {
+    let frame = lm.torso_frame.as_deref().filter(|f| !f.is_empty())?;
+    let (pu, _) = hf.to_local(point.v());
+    let (_, mouth_v) = hf.to_local(lm.mouth.v());
+    let (_, eye_l_v) = hf.to_local(lm.eye_l.v());
+    let (_, eye_r_v) = hf.to_local(lm.eye_r.v());
+    let eye_mid_v = (eye_l_v + eye_r_v) * 0.5;
+    let outer_t = smoothstep01(
+        hf.eye_dist * HAIR_BODY_OUTER_START_INNER_ED,
+        hf.eye_dist * HAIR_BODY_OUTER_START_OUTER_ED,
+        pu.abs(),
+    );
+    let v_floor = mouth_v + (eye_mid_v - mouth_v) * outer_t;
+    let y_floor = hf.to_world(pu, v_floor).y;
+    let dx = point.x - hf.origin.x;
+    let min_band = (hf.hh * HAIR_BODY_MIN_BAND_HH).max(dx.abs() * HAIR_BODY_BAND_X_RATIO);
+    let top = torso_top_at(frame, dx);
+    let y0 = (top - min_band).max(y_floor);
+    let y1 = top.max(y0 + min_band);
+    Some((y0, y1))
+}
+
+/// B2 hair → torso blend at `point`: smooth C¹ S-curve `smoothstep(y0, y1, point.y)` with band
+/// width `≥ max(0.22·hh, 1.15·|x - cx|)` so head rotation never folds or kinks hair.
+fn hair_body_weight(hf: &HeadFrame, lm: &Landmarks, point: Point) -> f64 {
+    if !hair_body_coupling_enabled() {
+        return 0.0;
+    }
+    let Some((y0, y1)) = hair_body_band(hf, lm, point) else {
+        return 0.0;
+    };
+    smoothstep01(y0, y1, point.y)
+}
+
+/// B2 neck-column share for `hair_back`: directly behind the neck (`|dx| ≤ 0.25·ed`), `hair_back`
+/// follows `neck` instead of `clothes` so it does not pull away from `clothes > neck` gaps.
+fn hair_back_neck_share(hf: &HeadFrame, role: PartRole, point: Point) -> f64 {
+    if role != PartRole::HairBack {
+        return 0.0;
+    }
+    let abs_dx = (point.x - hf.origin.x).abs();
+    HAIR_BACK_NECK_MAX_SHARE
+        * (1.0
+            - smoothstep01(
+                hf.eye_dist * HAIR_BACK_NECK_INNER_ED,
+                hf.eye_dist * HAIR_BACK_NECK_OUTER_ED,
+                abs_dx,
+            ))
 }
 
 /// Coupled neck field at `point` given the raw (uncoupled) neck displacement there.
@@ -2396,11 +2631,25 @@ pub fn deform_with_shapes(
             (raw.v() + (base - raw.v()) * wts.collar).into()
         }
         CouplingClass::Hair => {
-            if wts.hair_root <= 0.0 {
+            if wts.hair_root <= 0.0 && wts.hair_body <= 0.0 {
                 return raw;
             }
+            // `head` = the hair field without its sway (hair follows the head exactly like `face`).
             let head = deform_uncoupled(point, "face", lm, pose).v();
-            (raw.v() + (head - raw.v()) * wts.hair_root).into()
+            let mut p = raw.v() + (head - raw.v()) * wts.hair_root;
+            if wts.hair_body > 0.0 {
+                // B2: exchange the head-follow part for the coupled torso field; `raw − head` (the
+                // sway) is untouched, so the sway amplitude is the same at every point.
+                let mut torso = deform_with_shapes(point, "clothes", lm, pose, None).v();
+                let hf = HeadFrame::from_landmarks(lm, 0, 0);
+                let neck_share = hair_back_neck_share(&hf, infer_part_role(id, None), point);
+                if neck_share > 0.0 {
+                    let neck = deform_with_shapes(point, "neck", lm, pose, None).v();
+                    torso += (neck - torso) * neck_share;
+                }
+                p += (torso - head) * wts.hair_body;
+            }
+            p.into()
         }
         CouplingClass::None => raw,
     }
@@ -2953,6 +3202,7 @@ mod tests {
             chin: Point { x: 30., y: 40. },
             crown: Point { x: 30., y: 4. },
             eye_frames: None,
+            torso_frame: None,
         }
     }
     #[test]
@@ -3111,6 +3361,7 @@ mod tests {
             chin: Point { x: 30.0 * s, y: 40.0 * s },
             crown: Point { x: 30.0 * s, y: 4.0 * s },
             eye_frames: None,
+            torso_frame: None,
         };
         let m_1024 = part_overlap_margins(&scale_lm(16.0), 1024, 1024);
         let m_2048 = part_overlap_margins(&scale_lm(32.0), 2048, 2048);
@@ -3237,6 +3488,7 @@ mod tests {
             chin: Point { x: 360., y: 195. },
             crown: Point { x: 360., y: 40. },
             eye_frames: None,
+            torso_frame: None,
         };
         let report = check_mesh_quality(&mesh, &mask, w, h, "clothes", &l);
         assert!(report.triangle_count >= 120, "expected >=120 tris, got {}", report.triangle_count);
@@ -3395,6 +3647,7 @@ mod tests {
             chin: Point { x: 34., y: 60. },
             crown: Point { x: 34., y: 18. },
             eye_frames: None,
+            torso_frame: None,
         };
         let target = mesh_coverage_target(&mask, w, h);
         let mut parity_meshes = Vec::new();
@@ -3486,6 +3739,7 @@ mod tests {
             chin: Point { x: 54., y: 84. },
             crown: Point { x: 68., y: 8. },
             eye_frames: None,
+            torso_frame: None,
         };
         let hf = HeadFrame::from_landmarks(&tilt_lm, 128, 128);
         let (eye_lu, eye_lv) = hf.to_local(DVec2::new(tilt_lm.eye_l.x, tilt_lm.eye_l.y));

@@ -648,7 +648,14 @@ async fn compute_exposure_map(
             });
             ids.push(part.id);
         }
-        let landmarks = landmarks.with_eye_frames(&ids, &visible, width, height);
+        let effective: Vec<Vec<u8>> = visible
+            .iter()
+            .zip(fills.iter())
+            .map(|(v, f)| core::effective_part_mask(v, Some(f.as_slice())))
+            .collect();
+        let landmarks = landmarks
+            .with_eye_frames(&ids, &visible, width, height)
+            .with_torso_frame(&ids, &effective, width, height);
         let env = &rig::seams::pose_envelope().poses;
         let summary = rig::exposure::compute_exposure_map(
             &ids, &visible, &fills, &landmarks, width, height, env,
@@ -706,10 +713,16 @@ async fn build_rig(
             };
             decoded.push((part, visible, fill));
         }
-        // T10: eye layers deform with the aperture lines of all visible eye masks.
+        // T10 + B2: eye layers deform with the aperture lines, hair blends to torso below chin.
         let ids: Vec<String> = decoded.iter().map(|(p, _, _)| p.id.clone()).collect();
         let vis: Vec<Vec<u8>> = decoded.iter().map(|(_, v, _)| v.clone()).collect();
-        let landmarks = landmarks.with_eye_frames(&ids, &vis, width, height);
+        let effs: Vec<Vec<u8>> = decoded
+            .iter()
+            .map(|(_, v, f)| core::effective_part_mask(v, f.as_deref()))
+            .collect();
+        let landmarks = landmarks
+            .with_eye_frames(&ids, &vis, width, height)
+            .with_torso_frame(&ids, &effs, width, height);
         for (part, visible, fill) in decoded {
             let effective = core::effective_part_mask(&visible, fill.as_deref());
             let mesh = core::art_mesh_for_part(&effective, width, height, 14, &part.id, &landmarks);

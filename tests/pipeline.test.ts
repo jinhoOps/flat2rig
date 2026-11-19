@@ -12,6 +12,10 @@ import {
   defaultEyeFrame,
   defaultLandmarks,
   deriveEyeFrames,
+  deriveTorsoFrame,
+  rigLandmarks,
+  torsoTopAt,
+  type TorsoFrameSample,
   isEyeInteriorLayer,
   EYE_LID_RAMP_ED,
   EYE_LID_REACH_ED,
@@ -67,6 +71,7 @@ import fillRadiusParity from "./fixtures/fill-radius-parity.json";
 import seamEnvelopeParity from "./fixtures/seam-envelope-parity.json";
 import eyeSealParity from "./fixtures/eye-seal-parity.json";
 import meshCoverageParity from "./fixtures/mesh-coverage-parity.json";
+import hairBodyParity from "./fixtures/hair-body-parity.json";
 import { POSE_ENVELOPE, POSE_ENVELOPE_RANGES } from "../src/rig/poseEnvelope";
 import {
   createCustomExpression,
@@ -2394,5 +2399,85 @@ describe("T10 sealed eye rig", () => {
         { eyeL_iris: "eyeL_white" },
       ),
     ).toEqual({});
+  });
+});
+
+describe("B2 hair_body seam coupling parity", () => {
+  it("matches Rust derive_torso_frame, seam_coupling_weights, and coupled deform on tilted head", () => {
+    const fx = hairBodyParity as unknown as {
+      width: number;
+      height: number;
+      landmarks: Landmarks;
+      torsoFrame: TorsoFrameSample[];
+      points: { id: string; point: [number, number] }[];
+      weights: {
+        id: string;
+        point: [number, number];
+        weights: { neckHead: number; neckBody: number; collar: number; hairRoot: number; hairBody: number };
+      }[];
+      cases: { pose: string; out: [number, number][] }[];
+    };
+    const { width: w, height: h } = fx;
+    const clothes = new Uint8Array(w * h);
+    const hands = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (y >= 152 && x >= 56 && x <= 208) clothes[y * w + x] = 255;
+        else if (y >= 146 && x >= 122 && x <= 156) clothes[y * w + x] = 255;
+        if (y >= 145 && y <= 192 && x >= 46 && x <= 92) hands[y * w + x] = 255;
+      }
+    }
+    // Scattered low-alpha noise (<128) above mouth must be ignored.
+    clothes[40 * w + 100] = 64;
+    hands[60 * w + 70] = 120;
+
+    const parts = [
+      { id: "clothes", mask: clothes },
+      { id: "hands", mask: hands },
+    ];
+    const frame = deriveTorsoFrame(fx.landmarks, parts, w, h);
+    expect(frame).toBeDefined();
+    expect(frame!.length).toBe(fx.torsoFrame.length);
+    for (let i = 0; i < frame!.length; i++) {
+      expect(Math.abs(frame![i].u - fx.torsoFrame[i].u), `u[${i}]`).toBeLessThan(1e-9);
+      expect(Math.abs(frame![i].top - fx.torsoFrame[i].top), `top[${i}]`).toBeLessThan(1e-9);
+    }
+    expect(torsoTopAt(frame!, frame![0].u - 50)).toBe(frame![0].top);
+    expect(torsoTopAt(frame!, frame![frame!.length - 1].u + 50)).toBe(
+      frame![frame!.length - 1].top,
+    );
+
+    const lm: RigLandmarks = rigLandmarks({ landmarks: fx.landmarks, parts, width: w, height: h });
+    expect(lm.torsoFrame?.length).toBe(fx.torsoFrame.length);
+
+    for (const wCase of fx.weights) {
+      const got = seamCouplingWeights(
+        { x: wCase.point[0], y: wCase.point[1] },
+        { id: wCase.id },
+        lm,
+      );
+      for (const k of ["neckHead", "neckBody", "collar", "hairRoot", "hairBody"] as const) {
+        expect(Math.abs(got[k] - wCase.weights[k]), `${wCase.id}.${k}`).toBeLessThan(1e-9);
+      }
+    }
+
+    for (const c of fx.cases) {
+      const pose = POSE_ENVELOPE.find((p) => p.name === c.pose)!;
+      expect(pose, c.pose).toBeDefined();
+      fx.points.forEach((pt, i) => {
+        const q = deform({ x: pt.point[0], y: pt.point[1] }, { id: pt.id }, lm, pose.params);
+        expect(
+          Math.abs(q.x - c.out[i][0]) + Math.abs(q.y - c.out[i][1]),
+          `${c.pose} ${pt.id}`,
+        ).toBeLessThan(1e-6);
+      });
+    }
+
+    // Role-based coupling works for non-`hair*` IDs with explicit hair roles.
+    const customPt = { x: 180, y: 175 };
+    const wCustom = seamCouplingWeights(customPt, { id: "custom_lock", role: "hair_side_L" }, lm);
+    const wStd = seamCouplingWeights(customPt, { id: "hair_side_L" }, lm);
+    expect(wCustom.hairBody).toBeCloseTo(wStd.hairBody, 9);
+    expect(wCustom.hairBody).toBeGreaterThan(0.5);
   });
 });
