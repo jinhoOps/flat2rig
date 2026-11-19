@@ -722,8 +722,233 @@ function chamferBoundaryDistance(
   return dist;
 }
 
+/**
+ * B4: the ArtMesh outline sits this many pixels (Chebyshev) outside every texel with alpha > 0
+ * (Rust `core::MESH_SUPPORT_RADIUS`), so anti-aliased edges keep their bilinear falloff.
+ */
+export const MESH_SUPPORT_RADIUS = 2;
+
+function dilateChebyshev(src: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  if (r === 0 || w === 0 || h === 0) return src.slice();
+  const rows = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const lo = Math.max(0, x - r);
+      const hi = Math.min(w - 1, x + r);
+      for (let xx = lo; xx <= hi; xx++) {
+        if (src[y * w + xx]) {
+          rows[y * w + x] = 1;
+          break;
+        }
+      }
+    }
+  }
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const lo = Math.max(0, y - r);
+    const hi = Math.min(h - 1, y + r);
+    for (let x = 0; x < w; x++) {
+      for (let yy = lo; yy <= hi; yy++) {
+        if (rows[yy * w + x]) {
+          out[y * w + x] = 1;
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** B4: alpha > 0 (visible + hidden, AA edges included) grown by `MESH_SUPPORT_RADIUS`, as 0 / 255. */
+export function meshSupportMask(mask: Uint8Array, w: number, h: number): Uint8Array {
+  const base = new Uint8Array(mask.length);
+  for (let i = 0; i < mask.length; i++) base[i] = mask[i] > 0 ? 1 : 0;
+  const d = dilateChebyshev(base, w, h, MESH_SUPPORT_RADIUS);
+  for (let i = 0; i < d.length; i++) d[i] = d[i] ? 255 : 0;
+  return d;
+}
+
+/** B4: pixel centres a rest ArtMesh must cover — alpha > 0 texels and their 8-neighbours. */
+function meshCoverageTarget(mask: Uint8Array, w: number, h: number): Uint8Array {
+  const base = new Uint8Array(mask.length);
+  for (let i = 0; i < mask.length; i++) base[i] = mask[i] > 0 ? 1 : 0;
+  return dilateChebyshev(base, w, h, 1);
+}
+
+const RASTER_SUBPIXEL = 256;
+const roundAway = (v: number) => Math.sign(v) * Math.round(Math.abs(v));
+
+/**
+ * Pixel-centre coverage with the top-left fill rule on a 1/256 px integer grid — the same rule as
+ * Rust `rig::raster::rasterize_triangle` (and the GPU), so a pixel centre on an edge shared by two
+ * triangles belongs to exactly one. Calls `f(x, y)` for each covered pixel inside `w × h`.
+ */
+export function rasterizeTriangleTopLeft(
+  p0: Point,
+  p1: Point,
+  p2: Point,
+  w: number,
+  h: number,
+  f: (x: number, y: number) => void,
+): void {
+  if (w <= 0 || h <= 0) return;
+  for (const p of [p0, p1, p2]) if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+  const sub = RASTER_SUBPIXEL;
+  const v = [p0, p1, p2].map((p) => [roundAway(p.x * sub), roundAway(p.y * sub)]);
+  const edge = (a: number[], b: number[], px: number, py: number) =>
+    (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+  let area = edge(v[0], v[1], v[2][0], v[2][1]);
+  if (area === 0) return;
+  if (area < 0) {
+    const t = v[1];
+    v[1] = v[2];
+    v[2] = t;
+    area = -area;
+  }
+  const minX = Math.min(v[0][0], v[1][0], v[2][0]);
+  const maxX = Math.max(v[0][0], v[1][0], v[2][0]);
+  const minY = Math.min(v[0][1], v[1][1], v[2][1]);
+  const maxY = Math.max(v[0][1], v[1][1], v[2][1]);
+  const half = sub / 2;
+  const x0 = Math.max(0, Math.floor((minX - half) / sub));
+  const x1 = Math.min(w - 1, Math.floor((maxX - half) / sub) + 1);
+  const y0 = Math.max(0, Math.floor((minY - half) / sub));
+  const y1 = Math.min(h - 1, Math.floor((maxY - half) / sub) + 1);
+  if (x0 > x1 || y0 > y1) return;
+  const edges = [
+    [v[1], v[2]],
+    [v[2], v[0]],
+    [v[0], v[1]],
+  ];
+  const bias = edges.map(([a, b]) => {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    return (dy === 0 && dx > 0) || dy < 0 ? 0 : -1;
+  });
+  for (let y = y0; y <= y1; y++) {
+    const cy = y * sub + half;
+    for (let x = x0; x <= x1; x++) {
+      const cx = x * sub + half;
+      let inside = true;
+      for (let k = 0; k < 3; k++) {
+        if (edge(edges[k][0], edges[k][1], cx, cy) + bias[k] < 0) {
+          inside = false;
+          break;
+        }
+      }
+      if (inside) f(x, y);
+    }
+  }
+}
+
+/** Delaunay triangulation with the ArtMesh sliver / hole filter (Rust `triangulate_filtered`). */
+function triangulateFiltered(
+  points: Point[],
+  valid: (x: number, y: number) => boolean,
+  span: number,
+  ringStep: number,
+): { tris: number[]; keep: boolean[] } {
+  const d = Delaunator.from(
+    points,
+    (p) => p.x,
+    (p) => p.y,
+  );
+  const tris = Array.from(d.triangles);
+  const thinPart = points.length < 40;
+  const maxEdge = thinPart
+    ? Math.max(18, span * 0.9)
+    : Math.max(18, ringStep * 2.75);
+  const minCov = thinPart ? 52 : 68;
+  const keep: boolean[] = [];
+  for (let t = 0; t < tris.length; t += 3) {
+    const a = points[tris[t]],
+      b = points[tris[t + 1]],
+      c = points[tris[t + 2]];
+    keep.push(triangleKept(a, b, c, valid, thinPart, maxEdge, minCov));
+  }
+  return { tris, keep };
+}
+
+function triangleKept(
+  a: Point,
+  b: Point,
+  c: Point,
+  valid: (x: number, y: number) => boolean,
+  thinPart: boolean,
+  maxEdge: number,
+  minCov: number,
+): boolean {
+  const edgeLen = Math.max(
+    Math.hypot(a.x - b.x, a.y - b.y),
+    Math.hypot(a.x - c.x, a.y - c.y),
+    Math.hypot(b.x - c.x, b.y - c.y),
+  );
+  if (edgeLen > maxEdge) return false;
+  const minAspect = thinPart ? 0.025 : 0.048;
+  const cross = Math.abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
+  if (cross < minAspect * edgeLen * edgeLen) return false;
+  const cx = (a.x + b.x + c.x) / 3,
+    cy = (a.y + b.y + c.y) / 3;
+  if (
+    !valid(cx, cy) ||
+    !valid(a.x * 0.5 + b.x * 0.25 + c.x * 0.25, a.y * 0.5 + b.y * 0.25 + c.y * 0.25) ||
+    !valid(a.x * 0.25 + b.x * 0.5 + c.x * 0.25, a.y * 0.25 + b.y * 0.5 + c.y * 0.25) ||
+    !valid(a.x * 0.25 + b.x * 0.25 + c.x * 0.5, a.y * 0.25 + b.y * 0.25 + c.y * 0.5)
+  )
+    return false;
+  const steps = 4;
+  let total = 0,
+    validSamples = 0;
+  for (let u = 0; u <= steps; u++)
+    for (let v = 0; v <= steps - u; v++) {
+      total++;
+      const x = a.x + ((b.x - a.x) * u) / steps + ((c.x - a.x) * v) / steps,
+        y = a.y + ((b.y - a.y) * u) / steps + ((c.y - a.y) * v) / steps;
+      if (valid(x, y)) validSamples++;
+    }
+  return validSamples * 100 >= total * minCov;
+}
+
+/** B4: coverage-target pixels inside the box that no kept triangle covers (Rust `uncovered_target_pixels`). */
+function uncoveredTargetPixels(
+  points: Point[],
+  tris: number[],
+  keep: boolean[],
+  target: Uint8Array,
+  box: { left: number; right: number; top: number; bottom: number },
+  w: number,
+  h: number,
+): Uint8Array {
+  const covered = new Uint8Array(w * h);
+  for (let t = 0; t < keep.length; t++) {
+    if (!keep[t]) continue;
+    rasterizeTriangleTopLeft(
+      points[tris[t * 3]],
+      points[tris[t * 3 + 1]],
+      points[tris[t * 3 + 2]],
+      w,
+      h,
+      (x, y) => {
+        covered[y * w + x] = 1;
+      },
+    );
+  }
+  const missed = new Uint8Array(w * h);
+  for (let y = box.top; y <= box.bottom; y++)
+    for (let x = box.left; x <= box.right; x++) {
+      const i = y * w + x;
+      missed[i] = target[i] && !covered[i] ? 1 : 0;
+    }
+  return missed;
+}
+
+/**
+ * Builds an ArtMesh over the B4 support of `alphaMask` (alpha > 0 grown by `MESH_SUPPORT_RADIUS`);
+ * mirrors Rust `core::build_art_mesh` including the coverage refinement, so the rest mesh covers
+ * every alpha > 0 texel.
+ */
 function buildArtMesh(
-  mask: Uint8Array,
+  alphaMask: Uint8Array,
   w: number,
   h: number,
   density: number,
@@ -731,6 +956,8 @@ function buildArtMesh(
   lm?: Landmarks,
   anchors: Point[] = [],
 ): Mesh {
+  const target = meshCoverageTarget(alphaMask, w, h);
+  const mask = meshSupportMask(alphaMask, w, h);
   const box = bounds(mask, w, h);
   if (!box) return { vertices: [], triangles: [], uv: [] };
   const left = box.left;
@@ -1045,62 +1272,45 @@ function buildArtMesh(
   if (points.length < 3) {
     return { vertices: [], triangles: [], uv: [] };
   }
-  const d = Delaunator.from(
-    points,
-    (p) => p.x,
-    (p) => p.y,
-  );
-  const tris: number[] = [];
-  const thinPart = points.length < 40;
-  const maxEdge = thinPart
-    ? Math.max(18, span * 0.9)
-    : Math.max(18, ringStep * 2.75);
-  const minCov = thinPart ? 52 : 68;
-  for (let t = 0; t < d.triangles.length; t += 3) {
-    const ids = [d.triangles[t], d.triangles[t + 1], d.triangles[t + 2]];
-    const a = points[ids[0]],
-      b = points[ids[1]],
-      c = points[ids[2]];
-    const edgeLen = Math.max(
-      Math.hypot(a.x - b.x, a.y - b.y),
-      Math.hypot(a.x - c.x, a.y - c.y),
-      Math.hypot(b.x - c.x, b.y - c.y),
-    );
-    if (edgeLen > maxEdge) continue;
-    const minAspect = thinPart ? 0.025 : 0.048;
-    const cross = Math.abs(
-      (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x),
-    );
-    if (cross < minAspect * edgeLen * edgeLen) continue;
-    const cx = (a.x + b.x + c.x) / 3,
-      cy = (a.y + b.y + c.y) / 3;
-    if (
-      !valid(cx, cy) ||
-      !valid(
-        a.x * 0.5 + b.x * 0.25 + c.x * 0.25,
-        a.y * 0.5 + b.y * 0.25 + c.y * 0.25,
-      ) ||
-      !valid(
-        a.x * 0.25 + b.x * 0.5 + c.x * 0.25,
-        a.y * 0.25 + b.y * 0.5 + c.y * 0.25,
-      ) ||
-      !valid(
-        a.x * 0.25 + b.x * 0.25 + c.x * 0.5,
-        a.y * 0.25 + b.y * 0.25 + c.y * 0.5,
-      )
-    )
-      continue;
-    const steps = 4;
-    let total = 0,
-      validSamples = 0;
-    for (let u = 0; u <= steps; u++)
-      for (let v = 0; v <= steps - u; v++) {
-        total++;
-        const x = a.x + ((b.x - a.x) * u) / steps + ((c.x - a.x) * v) / steps,
-          y = a.y + ((b.y - a.y) * u) / steps + ((c.y - a.y) * v) / steps;
-        if (valid(x, y)) validSamples++;
+  let { tris: allTris, keep } = triangulateFiltered(points, valid, span, ringStep);
+  // B4 refinement (Rust `build_art_mesh`): add raw contour points near missed coverage-target
+  // pixels and triangulate again; at most two rounds.
+  const box4 = { left, right, top, bottom };
+  for (let round = 0; round < 2; round++) {
+    const missed = uncoveredTargetPixels(points, allTris, keep, target, box4, w, h);
+    if (!missed.some((m) => m)) break;
+    const near = dilateChebyshev(missed, w, h, 3);
+    const before = points.length;
+    for (const loop of rawLoops) {
+      for (const pt of loop.pts) {
+        if (near[Math.floor(pt.y) * w + Math.floor(pt.x)]) pushIfFar(pt.x, pt.y, 0.6 * 0.6, null);
       }
-    if (validSamples * 100 >= total * minCov) tris.push(...ids);
+    }
+    if (points.length === before) break;
+    ({ tris: allTris, keep } = triangulateFiltered(points, valid, span, ringStep));
+  }
+  // Last resort: keep the Delaunay triangle owning a still-uncovered target pixel centre.
+  const missed = uncoveredTargetPixels(points, allTris, keep, target, box4, w, h);
+  if (missed.some((m) => m)) {
+    for (let t = 0; t < keep.length; t++) {
+      if (keep[t]) continue;
+      let owns = false;
+      rasterizeTriangleTopLeft(
+        points[allTris[t * 3]],
+        points[allTris[t * 3 + 1]],
+        points[allTris[t * 3 + 2]],
+        w,
+        h,
+        (x, y) => {
+          if (missed[y * w + x]) owns = true;
+        },
+      );
+      if (owns) keep[t] = true;
+    }
+  }
+  const tris: number[] = [];
+  for (let t = 0; t < keep.length; t++) {
+    if (keep[t]) tris.push(allTris[t * 3], allTris[t * 3 + 1], allTris[t * 3 + 2]);
   }
 
   const remap = new Int32Array(points.length).fill(-1);
@@ -1167,14 +1377,14 @@ function triCross(a: Point, b: Point, c: Point): number {
 
 export function checkMeshQuality(
   mesh: Mesh,
-  mask: Uint8Array,
+  alphaMask: Uint8Array,
   w: number,
   h: number,
   part: Pick<Part, "id">,
   lm: Landmarks,
 ): MeshQualityReport {
   const triCount = Math.floor(mesh.triangles.length / 3);
-  const hasPixels = mask.some((a) => a > 8);
+  const hasPixels = alphaMask.some((a) => a > 0);
   if (!triCount || !mesh.vertices.length) {
     return {
       partId: part.id,
@@ -1188,6 +1398,8 @@ export function checkMeshQuality(
         : [],
     };
   }
+  // B4: hole crossings are judged against the mesh support (Rust `check_mesh_quality`).
+  const mask = meshSupportMask(alphaMask, w, h);
   const validPx = (x: number, y: number) => {
     const px = x + 1e-6,
       py = y + 1e-6;

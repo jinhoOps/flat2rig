@@ -657,6 +657,142 @@ pub fn mesh_for_with_anchors(
     build_art_mesh(mask, w, h, density, ArtMeshRole::Generic, None, anchors)
 }
 
+/// B4: the ArtMesh outline sits this many pixels (Chebyshev) outside every texel with alpha > 0, so
+/// a part's anti-aliased edge and faint strokes keep their bilinear falloff into transparent texels
+/// instead of being cut by the mesh boundary (mirrored by `MESH_SUPPORT_RADIUS` in `src/engine.ts`).
+pub const MESH_SUPPORT_RADIUS: usize = 2;
+
+/// `src` dilated by `r` pixels (Chebyshev, separable max filter).
+fn dilate_chebyshev(src: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+    if r == 0 || w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let mut rows = vec![false; w * h];
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            let (lo, hi) = (x.saturating_sub(r), (x + r).min(w - 1));
+            rows[y * w + x] = row[lo..=hi].iter().any(|&v| v);
+        }
+    }
+    let mut out = vec![false; w * h];
+    for y in 0..h {
+        let (lo, hi) = (y.saturating_sub(r), (y + r).min(h - 1));
+        for x in 0..w {
+            out[y * w + x] = (lo..=hi).any(|yy| rows[yy * w + x]);
+        }
+    }
+    out
+}
+
+/// B4: the mask an ArtMesh is built on — every texel with alpha > 0 (visible + hidden, including
+/// anti-aliased edges) grown by [`MESH_SUPPORT_RADIUS`], as `0` / `255`.
+pub fn mesh_support_mask(mask: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let base: Vec<bool> = mask.iter().map(|&a| a > 0).collect();
+    dilate_chebyshev(&base, w, h, MESH_SUPPORT_RADIUS)
+        .into_iter()
+        .map(|b| if b { 255 } else { 0 })
+        .collect()
+}
+
+/// B4: pixel centres an ArtMesh must cover at rest — alpha > 0 texels and their 8-neighbours (the
+/// bilinear footprint of the edge texels).
+fn mesh_coverage_target(mask: &[u8], w: usize, h: usize) -> Vec<bool> {
+    let base: Vec<bool> = mask.iter().map(|&a| a > 0).collect();
+    dilate_chebyshev(&base, w, h, 1)
+}
+
+/// Delaunay triangulation of `verts` with the ArtMesh sliver / hole filter: returns every Delaunay
+/// triangle and whether the filter keeps it.
+fn triangulate_filtered(
+    verts: &[Point],
+    valid: &dyn Fn(DVec2) -> bool,
+    span: f64,
+    ring_step: f64,
+) -> (Vec<[usize; 3]>, Vec<bool>) {
+    let points: Vec<_> = verts.iter().map(|p| delaunator::Point { x: p.x, y: p.y }).collect();
+    let result = delaunator::triangulate(&points);
+    let tris: Vec<[usize; 3]> = result.triangles.as_chunks::<3>().0.to_vec();
+    let thin_part = verts.len() < 40;
+    let max_edge = if thin_part {
+        (span * 0.90).max(18.0)
+    } else {
+        (ring_step * 2.75).max(18.0)
+    };
+    let min_cov = if thin_part { 52 } else { 68 };
+    let keep = tris
+        .iter()
+        .map(|ids| {
+            let a = verts[ids[0]].v();
+            let b = verts[ids[1]].v();
+            let c = verts[ids[2]].v();
+            let max_e = a.distance(b).max(a.distance(c)).max(b.distance(c));
+            if max_e > max_edge {
+                return false;
+            }
+            let min_aspect = if thin_part { 0.025 } else { 0.048 };
+            let cross = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs();
+            if cross < min_aspect * max_e * max_e {
+                return false;
+            }
+            let centroid = (a + b + c) / 3.0;
+            let q1 = a * 0.5 + b * 0.25 + c * 0.25;
+            let q2 = a * 0.25 + b * 0.5 + c * 0.25;
+            let q3 = a * 0.25 + b * 0.25 + c * 0.5;
+            if !valid(centroid) || !valid(q1) || !valid(q2) || !valid(q3) {
+                return false;
+            }
+            let steps: usize = 4;
+            let mut total = 0usize;
+            let mut valid_samples = 0usize;
+            for u in 0..=steps {
+                for v in 0..=steps - u {
+                    total += 1;
+                    let p = a + (b - a) * (u as f64 / steps as f64) + (c - a) * (v as f64 / steps as f64);
+                    if valid(p) {
+                        valid_samples += 1;
+                    }
+                }
+            }
+            valid_samples * 100 >= total * min_cov
+        })
+        .collect();
+    (tris, keep)
+}
+
+/// B4: coverage-target pixels (inside `bbox` = `(left, right, top, bottom)`) whose centre no kept
+/// triangle covers under the renderer's top-left rule, as a full-canvas flag grid.
+fn uncovered_target_pixels(
+    verts: &[Point],
+    tris: &[[usize; 3]],
+    keep: &[bool],
+    target: &[bool],
+    bbox: (usize, usize, usize, usize),
+    w: usize,
+    h: usize,
+) -> Vec<bool> {
+    let (left, right, top, bottom) = bbox;
+    let mut covered = vec![false; w * h];
+    for (ids, &k) in tris.iter().zip(keep) {
+        if k {
+            let tri = [verts[ids[0]], verts[ids[1]], verts[ids[2]]];
+            crate::rig::raster::rasterize_triangle(tri, w, h, |x, y, _| covered[y * w + x] = true);
+        }
+    }
+    let mut missed = vec![false; w * h];
+    for y in top..=bottom {
+        for x in left..=right {
+            let i = y * w + x;
+            missed[i] = target[i] && !covered[i];
+        }
+    }
+    missed
+}
+
+/// Builds an ArtMesh over the B4 support of `mask` (alpha > 0 grown by [`MESH_SUPPORT_RADIUS`]).
+/// After the usual contour / role / Delaunay construction and sliver filtering, any Delaunay
+/// triangle that owns (top-left rule, `rig::raster::rasterize_triangle`) an uncovered pixel centre of
+/// the coverage target is kept, so the rest mesh covers every alpha > 0 texel.
 fn build_art_mesh(
     mask: &[u8],
     w: usize,
@@ -666,6 +802,9 @@ fn build_art_mesh(
     lm: Option<&Landmarks>,
     anchors: &[Point],
 ) -> Mesh {
+    let target = mesh_coverage_target(mask, w, h);
+    let support = mesh_support_mask(mask, w, h);
+    let mask: &[u8] = &support;
     let mut mesh = Mesh {
         vertices: Vec::new(),
         triangles: Vec::new(),
@@ -1088,54 +1227,48 @@ fn build_art_mesh(
 
     // 5. Delaunay triangulation + strict hole-safe sliver filtering + orphan vertex compaction.
     if mesh.vertices.len() >= 3 {
-        let points: Vec<_> = mesh
-            .vertices
-            .iter()
-            .map(|p| delaunator::Point { x: p.x, y: p.y })
-            .collect();
-        let result = delaunator::triangulate(&points);
-        let thin_part = mesh.vertices.len() < 40;
-        let max_edge = if thin_part {
-            (span * 0.90).max(18.0)
-        } else {
-            (ring_step * 2.75).max(18.0)
-        };
-        let min_cov = if thin_part { 52 } else { 68 };
-        for ids in result.triangles.as_chunks::<3>().0 {
-            let a = mesh.vertices[ids[0]].v();
-            let b = mesh.vertices[ids[1]].v();
-            let c = mesh.vertices[ids[2]].v();
-            let max_e = a.distance(b).max(a.distance(c)).max(b.distance(c));
-            if max_e > max_edge {
-                continue;
+        let (mut tris, mut keep) = triangulate_filtered(&mesh.vertices, &valid, span, ring_step);
+        // B4 refinement: where the smoothed / resampled contour cut a corner or a thin strand off
+        // the coverage target, add the raw contour points (pixel-crack trace of the support, which
+        // encloses every target pixel centre) near the missed pixels and triangulate again.
+        let bbox = (left, right, top, bottom);
+        for _ in 0..2 {
+            let missed = uncovered_target_pixels(&mesh.vertices, &tris, &keep, &target, bbox, w, h);
+            if missed.is_empty() {
+                break;
             }
-            let min_aspect = if thin_part { 0.025 } else { 0.048 };
-            let cross = ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs();
-            if cross < min_aspect * max_e * max_e {
-                continue;
-            }
-            let centroid = (a + b + c) / 3.0;
-            let q1 = a * 0.5 + b * 0.25 + c * 0.25;
-            let q2 = a * 0.25 + b * 0.5 + c * 0.25;
-            let q3 = a * 0.25 + b * 0.25 + c * 0.5;
-            if !valid(centroid) || !valid(q1) || !valid(q2) || !valid(q3) {
-                continue;
-            }
-            let steps: usize = 4;
-            let mut total = 0usize;
-            let mut valid_samples = 0usize;
-            for u in 0..=steps {
-                for v in 0..=steps - u {
-                    total += 1;
-                    let p = a
-                        + (b - a) * (u as f64 / steps as f64)
-                        + (c - a) * (v as f64 / steps as f64);
-                    if valid(p) {
-                        valid_samples += 1;
+            let near = dilate_chebyshev(&missed, w, h, 3);
+            let before = mesh.vertices.len();
+            for (raw_pts, _) in &raw_loops {
+                for &pt in raw_pts {
+                    if near[pt.y as usize * w + pt.x as usize] {
+                        push_if_far(&mut mesh.vertices, &mut vert_normals, pt, 0.6 * 0.6, None);
                     }
                 }
             }
-            if valid_samples * 100 >= total * min_cov {
+            if mesh.vertices.len() == before {
+                break;
+            }
+            (tris, keep) = triangulate_filtered(&mesh.vertices, &valid, span, ring_step);
+        }
+        // Last resort: the Delaunay triangles partition their hull, so keep the triangle that owns
+        // a still-uncovered target pixel centre (top-left rule, `rig::raster::rasterize_triangle`).
+        let missed = uncovered_target_pixels(&mesh.vertices, &tris, &keep, &target, bbox, w, h);
+        if missed.iter().any(|&m| m) {
+            for (ti, ids) in tris.iter().enumerate() {
+                if keep[ti] {
+                    continue;
+                }
+                let tri = [mesh.vertices[ids[0]], mesh.vertices[ids[1]], mesh.vertices[ids[2]]];
+                let mut owns = false;
+                crate::rig::raster::rasterize_triangle(tri, w, h, |x, y, _| owns |= missed[y * w + x]);
+                if owns {
+                    keep[ti] = true;
+                }
+            }
+        }
+        for (ids, &k) in tris.iter().zip(&keep) {
+            if k {
                 mesh.triangles.extend_from_slice(ids);
             }
         }
@@ -2661,6 +2794,8 @@ fn tri_cross(a: DVec2, b: DVec2, c: DVec2) -> f64 {
 }
 
 /// Checks triangle hole crossings, excessive aspect elongation, and extreme-pose flips.
+/// Hole crossings are judged against the B4 mesh support (`mesh_support_mask`), the region the
+/// ArtMesh is built to cover; `mask` is the part's effective alpha.
 pub fn check_mesh_quality(
     mesh: &Mesh,
     mask: &[u8],
@@ -2671,7 +2806,7 @@ pub fn check_mesh_quality(
 ) -> MeshQualityReport {
     let tris = mesh.triangles.as_chunks::<3>().0;
     let triangle_count = tris.len();
-    let has_pixels = mask.iter().any(|&a| a > 8);
+    let has_pixels = mask.iter().any(|&a| a > 0);
     if triangle_count == 0 || mesh.vertices.is_empty() {
         return MeshQualityReport {
             part_id: id.to_string(),
@@ -2687,6 +2822,8 @@ pub fn check_mesh_quality(
             },
         };
     }
+    let support = mesh_support_mask(mask, w, h);
+    let mask: &[u8] = &support;
 
     let valid_px = |p: DVec2| {
         let px = p.x + 1e-6;
@@ -2850,11 +2987,24 @@ mod tests {
         }
         let mesh = mesh_for(&mask, 32, 32, 14);
         assert!(!mesh.triangles.is_empty());
+        // B4: the mesh extends `MESH_SUPPORT_RADIUS` px into the hole (transparent margin for the
+        // anti-aliased edge) but never across the rest of it.
+        let support = mesh_support_mask(&mask, 32, 32);
         for t in mesh.triangles.as_chunks::<3>().0 {
             let p =
                 (mesh.vertices[t[0]].v() + mesh.vertices[t[1]].v() + mesh.vertices[t[2]].v()) / 3.;
-            assert!(mask[p.y as usize * 32 + p.x as usize] > 0);
+            assert!(support[p.y as usize * 32 + p.x as usize] > 0);
         }
+        let mut hole_drawn = 0;
+        for t in mesh.triangles.as_chunks::<3>().0 {
+            let tri = [mesh.vertices[t[0]], mesh.vertices[t[1]], mesh.vertices[t[2]]];
+            crate::rig::raster::rasterize_triangle(tri, 32, 32, |x, y, _| {
+                if (13..19).contains(&x) && (13..19).contains(&y) {
+                    hole_drawn += 1;
+                }
+            });
+        }
+        assert_eq!(hole_drawn, 0, "mesh covers the hole centre");
     }
     #[test]
     fn contour_mesh_covers_boundary_and_passes_extreme_pose_quality() {
@@ -3207,6 +3357,83 @@ mod tests {
         assert!(lid_report.triangle_count >= 12);
         assert_eq!(lid_report.hole_crossings, 0);
         assert_eq!(lid_report.flipped_at_extremes, 0);
+    }
+
+    /// B4: at rest an ArtMesh covers every texel with alpha > 0 (anti-aliased edges, faint strokes,
+    /// isolated specks, thin strands, holes) plus its 8-neighbours, each pixel centre exactly once
+    /// under the renderer's top-left rule — for every mesh role.
+    #[test]
+    fn art_mesh_covers_every_alpha_texel_once_for_every_role() {
+        let (w, h) = (96usize, 96usize);
+        let mut mask = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+                // Disk with a 3px anti-aliased falloff and a hole with its own AA ring.
+                let r = ((fx - 34.0).powi(2) + (fy - 40.0).powi(2)).sqrt();
+                let disk = ((22.0 - r) / 3.0).clamp(0.0, 1.0) * ((r - 6.0) / 2.0).clamp(0.0, 1.0);
+                // A comb of 1–2px strands (hair tips) with faint alpha, 3px apart.
+                let strand = if (62..86).contains(&x) && x % 4 == 0 && y > 10 + x / 4 && y < 80 {
+                    if y > 70 { 0.04 } else { 0.6 }
+                } else {
+                    0.0
+                };
+                // A faint 1px diagonal stroke.
+                let stroke = if (x as i64 - y as i64) == 20 && (8..40).contains(&y) { 0.02 } else { 0.0 };
+                let a = disk.max(strand).max(stroke);
+                mask[y * w + x] = (a * 255.0).round() as u8;
+            }
+        }
+        // Isolated specks of alpha 1–3.
+        for (i, &(x, y)) in [(5usize, 5usize), (90, 6), (8, 88), (70, 90)].iter().enumerate() {
+            mask[y * w + x] = 1 + i as u8 % 3;
+        }
+        let l = Landmarks {
+            eye_l: Point { x: 44., y: 36. },
+            eye_r: Point { x: 24., y: 36. },
+            mouth: Point { x: 34., y: 50. },
+            chin: Point { x: 34., y: 60. },
+            crown: Point { x: 34., y: 18. },
+            eye_frames: None,
+        };
+        let target = mesh_coverage_target(&mask, w, h);
+        let mut parity_meshes = Vec::new();
+        for id in ["face", "hair_front", "eyeL_iris", "eyeL_white", "eyeL_upper", "browL", "clothes", ""] {
+            let mesh = if id.is_empty() { mesh_for(&mask, w, h, 14) } else { art_mesh_for_part(&mask, w, h, 14, id, &l) };
+            parity_meshes.push(serde_json::json!({
+                "id": id,
+                "vertices": mesh.vertices.iter().map(|v| [v.x, v.y]).collect::<Vec<_>>(),
+                "triangles": mesh.triangles,
+            }));
+            let mut count = vec![0u32; w * h];
+            for t in mesh.triangles.as_chunks::<3>().0 {
+                let tri = [mesh.vertices[t[0]], mesh.vertices[t[1]], mesh.vertices[t[2]]];
+                crate::rig::raster::rasterize_triangle(tri, w, h, |x, y, _| count[y * w + x] += 1);
+            }
+            assert!(count.iter().all(|&c| c <= 1), "{id}: overlapping triangles");
+            let missed_alpha = (0..w * h).filter(|&i| mask[i] > 0 && count[i] == 0).count();
+            let missed_target = (0..w * h).filter(|&i| target[i] && count[i] == 0).count();
+            assert_eq!(missed_alpha, 0, "{id}: {missed_alpha} alpha > 0 texels outside the mesh");
+            assert_eq!(missed_target, 0, "{id}: {missed_target} edge-footprint texels outside the mesh");
+            // No last-resort triangle spanning a gap was needed.
+            let q = check_mesh_quality(&mesh, &mask, w, h, if id.is_empty() { "generic" } else { id }, &l);
+            assert_eq!(q.hole_crossings, 0, "{id}: hole-crossing triangles");
+        }
+        // Rust/TS parity fixture (`tests/pipeline.test.ts` rebuilds the same meshes with `engine.ts`).
+        let doc = serde_json::json!({
+            "description": "B4 Rust/TS ArtMesh parity: core::art_mesh_for_part / mesh_for over a mask with AA edges, a hole, faint strands, a faint stroke and specks (alpha > 0 pixels as [index, alpha]); TS meshForPart / meshFor must return the same vertices and triangles and cover every alpha > 0 texel.",
+            "width": w,
+            "height": h,
+            "alpha": mask.iter().enumerate().filter(|(_, &a)| a > 0).map(|(i, &a)| [i as u32, a as u32]).collect::<Vec<_>>(),
+            "landmarks": l,
+            "meshes": parity_meshes,
+        });
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/mesh-coverage-parity.json");
+        if std::env::var("FLAT2RIG_BLESS").is_ok() {
+            std::fs::write(&path, serde_json::to_string(&doc).unwrap() + "\n").unwrap();
+        }
+        let fixture = std::fs::read_to_string(&path).expect("mesh parity fixture present").replace("\r\n", "\n");
+        assert_eq!(fixture, serde_json::to_string(&doc).unwrap() + "\n", "mesh parity fixture drifted (re-bless with FLAT2RIG_BLESS=1)");
     }
 
     #[test]

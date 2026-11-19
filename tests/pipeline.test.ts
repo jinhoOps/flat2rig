@@ -21,6 +21,8 @@ import {
   foregroundMask,
   meshFor,
   meshForPart,
+  rasterizeTriangleTopLeft,
+  meshSupportMask,
   paint,
   maxSeamRelativeDisplacement,
   partOverlapMargins,
@@ -64,6 +66,7 @@ import {
 import fillRadiusParity from "./fixtures/fill-radius-parity.json";
 import seamEnvelopeParity from "./fixtures/seam-envelope-parity.json";
 import eyeSealParity from "./fixtures/eye-seal-parity.json";
+import meshCoverageParity from "./fixtures/mesh-coverage-parity.json";
 import { POSE_ENVELOPE, POSE_ENVELOPE_RANGES } from "../src/rig/poseEnvelope";
 import {
   createCustomExpression,
@@ -189,12 +192,22 @@ describe("image partition and editing invariants", () => {
       for (let x = 10; x < 22; x++) mask[y * 32 + x] = 0;
     const m = meshFor(mask, 32, 32);
     expect(m.triangles.length).toBeGreaterThan(0);
+    // B4: the mesh reaches MESH_SUPPORT_RADIUS px into the hole (transparent AA margin), never across it.
+    const support = meshSupportMask(mask, 32, 32);
     for (let i = 0; i < m.triangles.length; i += 3) {
       const pts = m.triangles.slice(i, i + 3).map((j) => m.vertices[j]);
       const x = Math.floor(pts.reduce((n, p) => n + p.x, 0) / 3),
         y = Math.floor(pts.reduce((n, p) => n + p.y, 0) / 3);
-      expect(mask[y * 32 + x]).toBe(255);
+      expect(support[y * 32 + x]).toBe(255);
     }
+    let holeDrawn = 0;
+    for (let i = 0; i < m.triangles.length; i += 3) {
+      const [a, b, c] = m.triangles.slice(i, i + 3).map((j) => m.vertices[j]);
+      rasterizeTriangleTopLeft(a, b, c, 32, 32, (x, y) => {
+        if (x >= 13 && x < 19 && y >= 13 && y < 19) holeDrawn++;
+      });
+    }
+    expect(holeDrawn).toBe(0);
   });
   it("builds contour-aware part meshes that pass extreme-pose quality checks", () => {
     const mask = new Uint8Array(64 * 64);
@@ -283,13 +296,14 @@ describe("image partition and editing invariants", () => {
     }
     const mesh = meshFor(mask, w, h, 8);
     expect(mesh.triangles.length / 3).toBeGreaterThan(40);
+    const support = meshSupportMask(mask, w, h);
     for (let i = 0; i < mesh.triangles.length; i += 3) {
       const a = mesh.vertices[mesh.triangles[i]],
         b = mesh.vertices[mesh.triangles[i + 1]],
         c = mesh.vertices[mesh.triangles[i + 2]];
       const cx = Math.floor((a.x + b.x + c.x) / 3),
         cy = Math.floor((a.y + b.y + c.y) / 3);
-      expect(mask[cy * w + cx]).toBe(255);
+      expect(support[cy * w + cx]).toBe(255);
     }
   });
   it("deforms expanded body, eye, brow, mouth, and hair parameters accurately", () => {
@@ -958,6 +972,61 @@ describe("preserved part merging on regeneration", () => {
     // thin aperture corners: the corner moves down monotonically but at most 0.2 eye distances.
     expect(dCorner.y).toBeGreaterThanOrEqual(cornerTip.y - 1e-6);
     expect(dCorner.y - cornerTip.y).toBeLessThanOrEqual(dist * 0.2);
+  });
+
+  it("B4: ArtMesh matches the Rust parity fixture and covers every alpha > 0 texel once", () => {
+    const fx = meshCoverageParity as unknown as {
+      width: number;
+      height: number;
+      alpha: [number, number][];
+      landmarks: Landmarks;
+      meshes: { id: string; vertices: [number, number][]; triangles: number[] }[];
+    };
+    const { width: w, height: h } = fx;
+    const mask = new Uint8Array(w * h);
+    for (const [i, a] of fx.alpha) mask[i] = a;
+    expect(fx.meshes.length).toBe(8);
+    for (const expected of fx.meshes) {
+      const mesh = expected.id
+        ? meshForPart(mask, w, h, 14, fx.landmarks, expected.id)
+        : meshFor(mask, w, h, 14);
+      // Same geometry: the JS and Rust delaunator ports emit triangles in a different order (and
+      // compaction then numbers vertices differently), so compare vertex and triangle sets.
+      const key = (x: number, y: number) => `${x.toFixed(9)},${y.toFixed(9)}`;
+      const triSet = (pts: [number, number][], tris: number[]) => {
+        const out: string[] = [];
+        for (let t = 0; t < tris.length; t += 3) {
+          out.push([0, 1, 2].map((k) => key(...pts[tris[t + k]])).sort().join("|"));
+        }
+        return out.sort();
+      };
+      const pts: [number, number][] = mesh.vertices.map((v) => [v.x, v.y]);
+      expect(pts.map((p) => key(...p)).sort(), expected.id).toEqual(
+        expected.vertices.map((p) => key(...p)).sort(),
+      );
+      expect(triSet(pts, mesh.triangles), expected.id).toEqual(
+        triSet(expected.vertices, expected.triangles),
+      );
+      const count = new Uint8Array(w * h);
+      for (let t = 0; t < mesh.triangles.length; t += 3) {
+        rasterizeTriangleTopLeft(
+          mesh.vertices[mesh.triangles[t]],
+          mesh.vertices[mesh.triangles[t + 1]],
+          mesh.vertices[mesh.triangles[t + 2]],
+          w,
+          h,
+          (x, y) => {
+            count[y * w + x]++;
+          },
+        );
+      }
+      expect(count.every((c) => c <= 1), `${expected.id}: overlap`).toBe(true);
+      let missed = 0;
+      for (let i = 0; i < w * h; i++) if (mask[i] > 0 && count[i] === 0) missed++;
+      expect(missed, `${expected.id}: alpha > 0 texels outside the mesh`).toBe(0);
+      const q = checkMeshQuality(mesh, mask, w, h, { id: expected.id || "generic" }, fx.landmarks);
+      expect(q.holeCrossings, expected.id).toBe(0);
+    }
   });
 
   it("builds role-aware Cubism ArtMesh topology without orphan vertices or collapsing thin parts", () => {
