@@ -38,6 +38,7 @@ artifacts/
 # Local illustration references and generated Tauri schemas
 */sutteang/
 /ref/*
+tools/evaluation/*himikan*
 /src-tauri/gen/
 models/*.onnx
 models/*.dll
