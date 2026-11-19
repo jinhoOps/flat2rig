@@ -23,7 +23,12 @@ import {
   type PsdLayerNode,
   type PsdLayerPixels,
 } from "../psdLayers";
-import { interleavedParts, workingSize } from "../layerParts";
+import { interleavedParts, planParts, workingSize } from "../layerParts";
+import {
+  correctSeeThroughDrawOrder,
+  SEE_THROUGH_LICENSE_NOTE,
+  SEE_THROUGH_LIMITATIONS,
+} from "../seethrough";
 import { describeDynamicPart, PARENT_PART_DEFS, PART_DEFS } from "../types";
 import type { PsdSession } from "../layerProject";
 
@@ -104,13 +109,21 @@ export interface PsdMappingPanelProps {
   session: PsdSession;
   busy: boolean;
   onChange: (mappings: LayerMapping[]) => void;
+  onToggleSeeThroughOrder?: (apply: boolean) => void;
   onGenerate: () => void;
   onCancel: () => void;
 }
 
 type Filter = "all" | "todo" | "warn";
 
-export default function PsdMappingPanel({ session, busy, onChange, onGenerate, onCancel }: PsdMappingPanelProps) {
+export default function PsdMappingPanel({
+  session,
+  busy,
+  onChange,
+  onToggleSeeThroughOrder,
+  onGenerate,
+  onCancel,
+}: PsdMappingPanelProps) {
   const { psd, mappings } = session;
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<Filter>("all");
@@ -132,22 +145,48 @@ export default function PsdMappingPanel({ session, busy, onChange, onGenerate, o
   const included = mappings.filter((m) => m.include);
   const unassigned = included.filter((m) => !m.target);
   const nonNormal = mappings.filter((m) => m.blend);
+  const seeThroughOrder = useMemo(() => {
+    if (!psd.seeThrough) return null;
+    const rawOrder = planParts(psd, mappings).map((p) => p.id);
+    return correctSeeThroughDrawOrder(rawOrder);
+  }, [psd, mappings]);
+  const reorderedPartIds = useMemo(() => {
+    if (!seeThroughOrder) return new Set<string>();
+    return new Set([
+      ...seeThroughOrder.liftedAboveFace,
+      ...seeThroughOrder.eyeWhiteMovedBelowIris,
+    ]);
+  }, [seeThroughOrder]);
   /** Parts (top first) with their layer names. */
   const parts = useMemo(() => {
     const map = new Map<string, { id: string; layers: string[]; order: number; split: boolean }>();
     for (const m of mappings) {
       if (!m.include || !m.target) continue;
       const node = nodeByPath.get(m.path);
+      const lash = Boolean(m.lashSplit && /^eye(?:\{S\}|[LR])_upper$/.test(m.target));
       for (const id of expandTarget(m.target)) {
-        const e = map.get(id) ?? { id, layers: [], order: -1, split: false };
-        e.layers.push(node?.name ?? m.path);
-        e.order = Math.max(e.order, node?.order ?? -1);
-        if (m.target.includes("{S}")) e.split = true;
-        map.set(id, e);
+        const ids = lash ? [id, id.replace(/_upper$/, "_lower")] : [id];
+        for (const pid of ids) {
+          const e = map.get(pid) ?? { id: pid, layers: [], order: -1, split: false };
+          e.layers.push(node?.name ?? m.path);
+          e.order = Math.max(e.order, node?.order ?? -1);
+          if (m.target.includes("{S}")) e.split = true;
+          map.set(pid, e);
+        }
       }
     }
-    return [...map.values()].sort((a, b) => b.order - a.order || a.id.localeCompare(b.id));
-  }, [mappings, nodeByPath]);
+    const list = [...map.values()];
+    if (psd.seeThrough && session.applySeeThroughOrderFix && seeThroughOrder?.changed) {
+      const rank = new Map(seeThroughOrder.correctedOrder.map((id, idx) => [id, idx]));
+      return list.sort(
+        (a, b) =>
+          (rank.get(b.id) ?? -1) - (rank.get(a.id) ?? -1) ||
+          b.order - a.order ||
+          a.id.localeCompare(b.id),
+      );
+    }
+    return list.sort((a, b) => b.order - a.order || a.id.localeCompare(b.id));
+  }, [mappings, nodeByPath, psd.seeThrough, session.applySeeThroughOrderFix, seeThroughOrder]);
   const options = useMemo(() => {
     const current = mappings.map((m) => m.target).filter((t): t is string => !!t);
     const base = mappingTargetOptions([...current.filter((t) => !t.includes("{S}")), ...nextHairIds(current)]);
@@ -252,7 +291,17 @@ export default function PsdMappingPanel({ session, busy, onChange, onGenerate, o
           {psd.seeThrough ? " · See-through" : ""}
         </span>
         <span className="pm-meta" title="좌우(L/R)는 캐릭터 기준: 화면 오른쪽 = 캐릭터 왼쪽(L). 이름의 좌우 표기 대신 픽셀 위치로 정합니다.">
-          중심선 x {Math.round(session.midlineX)} ({session.suggestion.midlineSource === "face" ? "얼굴" : session.suggestion.midlineSource})
+          중심선 x {Math.round(session.midlineX)} (
+          {
+            {
+              face: "얼굴",
+              iris: "홍채",
+              eyewhite: "흰자",
+              composite: "전체",
+              canvas: "캔버스",
+            }[session.suggestion.midlineSource]
+          }
+          )
         </span>
         <span className="pm-spacer" />
         <div className="pm-filter" role="radiogroup" aria-label="레이어 필터">
@@ -276,6 +325,54 @@ export default function PsdMappingPanel({ session, busy, onChange, onGenerate, o
           ))}
         </div>
       </header>
+      {psd.seeThrough && (
+        <div className="pm-seethrough-banner" role="region" aria-label="See-through PSD 안내 및 보정">
+          <div className="pm-seethrough-top">
+            <span className="pm-seethrough-title">
+              <AlertTriangle size={13} />
+              <strong>
+                {session.applySeeThroughOrderFix
+                  ? "See-through PSD 감지됨 — 깊이 순서 보정 적용됨 (원본 순서로 되돌리기)"
+                  : "See-through PSD 감지됨 — 원본 PSD 순서 유지 중"}
+              </strong>
+            </span>
+            {onToggleSeeThroughOrder && (
+              <button
+                type="button"
+                className="pm-seethrough-toggle"
+                role="switch"
+                aria-checked={session.applySeeThroughOrderFix}
+                disabled={busy}
+                onClick={() => onToggleSeeThroughOrder(!session.applySeeThroughOrderFix)}
+              >
+                {session.applySeeThroughOrderFix ? "원본 순서로 되돌리기" : "깊이 순서 보정 적용"}
+              </button>
+            )}
+          </div>
+          {seeThroughOrder?.changed ? (
+            <ul className="pm-seethrough-fixes">
+              {seeThroughOrder.fixes.map((fix) => (
+                <li key={fix.partId}>
+                  <span className={`pm-badge ${session.applySeeThroughOrderFix ? "is-fixed" : "is-warn"}`}>
+                    {session.applySeeThroughOrderFix ? "순서 보정" : "순서 역전"}
+                  </span>
+                  <span>{fix.message}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="pm-seethrough-ok">깊이 순서 역전 없음 · {SEE_THROUGH_LICENSE_NOTE}</p>
+          )}
+          <div className="pm-seethrough-limits">
+            {SEE_THROUGH_LIMITATIONS.map((lim) => (
+              <span key={lim.id} title={lim.detail}>
+                <strong>{lim.title}</strong>: {lim.detail}
+              </span>
+            ))}
+            {seeThroughOrder?.changed && <span className="pm-seethrough-license">{SEE_THROUGH_LICENSE_NOTE}</span>}
+          </div>
+        </div>
+      )}
       <div className="pm-body">
         <div className="pm-tree lp" aria-label="PSD 레이어">
           <div className="pm-colhead lp-colhead" aria-hidden="true">
@@ -430,6 +527,11 @@ export default function PsdMappingPanel({ session, busy, onChange, onGenerate, o
                 <i className="lp-color" style={{ background: targetColor(p.id) }} />
                 <span className="pm-part-id">{p.id}</span>
                 <span className="pm-part-name">{targetLabel(p.id)}</span>
+                {reorderedPartIds.has(p.id) && (
+                  <em className={`pm-badge ${session.applySeeThroughOrderFix ? "is-fixed" : "is-warn"}`}>
+                    {session.applySeeThroughOrderFix ? "순서 보정" : "순서 역전"}
+                  </em>
+                )}
                 <small title={p.layers.join(", ")}>
                   {p.split ? "L/R 분리 · " : ""}
                   {p.layers.length}장

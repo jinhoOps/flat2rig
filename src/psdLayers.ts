@@ -18,6 +18,17 @@
  */
 import { readPsd, type Layer, type Psd } from "ag-psd";
 import { PART_DEFS } from "./types";
+import {
+  applySeeThroughAlphaFloor,
+  correctSeeThroughDrawOrder,
+  estimateSeeThroughMidline,
+  isSeeThroughPsd,
+  normSeeThroughTag,
+  SEE_THROUGH_TAGS,
+  type SeeThroughOrderPlan,
+} from "./seethrough";
+
+export { isSeeThroughPsd, SEE_THROUGH_TAGS };
 
 export const PSD_LAYER_INPUT_VERSION = "psd-layers-v1";
 /** Largest PSD the app reads (Rust `PASTED_PSD_MAX_BYTES` for pasted paths). */
@@ -126,6 +137,7 @@ export function parsePsd(bytes: Uint8Array, name = "layers.psd"): ParsedPsd {
     );
   }
   const bits = psd.bitsPerChannel ?? 8;
+  const seeThrough = isSeeThroughPsd((psd.children ?? []).map((l) => l.name ?? ""));
   const nodes: PsdLayerNode[] = [];
   const pixels = new Map<string, PsdLayerPixels>();
   const layers: PsdLayerNode[] = [];
@@ -194,13 +206,14 @@ export function parsePsd(bytes: Uint8Array, name = "layers.psd"): ParsedPsd {
       layers.push(node);
       const img = l.imageData;
       if (img && img.width > 0 && img.height > 0) {
-        const px: PsdLayerPixels = {
+        let px: PsdLayerPixels = {
           left: node.bounds.left,
           top: node.bounds.top,
           width: img.width,
           height: img.height,
           rgba: toU8(img.data as ArrayLike<number> & { length: number }, bits),
         };
+        if (seeThrough) px = applySeeThroughAlphaFloor(px);
         const m = l.mask;
         if (m?.imageData && !m.disabled) {
           px.mask = extractMaskChannel(toU8(m.imageData.data as ArrayLike<number> & { length: number }, bits));
@@ -238,8 +251,6 @@ export function parsePsd(bytes: Uint8Array, name = "layers.psd"): ParsedPsd {
     throw new Error(
       `PSD 레이어 ${undecoded.length}개의 픽셀을 읽지 못했습니다(예: ${undecoded[0]}). 지원하지 않는 압축·색상 모드일 수 있습니다.`,
     );
-  const top = (psd.children ?? []).map((l) => normTag(l.name ?? ""));
-  const seeThrough = top.length > 0 && top.every((t) => t in SEE_THROUGH_TAGS);
   return {
     name: name.replace(/\.[^.]+$/, ""),
     width: psd.width,
@@ -305,6 +316,8 @@ export interface LayerMapping {
   /** Set only for layers whose blend mode (own or group) is not `normal`. */
   blend?: LayerBlendHandling;
   source: MappingSource;
+  /** See-through `eyelash`: split into `eye{S}_upper` and `eye{S}_lower` around each eye centre. */
+  lashSplit?: boolean;
   /** Why the layer is excluded / unassigned / what rule matched (UI and report). */
   note?: string;
 }
@@ -319,43 +332,13 @@ export interface MappingSuggestion {
   mappings: LayerMapping[];
   /** Face midline x at PSD resolution used for L/R (null = canvas centre fallback). */
   midlineX: number;
-  midlineSource: "face" | "iris" | "composite" | "canvas";
+  midlineSource: "face" | "iris" | "eyewhite" | "composite" | "canvas";
   warnings: MappingWarning[];
+  /** Proposed See-through depth-order correction plan (when `psd.seeThrough`). */
+  seeThroughOrder?: SeeThroughOrderPlan;
 }
 
 const DEFAULT_IDS: readonly string[] = PART_DEFS.map((d) => d[0]);
-
-/** See-through tags → flat2rig ids (`tools/evaluation/v2_seethrough_to_layers.py` TAG_MAP and its
- * role-bearing extra ids). `{S}` = split into character L/R. */
-export const SEE_THROUGH_TAGS: Record<string, string> = {
-  "back hair": "hair_back",
-  "front hair": "hair_front",
-  face: "face",
-  ears: "face",
-  neck: "neck",
-  topwear: "clothes",
-  neckwear: "clothes_inner",
-  eyewhite: "eye{S}_white",
-  irides: "eye{S}_iris",
-  eyelash: "eye{S}_upper",
-  eyebrow: "brow{S}",
-  mouth: "mouth_all",
-  nose: "face_detail",
-  headwear: "hat",
-  eyewear: "acc_glasses",
-  earwear: "acc_earwear",
-  handwear: "hands",
-  bottomwear: "clothes_bottom",
-  legwear: "clothes_legwear",
-  footwear: "clothes_footwear",
-  tail: "other_tail",
-  wings: "other_wings",
-  objects: "other_objects",
-};
-
-function normTag(name: string) {
-  return name.trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
-}
 
 const GUIDE_RE =
   /가이드|guide|ガイド|下書き|下描き|ラフ|밑그림|스케치|sketch|参考|참고|레퍼런스|reference|^ref\b|メモ|메모|memo|아타리|アタリ/i;
@@ -487,6 +470,7 @@ function estimateMidline(
   psd: ParsedPsd,
   classes: Map<string, string | null>,
 ): { x: number; source: MappingSuggestion["midlineSource"] } {
+  if (psd.seeThrough) return estimateSeeThroughMidline(psd, classes);
   const usable = (n: PsdLayerNode) => !n.effectiveHidden && !n.guide && n.alphaSum > 0;
   const faces = psd.layers.filter(
     (n) => usable(n) && classes.get(n.path) === "face" && !/귀|耳|ear/i.test(n.name),
@@ -546,10 +530,11 @@ export function suggestMapping(psd: ParsedPsd): MappingSuggestion {
     let source: MappingSource = "none";
     let note: string | undefined;
     let matchedGroup: string | null = null;
-    const tag = normTag(node.name);
+    const tag = normSeeThroughTag(node.name);
     if (psd.seeThrough && tag in SEE_THROUGH_TAGS) {
       target = SEE_THROUGH_TAGS[tag];
       source = "seethrough";
+      if (tag === "eyelash") note = "속눈썹: 좌우 + 위/아래 눈꺼풀 자동 분리";
     } else {
       const own = matchRule(node.name);
       const generic = GENERIC_RE.test(stripSide(node.name));
@@ -637,6 +622,9 @@ export function suggestMapping(psd: ParsedPsd): MappingSuggestion {
       if (idx > 0) target = hairNumber(target, idx);
     }
     const m: LayerMapping = { path: node.path, target, include, source };
+    if (source === "seethrough" && normSeeThroughTag(node.name) === "eyelash" && target === "eye{S}_upper") {
+      m.lashSplit = true;
+    }
     if (note) m.note = note;
     const blend = effectiveBlend(node);
     if (blend !== "normal") {
@@ -670,7 +658,31 @@ export function suggestMapping(psd: ParsedPsd): MappingSuggestion {
     mappings.push(m);
   }
   warnings.push(...drawOrderWarnings(psd, mappings));
-  return { mappings, midlineX: mid.x, midlineSource: mid.source, warnings };
+  const seeThroughOrder = psd.seeThrough
+    ? correctSeeThroughDrawOrder(rawPartOrder(psd, mappings))
+    : undefined;
+  return {
+    mappings,
+    midlineX: mid.x,
+    midlineSource: mid.source,
+    warnings,
+    ...(seeThroughOrder ? { seeThroughOrder } : {}),
+  };
+}
+
+/** Bottom → top part order implied by `mappings` (without building pixels). */
+export function rawPartOrder(psd: ParsedPsd, mappings: readonly LayerMapping[]): string[] {
+  const pos = new Map<string, number>();
+  psd.layers.forEach((n, i) => {
+    const m = mappings[i];
+    if (!m?.include || !m.target) return;
+    for (const id of expandTarget(m.target)) {
+      pos.set(id, Math.max(pos.get(id) ?? -1, n.order));
+    }
+  });
+  return [...pos.entries()]
+    .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+    .map(([id]) => id);
 }
 
 /** Face features drawn below the face, or an eye white above its iris (See-through depth order

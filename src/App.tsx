@@ -2284,6 +2284,9 @@ export default function App() {
                 session={psdSession}
                 busy={!!busy}
                 onChange={(mappings) => setPsdSession((s) => (s ? { ...s, mappings } : s))}
+                onToggleSeeThroughOrder={(applySeeThroughOrderFix) =>
+                  setPsdSession((s) => (s ? { ...s, applySeeThroughOrderFix } : s))
+                }
                 onGenerate={generateFromPsd}
                 onCancel={() => {
                   setPsdSession(null);

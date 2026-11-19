@@ -30,6 +30,11 @@ import {
   type PsdLayerNode,
   type PsdLayerPixels,
 } from "./psdLayers";
+import {
+  computeEyeCenterY,
+  splitEyelashUpperLower,
+  type EyelashSplitResult,
+} from "./seethrough";
 
 /** Same long-side rule as `readImage` (illustration input). */
 export const WORK_MAX_SIDE = 2048;
@@ -422,27 +427,58 @@ export interface BuildOptions {
   height?: number;
   /** Face midline at PSD resolution for `{S}` splits. */
   midlineX: number;
+  /** Optional explicit bottom → top part order (e.g. See-through depth-order correction). */
+  partOrder?: readonly string[];
 }
 
-/** Groups included, assigned layers into parts (bottom → top by topmost layer). */
-export function planParts(psd: ParsedPsd, mappings: readonly LayerMapping[]) {
+/** Groups included, assigned layers into parts (bottom → top by topmost layer, or `partOrder`). */
+export function planParts(
+  psd: ParsedPsd,
+  mappings: readonly LayerMapping[],
+  partOrder?: readonly string[],
+) {
   const byPath = new Map(psd.layers.map((n) => [n.path, n]));
-  const parts = new Map<string, { id: string; paths: string[]; order: number; splitPaths: Set<string> }>();
+  const parts = new Map<
+    string,
+    { id: string; paths: string[]; order: number; splitPaths: Set<string>; lashPaths: Set<string> }
+  >();
+  const addPartPath = (id: string, path: string, order: number, split: boolean, lash: boolean) => {
+    const e = parts.get(id) ?? {
+      id,
+      paths: [],
+      order: -1,
+      splitPaths: new Set<string>(),
+      lashPaths: new Set<string>(),
+    };
+    e.paths.push(path);
+    e.order = Math.max(e.order, order);
+    if (split) e.splitPaths.add(path);
+    if (lash) e.lashPaths.add(path);
+    parts.set(id, e);
+  };
   for (const m of mappings) {
     const node = byPath.get(m.path);
     if (!node || !m.include || !m.target || !psd.pixels.has(m.path)) continue;
     const split = m.target.includes("{S}");
+    const lash = Boolean(m.lashSplit && /^eye(?:\{S\}|[LR])_upper$/.test(m.target));
     for (const id of expandTarget(m.target)) {
-      const e = parts.get(id) ?? { id, paths: [], order: -1, splitPaths: new Set<string>() };
-      e.paths.push(m.path);
-      e.order = Math.max(e.order, node.order);
-      if (split) e.splitPaths.add(m.path);
-      parts.set(id, e);
+      addPartPath(id, m.path, node.order, split, lash);
+      if (lash) addPartPath(id.replace(/_upper$/, "_lower"), m.path, node.order, split, true);
     }
   }
   const list = [...parts.values()];
   for (const e of list) e.paths.sort((a, b) => byPath.get(a)!.order - byPath.get(b)!.order);
-  list.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  if (partOrder && partOrder.length > 0) {
+    const rank = new Map(partOrder.map((id, idx) => [id, idx]));
+    list.sort(
+      (a, b) =>
+        (rank.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.id) ?? Number.MAX_SAFE_INTEGER) ||
+        a.order - b.order ||
+        a.id.localeCompare(b.id),
+    );
+  } else {
+    list.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  }
   return list;
 }
 
@@ -498,8 +534,17 @@ export function buildLayerParts(
     sy = H / psd.height;
   const byPath = new Map(psd.layers.map((x) => [x.path, x]));
   const mapByPath = new Map(mappings.map((m) => [m.path, m]));
-  const plan = planParts(psd, mappings);
+  const plan = planParts(psd, mappings, options.partOrder);
   const splitCache = new Map<string, ReturnType<typeof splitComponentsLR>>();
+  const lashCache = new Map<string, EyelashSplitResult>();
+  const hasLashSplit = plan.some((e) => e.lashPaths.size > 0);
+  const eyeCenterY = hasLashSplit
+    ? computeEyeCenterY(
+        psd,
+        new Map(mappings.map((m) => [m.path, m.include ? m.target : null])),
+        options.midlineX,
+      )
+    : {};
   const splits: LayerPartsBuild["splits"] = [];
   const parts: BuiltLayerPart[] = [];
   const keptOwn = new Set<string>();
@@ -512,7 +557,19 @@ export function buildLayerParts(
       const m = mapByPath.get(path)!;
       const blend = effectiveBlend(node);
       const piece: Piece = { node, px, blend, fold: blend !== "normal" && m.blend === "fold" && isFoldable(blend) };
-      if (entry.splitPaths.has(path)) {
+      if (entry.lashPaths.has(path) && (entry.id === "eyeL_upper" || entry.id === "eyeL_lower" || entry.id === "eyeR_upper" || entry.id === "eyeR_lower")) {
+        let ls = lashCache.get(path);
+        if (!ls) {
+          ls = splitEyelashUpperLower(px, options.midlineX, eyeCenterY);
+          lashCache.set(path, ls);
+          splits.push({
+            path,
+            L: ls.counts.upperL + ls.counts.lowerL,
+            R: ls.counts.upperR + ls.counts.lowerR,
+          });
+        }
+        piece.side = ls[entry.id];
+      } else if (entry.splitPaths.has(path)) {
         let s = splitCache.get(path);
         if (!s) {
           s = splitComponentsLR(px, options.midlineX);
@@ -539,10 +596,20 @@ export function buildLayerParts(
       ch = Math.max(0, b - t);
     const u8 = unpremultiplyU8(scaled.data);
     const rgba = new Uint8ClampedArray(cw * ch * 4);
+    let hasOpaque = false;
     for (let y = 0; y < ch; y++) {
       const srow = ((y + t - scaled.top) * scaled.width + (l - scaled.left)) * 4;
       rgba.set(u8.subarray(srow, srow + cw * 4), y * cw * 4);
+      if (!hasOpaque) {
+        for (let x = 0; x < cw; x++) {
+          if (rgba[(y * cw + x) * 4 + 3] > 0) {
+            hasOpaque = true;
+            break;
+          }
+        }
+      }
     }
+    if (entry.lashPaths.size > 0 && !hasOpaque) return;
     parts.push({ id: entry.id, layers: entry.paths, order: entry.order, left: l, top: t, width: cw, height: ch, rgba });
   });
   onProgress?.(plan.length, plan.length, "가시/숨은 영역 분리");

@@ -36,10 +36,12 @@ import {
 import {
   buildLayerParts,
   partCanvasRgba,
+  planParts,
   splitComponentsLR,
   workingSize,
   type LayerPartsBuild,
 } from "./layerParts";
+import { correctSeeThroughDrawOrder } from "./seethrough";
 
 export interface PsdSession {
   fileName: string;
@@ -50,6 +52,8 @@ export interface PsdSession {
   mappings: LayerMapping[];
   /** Midline (PSD px) used for `{S}` splits; replaced by the landmark midline after analysis. */
   midlineX: number;
+  /** Whether See-through depth-order correction is enabled (default true for See-through PSDs). */
+  applySeeThroughOrderFix: boolean;
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string | undefined> {
@@ -71,6 +75,7 @@ export async function openPsdSession(bytes: Uint8Array, fileName: string): Promi
     suggestion,
     mappings: suggestion.mappings.map((m) => ({ ...m })),
     midlineX: suggestion.midlineX,
+    applySeeThroughOrderFix: psd.seeThrough,
   };
 }
 
@@ -201,6 +206,18 @@ export function layerSourceRecord(session: PsdSession, build: LayerPartsBuild): 
       ...(m.note ? { note: m.note } : {}),
     };
   });
+  const warnings = session.suggestion.warnings.map((w) => w.message);
+  if (session.psd.seeThrough) {
+    const rawOrder = planParts(session.psd, session.mappings).map((p) => p.id);
+    const plan = correctSeeThroughDrawOrder(rawOrder);
+    if (plan.changed) {
+      warnings.push(
+        session.applySeeThroughOrderFix
+          ? `See-through 깊이 순서 보정 적용됨: ${plan.fixes.map((f) => f.partId).join(", ")}`
+          : `See-through 원본 PSD 순서 유지됨(보정 미적용): ${plan.fixes.map((f) => f.partId).join(", ")}`,
+      );
+    }
+  }
   return {
     version: PSD_LAYER_INPUT_VERSION,
     file: session.fileName,
@@ -214,7 +231,7 @@ export function layerSourceRecord(session: PsdSession, build: LayerPartsBuild): 
     parts: build.parts.map((p) => ({ id: p.id, layers: p.layers })),
     missingDefaultParts: missingDefaultParts(session.mappings),
     interleaved: build.interleaved,
-    warnings: session.suggestion.warnings.map((w) => w.message),
+    warnings,
   };
 }
 
@@ -223,7 +240,18 @@ export function buildPsdParts(
   onProgress?: (done: number, total: number, step: string) => void,
 ) {
   const size = workingSize(session.psd.width, session.psd.height);
-  return buildLayerParts(session.psd, session.mappings, { ...size, midlineX: session.midlineX }, onProgress);
+  let partOrder: readonly string[] | undefined;
+  if (session.psd.seeThrough && session.applySeeThroughOrderFix) {
+    const rawOrder = planParts(session.psd, session.mappings).map((p) => p.id);
+    const plan = correctSeeThroughDrawOrder(rawOrder);
+    if (plan.changed) partOrder = plan.correctedOrder;
+  }
+  return buildLayerParts(
+    session.psd,
+    session.mappings,
+    { ...size, midlineX: session.midlineX, ...(partOrder ? { partOrder } : {}) },
+    onProgress,
+  );
 }
 
 /** A fresh project from built layer parts (landmarks are placeholders until face analysis runs). */
