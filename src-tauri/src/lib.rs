@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod core;
 pub mod inference;
 pub mod rig;
+pub mod seethrough;
 pub mod updater;
 use analysis::{
     detector::{detect_faces, FaceCandidate, DEFAULT_FACE_SCORE_THRESHOLD},
@@ -1014,6 +1015,8 @@ pub fn run() {
             cancel_analysis,
             analyze_face,
             detect_landmarks_for_face,
+            seethrough::seethrough_check_install,
+            seethrough::seethrough_decompose,
             updater::get_app_version,
             updater::check_app_update,
             updater::install_app_update,

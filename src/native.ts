@@ -38,6 +38,12 @@ import {
   type MeshQualityReport,
 } from "./engine";
 import { REST, PARAM_DEFS } from "./types";
+import {
+  SEE_THROUGH_LICENSE_NOTE,
+  SEE_THROUGH_LIMITATIONS,
+  type SeeThroughDecomposeResult,
+  type SeeThroughInstallStatus,
+} from "./seethrough";
 export type { MeshQualityReport } from "./engine";
 export const desktop = isTauri();
 /** T15 line-layer summary inside a Rust `RegionReport` (`lineart`; absent = no line synthesis). */
@@ -916,4 +922,61 @@ export async function detectLandmarksForFace(
   );
   signal.throwIfAborted();
   return result;
+}
+
+export async function chooseDirectory(title = "폴더 선택"): Promise<string | null> {
+  if (!desktop) return null;
+  const picked = await open({ title, directory: true, multiple: false });
+  return typeof picked === "string" ? picked : null;
+}
+
+export async function chooseImagePath(title = "일러스트 이미지 선택"): Promise<string | null> {
+  if (!desktop) return null;
+  const picked = await open({
+    title,
+    multiple: false,
+    filters: [{ name: "Illustration", extensions: ["png", "jpg", "jpeg", "webp"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+export async function readFileFromPath(path: string): Promise<{ name: string; bytes: Uint8Array }> {
+  if (!desktop) {
+    throw new Error("로컬 파일 읽기는 데스크톱 앱에서 실행됩니다.");
+  }
+  const file = await invoke<{ name: string; bytes: string }>("read_pasted_path", { path });
+  return { name: file.name, bytes: unbase64(file.bytes) };
+}
+
+export async function checkSeeThroughInstall(installDir: string): Promise<SeeThroughInstallStatus> {
+  if (!desktop) {
+    return {
+      installed: false,
+      installDir,
+      pythonPath: null,
+      scriptPath: null,
+      hfHome: null,
+      message: "외부 See-through 실행은 데스크톱 앱(Tauri)에서 사용할 수 있습니다.",
+      license: SEE_THROUGH_LICENSE_NOTE,
+      limitations: SEE_THROUGH_LIMITATIONS.map((l) => l.detail),
+    };
+  }
+  return invoke<SeeThroughInstallStatus>("seethrough_check_install", { installDir });
+}
+
+export async function decomposeWithSeeThrough(
+  installDir: string,
+  imagePath: string,
+  options?: { outputDir?: string; seed?: number; jobId?: number },
+): Promise<SeeThroughDecomposeResult> {
+  if (!desktop) {
+    throw new Error("외부 See-through 실행은 데스크톱 앱(Tauri)에서 사용할 수 있습니다.");
+  }
+  return invoke<SeeThroughDecomposeResult>("seethrough_decompose", {
+    installDir,
+    imagePath,
+    outputDir: options?.outputDir ?? null,
+    seed: options?.seed ?? null,
+    jobId: options?.jobId ?? null,
+  });
 }

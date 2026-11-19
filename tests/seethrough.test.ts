@@ -5,13 +5,18 @@ import { initializeCanvas, writePsdUint8Array, type Layer } from "ag-psd";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
 import { parsePsd, suggestMapping } from "../src/psdLayers";
-import { buildPsdParts, openPsdSession } from "../src/layerProject";
+import { buildPsdParts, openPsdSession, runSeeThroughDecomposeFlow } from "../src/layerProject";
 import {
   applySeeThroughAlphaFloor,
+  clearSeeThroughSettings,
   correctSeeThroughDrawOrder,
   isSeeThroughPsd,
+  loadSeeThroughSettings,
+  saveSeeThroughSettings,
+  SEE_THROUGH_DEFAULT_SEED,
 } from "../src/seethrough";
 import PsdMappingPanel from "../src/workspace/PsdMappingPanel";
+import SeeThroughModal from "../src/workspace/SeeThroughModal";
 
 beforeAll(() => {
   initializeCanvas(
@@ -262,5 +267,107 @@ describe.skipIf(!hasRealSeeThroughPsds)("B5 See-through — real V2 PSD integrat
     const himSug = suggestMapping(him);
     expect(himSug.seeThroughOrder?.changed).toBe(true);
     expect(himSug.seeThroughOrder?.liftedAboveFace.length).toBeGreaterThan(0);
+  });
+});
+
+describe("B5 See-through Checkpoint 2 — settings, unconfigured notice, mocked decompose flow", () => {
+  function memoryStorage(): Storage {
+    const map = new Map<string, string>();
+    return {
+      get length() {
+        return map.size;
+      },
+      clear: () => map.clear(),
+      getItem: (k) => map.get(k) ?? null,
+      key: (i) => [...map.keys()][i] ?? null,
+      removeItem: (k) => {
+        map.delete(k);
+      },
+      setItem: (k, v) => {
+        map.set(k, v);
+      },
+    };
+  }
+
+  it("persists, validates, and clears See-through installDir and seed settings", () => {
+    const storage = memoryStorage();
+    expect(loadSeeThroughSettings(storage)).toEqual({
+      installDir: "",
+      seed: SEE_THROUGH_DEFAULT_SEED,
+    });
+    saveSeeThroughSettings({ installDir: "  C:\\tools\\seethrough  ", seed: 7 }, storage);
+    expect(loadSeeThroughSettings(storage)).toEqual({
+      installDir: "C:\\tools\\seethrough",
+      seed: 7,
+    });
+    // Invalid seed falls back to default.
+    saveSeeThroughSettings({ installDir: "C:\\tools\\seethrough", seed: -5 }, storage);
+    expect(loadSeeThroughSettings(storage).seed).toBe(SEE_THROUGH_DEFAULT_SEED);
+    clearSeeThroughSettings(storage);
+    expect(loadSeeThroughSettings(storage)).toEqual({
+      installDir: "",
+      seed: SEE_THROUGH_DEFAULT_SEED,
+    });
+  });
+
+  it("renders unconfigured install guide, OpenRAIL++ notice, and chibi/SD warning in SeeThroughModal", () => {
+    const html = renderToStaticMarkup(
+      createElement(SeeThroughModal, {
+        desktop: true,
+        busy: false,
+        installDir: "",
+        seed: 42,
+        status: null,
+        error: null,
+        onChangeInstallDir: () => {},
+        onChangeSeed: () => {},
+        onBrowseDir: () => {},
+        onVerify: () => {},
+        onClear: () => {},
+        onRunDecompose: () => {},
+        onClose: () => {},
+      }),
+    );
+    expect(html).toContain("외부 설치 안내");
+    expect(html).toContain("OpenRAIL++");
+    expect(html).toContain("치비(SD)");
+    expect(html).toContain('data-action="seethrough-decompose"');
+    expect(html).toContain("disabled");
+  });
+
+  it("runs mocked decompose → reads generated PSD → opens B1 PsdMappingPanel with depth fix", async () => {
+    const psd = sutteangLikeSeeThroughPsd();
+    const { result, session } = await runSeeThroughDecomposeFlow(
+      {
+        decompose: async (installDir, imagePath, opts) => ({
+          psdPath: `${installDir}\\out\\sutteang.psd`,
+          outputDir: `${installDir}\\out`,
+          seed: opts?.seed ?? 42,
+          commandSummary: `python inference_psd_blockswap.py --srcp ${imagePath}`,
+        }),
+        readPsdFile: async () => ({ name: "sutteang.psd", bytes: psd }),
+      },
+      "C:\\tools\\seethrough",
+      "C:\\art\\sutteang.png",
+      42,
+      1,
+    );
+
+    expect(result.psdPath).toContain("sutteang.psd");
+    expect(session.psd.seeThrough).toBe(true);
+    expect(session.applySeeThroughOrderFix).toBe(true);
+
+    const panelHtml = renderToStaticMarkup(
+      createElement(PsdMappingPanel, {
+        session,
+        busy: false,
+        onChange: () => {},
+        onToggleSeeThroughOrder: () => {},
+        onGenerate: () => {},
+        onCancel: () => {},
+      }),
+    );
+    expect(panelHtml).toContain("See-through PSD 감지됨 — 깊이 순서 보정 적용됨");
+    expect(panelHtml).toContain("eyeL_white");
   });
 });

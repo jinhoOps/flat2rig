@@ -455,3 +455,89 @@ export function correctSeeThroughDrawOrder(rawOrder: readonly string[]): SeeThro
     fixes,
   };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Checkpoint 2: External See-through tool settings & status types (not bundled in app)
+// ---------------------------------------------------------------------------------------------
+
+export const SEE_THROUGH_INSTALL_DIR_KEY = "flat2rig.seethrough.installDir";
+export const SEE_THROUGH_SEED_KEY = "flat2rig.seethrough.seed";
+export const SEE_THROUGH_DEFAULT_SEED = 42;
+
+export const SEE_THROUGH_INSTALL_GUIDE = [
+  "See-through(shitagaki-lab/see-through) 저장소를 로컬에 설치하고 Python 가상환경(venv)을 준비하세요.",
+  "설치 폴더에 venv(Scripts/python.exe)와 repo/inference_psd_blockswap.py(또는 inference_psd.py)가 있어야 합니다.",
+  "모델 가중치는 OpenRAIL++ 라이선스이므로 앱에 포함되지 않으며, 최초 실행 시 HF 캐시(hf-home)로 내려받습니다.",
+] as const;
+
+export interface SeeThroughInstallStatus {
+  installed: boolean;
+  installDir: string;
+  pythonPath: string | null;
+  scriptPath: string | null;
+  hfHome: string | null;
+  message: string;
+  license: string;
+  limitations: string[];
+}
+
+export interface SeeThroughDecomposeResult {
+  psdPath: string;
+  outputDir: string;
+  seed: number;
+  commandSummary: string;
+}
+
+export interface SeeThroughSettings {
+  installDir: string;
+  seed: number;
+}
+
+function defaultStorage(): Storage | undefined {
+  return typeof window !== "undefined" ? window.localStorage : undefined;
+}
+
+export function loadSeeThroughSettings(storage: Storage | undefined = defaultStorage()): SeeThroughSettings {
+  if (!storage) return { installDir: "", seed: SEE_THROUGH_DEFAULT_SEED };
+  try {
+    const installDir = (storage.getItem(SEE_THROUGH_INSTALL_DIR_KEY) ?? "").trim();
+    const raw = storage.getItem(SEE_THROUGH_SEED_KEY);
+    const rawSeed = raw !== null && raw.trim() !== "" ? Number(raw) : NaN;
+    const seed =
+      Number.isInteger(rawSeed) && rawSeed >= 0 && rawSeed <= 0xffffffff
+        ? rawSeed
+        : SEE_THROUGH_DEFAULT_SEED;
+    return { installDir, seed };
+  } catch {
+    return { installDir: "", seed: SEE_THROUGH_DEFAULT_SEED };
+  }
+}
+
+export function saveSeeThroughSettings(
+  settings: SeeThroughSettings,
+  storage: Storage | undefined = defaultStorage(),
+): void {
+  if (!storage) return;
+  try {
+    const dir = settings.installDir.trim();
+    if (dir) storage.setItem(SEE_THROUGH_INSTALL_DIR_KEY, dir);
+    else storage.removeItem(SEE_THROUGH_INSTALL_DIR_KEY);
+    const seed =
+      Number.isInteger(settings.seed) && settings.seed >= 0 && settings.seed <= 0xffffffff
+        ? settings.seed
+        : SEE_THROUGH_DEFAULT_SEED;
+    storage.setItem(SEE_THROUGH_SEED_KEY, String(seed));
+  } catch {
+    // Ignore storage quota/security errors.
+  }
+}
+
+export function clearSeeThroughSettings(storage: Storage | undefined = defaultStorage()): void {
+  if (!storage) return;
+  try {
+    storage.removeItem(SEE_THROUGH_INSTALL_DIR_KEY);
+    storage.removeItem(SEE_THROUGH_SEED_KEY);
+  } catch {
+    // Ignore storage errors.
+  }
+}

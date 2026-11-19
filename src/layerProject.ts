@@ -41,7 +41,10 @@ import {
   workingSize,
   type LayerPartsBuild,
 } from "./layerParts";
-import { correctSeeThroughDrawOrder } from "./seethrough";
+import {
+  correctSeeThroughDrawOrder,
+  type SeeThroughDecomposeResult,
+} from "./seethrough";
 
 export interface PsdSession {
   fileName: string;
@@ -315,4 +318,27 @@ export function withRebuiltLayerParts(project: Project, session: PsdSession, bui
     parts: partsFromLayerBuild(build),
     layerSource: layerSourceRecord(session, build),
   };
+}
+
+export interface SeeThroughRunnerDeps {
+  decompose: (
+    installDir: string,
+    imagePath: string,
+    options?: { seed?: number; jobId?: number },
+  ) => Promise<SeeThroughDecomposeResult>;
+  readPsdFile: (path: string) => Promise<{ name: string; bytes: Uint8Array }>;
+}
+
+/** Runs external See-through CLI decomposition and opens the resulting PSD in a B1 session. */
+export async function runSeeThroughDecomposeFlow(
+  deps: SeeThroughRunnerDeps,
+  installDir: string,
+  imagePath: string,
+  seed?: number,
+  jobId?: number,
+): Promise<{ result: SeeThroughDecomposeResult; session: PsdSession }> {
+  const result = await deps.decompose(installDir, imagePath, { seed, jobId });
+  const file = await deps.readPsdFile(result.psdPath);
+  const session = await openPsdSession(file.bytes, file.name);
+  return { result, session };
 }

@@ -77,8 +77,12 @@ import {
   buildRig,
   cancelAnalysis,
   checkAppUpdate,
+  checkSeeThroughInstall,
+  chooseDirectory,
+  chooseImagePath,
   chooseOnnxModel,
   computeExposureMap,
+  decomposeWithSeeThrough,
   desktop,
   detectLandmarksForFace,
   downloadModel,
@@ -88,6 +92,7 @@ import {
   installAppUpdate,
   listenTaskProgress,
   proposeParts,
+  readFileFromPath,
   refinePartPrompt,
   relaunchApp,
   saveFile,
@@ -138,15 +143,24 @@ import { BrandMark } from "./brand/Brand";
 import BrandLoop from "./brand/BrandLoop";
 import CatProgress from "./workspace/CatProgress";
 import PsdMappingPanel from "./workspace/PsdMappingPanel";
+import SeeThroughModal from "./workspace/SeeThroughModal";
 import {
   buildPsdParts,
   landmarkMidlinePsd,
   openPsdSession,
   projectFromLayerBuild,
+  runSeeThroughDecomposeFlow,
   splitChangesWithMidline,
   withRebuiltLayerParts,
   type PsdSession,
 } from "./layerProject";
+import {
+  clearSeeThroughSettings,
+  loadSeeThroughSettings,
+  saveSeeThroughSettings,
+  SEE_THROUGH_DEFAULT_SEED,
+  type SeeThroughInstallStatus,
+} from "./seethrough";
 import { MAX_PSD_BYTES } from "./psdLayers";
 import LayersPanel, { DYNAMIC_LAYER_KINDS } from "./workspace/LayersPanel";
 import MenuBar, { type MenuDef } from "./workspace/MenuBar";
@@ -366,11 +380,16 @@ export default function App() {
     | "reanalysis"
     | "replaceWorkspace"
     | "models"
+    | "seethrough"
     | "help"
     | "spriteGuide"
     | "updates"
     | null
   >(null),
+    [seeThroughDir, setSeeThroughDir] = useState(() => loadSeeThroughSettings().installDir),
+    [seeThroughSeed, setSeeThroughSeed] = useState(() => loadSeeThroughSettings().seed),
+    [seeThroughStatus, setSeeThroughStatus] = useState<SeeThroughInstallStatus | null>(null),
+    [seeThroughError, setSeeThroughError] = useState<string | null>(null),
     [pendingDrop, setPendingDrop] = useState<{
       kind: "image" | "project" | "psd";
       file: File;
@@ -820,6 +839,68 @@ export default function App() {
     });
   };
   /** B1: reads a layered PSD and shows the mapping screen (the workspace is replaced on 파츠 생성). */
+  const verifySeeThroughDir = async (dir: string) => {
+    const trimmed = dir.trim();
+    saveSeeThroughSettings({ installDir: trimmed, seed: seeThroughSeed });
+    setSeeThroughError(null);
+    if (!trimmed) {
+      setSeeThroughStatus(null);
+      return null;
+    }
+    try {
+      const status = await checkSeeThroughInstall(trimmed);
+      setSeeThroughStatus(status);
+      return status;
+    } catch (e) {
+      setSeeThroughStatus(null);
+      setSeeThroughError(e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  };
+  const openSeeThroughSettings = () => {
+    setModal("seethrough");
+    if (seeThroughDir.trim()) void verifySeeThroughDir(seeThroughDir);
+  };
+  const runSeeThroughDecompose = async () => {
+    if (!desktop) {
+      openSeeThroughSettings();
+      return;
+    }
+    const dir = seeThroughDir.trim();
+    if (!dir) {
+      openSeeThroughSettings();
+      return;
+    }
+    const status = seeThroughStatus?.installDir === dir ? seeThroughStatus : await verifySeeThroughDir(dir);
+    if (!status?.installed) {
+      setModal("seethrough");
+      return;
+    }
+    const imagePath = await chooseImagePath("See-through로 분해할 일러스트 선택");
+    if (!imagePath) return;
+    setModal(null);
+    const jobId = ++analysisJobSeq.current;
+    void task("See-through 외부 도구로 레이어 분해 중", async (signal, report) => {
+      report(0, 3, "See-through 외부 실행 준비");
+      saveSeeThroughSettings({ installDir: dir, seed: seeThroughSeed });
+      const { result, session } = await runSeeThroughDecomposeFlow(
+        {
+          decompose: decomposeWithSeeThrough,
+          readPsdFile: readFileFromPath,
+        },
+        dir,
+        imagePath,
+        seeThroughSeed,
+        jobId,
+      );
+      signal.throwIfAborted();
+      setPsdSession(session);
+      const todo = session.mappings.filter((m) => m.include && !m.target).length;
+      notify(
+        `See-through PSD(${result.psdPath.split(/[\\/]/).pop()})를 열었습니다. 깊이 순서 보정을 확인하고 「파츠 생성」을 누르세요.${todo ? ` 미지정 ${todo}개` : ""}`,
+      );
+    });
+  };
   const openPsd = (file?: File, force = false) => {
     if (!file) return;
     if (!force && hasActiveWorkspace()) {
@@ -1970,6 +2051,7 @@ export default function App() {
       label: "파일",
       items: [
         { label: "레이어 PSD 열기…", disabled: isBusy, onSelect: () => psdInput.current?.click() },
+        { label: "See-through로 분해 (외부 도구)…", disabled: isBusy, onSelect: () => void runSeeThroughDecompose() },
         { label: "이미지 열기…", disabled: isBusy, onSelect: () => input.current?.click() },
         { label: "프로젝트 열기…", disabled: isBusy, onSelect: () => projectInput.current?.click() },
         { label: "샘플 일러스트 열기", disabled: isBusy, onSelect: openSample },
@@ -2351,6 +2433,15 @@ export default function App() {
                   >
                     <ImagePlus size={14} />
                     일러스트 한 장(PNG · JPG) 열기
+                  </button>
+                  <button
+                    className="text-button"
+                    data-action="open-seethrough"
+                    disabled={!!busy}
+                    onClick={() => void runSeeThroughDecompose()}
+                  >
+                    <Layers size={14} />
+                    See-through로 분해 (외부 도구)
                   </button>
                   <span className="drop-hint">
                     LD/SD 실루엣 매칭 · 모션용 21파츠 분리 · Cubism용 PSD
@@ -3065,6 +3156,25 @@ export default function App() {
                     </span>
                     <ChevronRight size={14} />
                   </button>
+                  <button
+                    className="model-button"
+                    style={{ marginTop: 8 }}
+                    disabled={!!busy}
+                    onClick={openSeeThroughSettings}
+                  >
+                    <Layers size={15} />
+                    <span>
+                      See-through 외부 도구 설정
+                      <small>
+                        {seeThroughStatus?.installed
+                          ? "연결됨 (OpenRAIL++, 외부 실행)"
+                          : seeThroughDir.trim()
+                            ? "경로 확인 필요 (미번들)"
+                            : "선택 기능 · 미설정"}
+                      </small>
+                    </span>
+                    <ChevronRight size={14} />
+                  </button>
                   {total > 0 && (
                     <button
                       className="full"
@@ -3694,9 +3804,11 @@ export default function App() {
                         ? "워크스페이스 저장 확인"
                         : modal === "models"
                           ? "모델 관리"
-                          : modal === "updates"
-                            ? "앱 자동 업데이트"
-                            : "파츠 재생성"
+                          : modal === "seethrough"
+                            ? "See-through 외부 도구 설정"
+                            : modal === "updates"
+                              ? "앱 자동 업데이트"
+                              : "파츠 재생성"
             }
           >
             <button
@@ -4219,6 +4331,46 @@ export default function App() {
                     <button onClick={() => setModal(null)}>닫기</button>
                   )}
                 </div>
+              </>
+            ) : modal === "seethrough" ? (
+              <>
+                <span className="eyebrow">EXTERNAL TOOL</span>
+                <h2>See-through 외부 도구 설정</h2>
+                <SeeThroughModal
+                  desktop={desktop}
+                  busy={!!busy}
+                  installDir={seeThroughDir}
+                  seed={seeThroughSeed}
+                  status={seeThroughStatus}
+                  error={seeThroughError}
+                  onChangeInstallDir={(dir) => {
+                    setSeeThroughDir(dir);
+                    setSeeThroughStatus(null);
+                    setSeeThroughError(null);
+                    saveSeeThroughSettings({ installDir: dir, seed: seeThroughSeed });
+                  }}
+                  onChangeSeed={(seed) => {
+                    setSeeThroughSeed(seed);
+                    saveSeeThroughSettings({ installDir: seeThroughDir, seed });
+                  }}
+                  onBrowseDir={() => {
+                    void chooseDirectory("See-through 설치 폴더 선택").then((picked) => {
+                      if (!picked) return;
+                      setSeeThroughDir(picked);
+                      void verifySeeThroughDir(picked);
+                    });
+                  }}
+                  onVerify={() => void verifySeeThroughDir(seeThroughDir)}
+                  onClear={() => {
+                    clearSeeThroughSettings();
+                    setSeeThroughDir("");
+                    setSeeThroughSeed(SEE_THROUGH_DEFAULT_SEED);
+                    setSeeThroughStatus(null);
+                    setSeeThroughError(null);
+                  }}
+                  onRunDecompose={() => void runSeeThroughDecompose()}
+                  onClose={() => setModal(null)}
+                />
               </>
             ) : (
               <>
