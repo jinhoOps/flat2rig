@@ -890,3 +890,43 @@ T15 패스(합성 1회당; 평가 실행은 홀드아웃 합성 포함 2회)와 
 - (e) 윤곽선·선화 판정은 L* 중앙값 − 25 고정 규칙(T14와 같음)이라 색선·어두운 파츠의 외곽선을 놓친다. 분할이 외곽선을 다른 파츠에 준 경우(Sutteang 턱선)는 고치지 않는다(T11).
 - (f) 브라우저 대체 경로(`engine.ts`)는 선 합성을 하지 않는다. 결과 구분용 선택 필드 `Part.fillLines`(`extended` | `none`, 없으면 T15 이전 = 미상)를 추가했고 대체 경로·수동 보완은 `none`이다(schema v3 유지, 구 프로젝트는 필드 없음으로 읽힘). 숨은 텍셀 단위 `semantic` 표시는 `RegionReport.lineart.semantic`(획 위치·사유·값·한계)에만 있고 프로젝트 마스크로 저장하지 않는다(T11 입력).
 - (g) Windows 앱(WebView2) 모션 표시, PSD 인계 후 Cubism 가져오기 검증 없음(`미검증`).
+
+---
+
+## B2 이음새 결합 변형 (`hair_body`) 검증 (2026-11-19)
+
+- **대상 커밋**: B2 체크포인트 1(`7f99341` — `derive_torso_frame` + 야코비안 안전 `hair_body` 이음새 결합 + Rust/TS 일치).
+- **실행 검증**:
+  - `cargo test --manifest-path src-tauri/Cargo.toml --lib b2_hair_body_parity_fixture_matches_rust_deform`: **1 passed, 0 failed** (공유 fixture `tests/fixtures/hair-body-parity.json`, 기울어진 머리 `-15°` · `clothes`+`hands`+저알파 노이즈 · 8극단 포즈).
+  - `npx vitest run tests/pipeline.test.ts -t "B2 hair_body"`: **1 passed** (역할 기반 커스텀 ID 포함 Rust↔TS 일치).
+- **4개 데이터셋 Before → After 수치 비교 (`artifacts/b2/before/` → `artifacts/b2/after/`)**:
+
+| 데이터셋 | `seamCoverage.holes` | `lowerMisses` | `exposure.holePxTot` | `exposure.holePxMax` | `maxDepthPx` | `flipped/inv` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `himikan-truth` | 1,453 → **797** (-45.1%) | 9,192 → **7,269** | 61,588 → **25,100** (-59.2%) | 2,668 → **1,173** (-56.0%) | 43.2 → 43.2 | 0 → **0** |
+| `st-himikan` | 1,409 → **474** (-66.4%) | 7,895 → **6,474** | 63,515 → **23,907** (-62.4%) | 2,692 → **1,182** (-56.1%) | 23.2 → 23.2 | 0 → **0** |
+| `st-sutteang` | 11,225 → **1,969** (-82.5%) | 35,662 → **13,615** | 1,250,984 → **1,043,197** (-16.6%) | 31,120 → **22,091** (-29.0%) | 198.4 → **61.6** | 0 → **0** |
+| `default` | 103 → **83** (-19.4%) | 14,628 → **8,369** | 19,478 → **10,176** (-47.8%) | 748 → **341** (-54.4%) | 204.2 → **182.2** | 0 → **0** |
+
+- **주요 이음새별 구멍 감소 및 칼라 보호**:
+  - `himikan-truth`: `hair_side_R > clothes` `380 → 42`, `hair_side_L > clothes` `359 → 39`, `clothes > hair_back` `462 → 320`, `face > hair_back` `0 → 0`.
+  - `st-himikan`: `hair_front > clothes` `739 → 77`, `clothes > hair_back` `630 → 378`, `clothes > neck` `4 → 0` (목 뒤 칼라 열 보호), `neck > hair_back` `36 → 10`.
+  - `st-sutteang`: `clothes > hair_back` `7,423 → 1,371`, `hair_front > clothes` `2,902 → 124`, `hands > hair_back` `427 → 33`, `hair_front > hands` `268 → 176`.
+  - `default`: `hair_side_R > clothes` `37 → 29`, `hair_side_L > clothes` `30 → 17`, `face > hair_back` `0 → 0`, `hair_side_L > face` `0 → 0`.
+  - **잔여 한계(솔직 기록)**: `himikan-truth`에서는 `clothes > hair_back`(`|dx|/ed = 0.32..0.55`)과 `clothes > neck`(`|dx|/ed = 0.00..0.51`)이 동일 칼라 띠에서 겹쳐 `clothes > neck`이 `3 → 29`(rel `26.6 → 26.6` 불변)로 소폭 남았다. 다만 실제 렌더 노출 구멍 픽셀 총합은 `61,588 → 25,100`(-59.2%)으로 감소했다.
+
+- **금지 불변량 증명 표**:
+
+| 불변 항목 | 검증 근거 | 결과 |
+| --- | --- | --- |
+| 얼굴(`face`)·눈(`eyeL_*`, `eyeR_*`)·입(`mouth_*`)·입 위 앞머리(bangs, `y ≤ mouth.y` & `|pu| ≤ 0.70·ed`) | `b2_hair_body_parity_fixture_matches_rust_deform` (`tests/fixtures/hair-body-parity.json`) | 최대 변위 차이 `0.000 px` (`< 1e-6`) |
+| 머리카락 흔들림 진폭(`hair_front`/`hair_side`/`hair_back`의 `ParamHairFront = ±1`에서 `raw - head` 차이) | `b2_hair_body_parity_fixture_matches_rust_deform` | **불변 (유지됨)** |
+| 모션 최대 각도(`ParamAngleX/Y/Z = ±30`, `ParamBodyAngleX/Z = ±10`, `PARAM_DEFS`) | `src/types.ts` · `src-tauri/src/core.rs` · `b2_hair_body_parity_fixture_matches_rust_deform` | **불변 (축소 없음)** |
+
+- **비교 이미지 (`artifacts/b2/compare/`)**:
+  - `artifacts/b2/compare/himikan_truth_compare.png` 및 `artifacts/b2/compare/himikan_truth_zoom3x.png`
+  - `artifacts/b2/compare/st_himikan_compare.png`
+  - `artifacts/b2/compare/st_sutteang_compare.png`
+  - `artifacts/b2/compare/default_compare.png`
+  - 육안 점검: `angleZ_30`, `angleZ_m30`, `same3_headpmm_breath1`에서 옆머리·어깨 머리카락이 꺾임/찢어짐 없이 매끄러운 S-곡선으로 어깨·칼라를 따라가며, `st-sutteang`의 어깨 지그재그 찢어짐과 배경 노출이 크게 줄었다.
+- **미검증 항목**: Tauri 데스크톱 앱(WebView2) 실화면 육안 확인, Cubism Editor 가져오기.
