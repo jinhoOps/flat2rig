@@ -137,6 +137,17 @@ import {
 import { BrandMark } from "./brand/Brand";
 import BrandLoop from "./brand/BrandLoop";
 import CatProgress from "./workspace/CatProgress";
+import PsdMappingPanel from "./workspace/PsdMappingPanel";
+import {
+  buildPsdParts,
+  landmarkMidlinePsd,
+  openPsdSession,
+  projectFromLayerBuild,
+  splitChangesWithMidline,
+  withRebuiltLayerParts,
+  type PsdSession,
+} from "./layerProject";
+import { MAX_PSD_BYTES } from "./psdLayers";
 import LayersPanel, { DYNAMIC_LAYER_KINDS } from "./workspace/LayersPanel";
 import MenuBar, { type MenuDef } from "./workspace/MenuBar";
 import OptionsBar from "./workspace/OptionsBar";
@@ -361,10 +372,12 @@ export default function App() {
     | null
   >(null),
     [pendingDrop, setPendingDrop] = useState<{
-      kind: "image" | "project";
+      kind: "image" | "project" | "psd";
       file: File;
     } | null>(null),
     [dirty, setDirty] = useState(false);
+  /** B1: an opened layered PSD waiting on the mapping screen (null = none). */
+  const [psdSession, setPsdSession] = useState<PsdSession | null>(null);
   const [appVersion, setAppVersion] = useState("0.2.0-3");
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [updateCustomUrl, setUpdateCustomUrl] = useState("");
@@ -435,6 +448,7 @@ export default function App() {
     controller = useRef<AbortController | null>(null);
   const input = useRef<HTMLInputElement>(null),
     projectInput = useRef<HTMLInputElement>(null),
+    psdInput = useRef<HTMLInputElement>(null),
     partInput = useRef<HTMLInputElement>(null),
     csvInput = useRef<HTMLInputElement>(null);
   const dragSnapshot = useRef<Project | null>(null);
@@ -805,17 +819,84 @@ export default function App() {
       notify(res.message);
     });
   };
-  /** Routes one dropped or pasted file to the project or illustration loader. */
+  /** B1: reads a layered PSD and shows the mapping screen (the workspace is replaced on 파츠 생성). */
+  const openPsd = (file?: File, force = false) => {
+    if (!file) return;
+    if (!force && hasActiveWorkspace()) {
+      setPendingDrop({ kind: "psd", file });
+      setModal("replaceWorkspace");
+      return;
+    }
+    setPendingDrop(null);
+    void task("레이어 PSD 읽는 중", async (signal, report) => {
+      if (file.size > MAX_PSD_BYTES) throw new Error("PSD 최대 크기는 300MB입니다.");
+      report(0, 2, "PSD 읽기");
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      signal.throwIfAborted();
+      await new Promise((r) => setTimeout(r, 0));
+      report(1, 2, "레이어 → 파츠 제안");
+      const session = await openPsdSession(bytes, file.name);
+      signal.throwIfAborted();
+      setPsdSession(session);
+      const todo = session.mappings.filter((m) => m.include && !m.target).length;
+      notify(
+        `레이어 ${session.psd.layers.length}개를 읽었습니다. 제안을 확인하고 「파츠 생성」을 누르세요.${todo ? ` 미지정 ${todo}개는 생성에서 빠집니다.` : ""}`,
+      );
+    });
+  };
+  /** B1: builds parts from the mapping, then runs face analysis on the composite. */
+  const generateFromPsd = () => {
+    const session = psdSession;
+    if (!session) return;
+    const jobId = ++analysisJobSeq.current;
+    void task("레이어 파츠 생성 중", async (signal, report) => {
+      const steps = 3;
+      report(0, steps, "레이어 합성 · 가시/숨은 분리");
+      await new Promise((r) => setTimeout(r, 0));
+      let build = buildPsdParts(session);
+      signal.throwIfAborted();
+      let next = projectFromLayerBuild(session, build);
+      reset(next);
+      report(1, steps, "얼굴 검출 (합성 이미지)");
+      const res = await analyzeFace(build.composite, build.width, build.height, null, jobId, signal);
+      signal.throwIfAborted();
+      if (jobId !== analysisJobSeq.current) return;
+      next = applyAnalysisResponse(next, res, false);
+      // Re-split one-layer L/R pairs around the landmark midline when it moves a component.
+      const mid = landmarkMidlinePsd(next, build.sx);
+      if (mid !== null && build.splits.length && splitChangesWithMidline(session, build, mid)) {
+        report(2, steps, "좌우 분리 다시 계산 (랜드마크 중심선)");
+        const resplit = { ...session, midlineX: mid };
+        build = buildPsdParts(resplit);
+        next = withRebuiltLayerParts(next, resplit, build);
+      }
+      report(2, steps, "표정 준비");
+      next = synthesizeShapeAssetsForProject(next, build.composite, true);
+      signal.throwIfAborted();
+      update(next);
+      setPsdSession(null);
+      setDirty(true);
+      const missing = next.layerSource?.missingDefaultParts ?? [];
+      notify(
+        `레이어로 파츠 ${build.parts.length}개를 만들었습니다. ${res.message}${missing.length ? ` 레이어가 없는 기본 파츠: ${missing.join(", ")} (자동으로 채우지 않음).` : ""}`,
+      );
+    });
+  };
+  /** Routes one dropped or pasted file to the project, layered PSD or illustration loader. */
   const openIncomingFile = (file: File) => {
     if (/\.flat2rig$/i.test(file.name)) {
       openProjectFile(file);
+      return;
+    }
+    if (/\.psd$/i.test(file.name)) {
+      openPsd(file);
       return;
     }
     if (
       !/^image\/(png|jpeg)$/.test(file.type) &&
       !/\.(png|jpe?g)$/i.test(file.name)
     ) {
-      setError("PNG, JPG 이미지 또는 .flat2rig 파일만 불러올 수 있습니다.");
+      setError("PNG, JPG 이미지, 레이어 PSD 또는 .flat2rig 파일만 불러올 수 있습니다.");
       return;
     }
     openImage(file);
@@ -1888,6 +1969,7 @@ export default function App() {
       id: "file",
       label: "파일",
       items: [
+        { label: "레이어 PSD 열기…", disabled: isBusy, onSelect: () => psdInput.current?.click() },
         { label: "이미지 열기…", disabled: isBusy, onSelect: () => input.current?.click() },
         { label: "프로젝트 열기…", disabled: isBusy, onSelect: () => projectInput.current?.click() },
         { label: "샘플 일러스트 열기", disabled: isBusy, onSelect: openSample },
@@ -1978,7 +2060,7 @@ export default function App() {
         if (busy || modal) return;
         const files = Array.from(e.dataTransfer.files);
         if (files.length !== 1) {
-          setError("PNG, JPG 이미지 또는 .flat2rig 파일 한 개를 놓으세요.");
+          setError("PNG, JPG 이미지, 레이어 PSD 또는 .flat2rig 파일 한 개를 놓으세요.");
           return;
         }
         openIncomingFile(files[0]);
@@ -1988,8 +2070,8 @@ export default function App() {
         <div className="drop-target" role="status" aria-live="polite">
           <div className="drop-card">
             <ImagePlus size={22} />
-            <strong>일러스트 · 프로젝트 놓기</strong>
-            <span>PNG · JPG · .flat2rig 한 개</span>
+            <strong>레이어 PSD · 일러스트 · 프로젝트 놓기</strong>
+            <span>PSD · PNG · JPG · .flat2rig 한 개</span>
           </div>
         </div>
       )}
@@ -2002,6 +2084,18 @@ export default function App() {
         onChange={(e) => {
           openImage(e.target.files?.[0]);
           e.target.value = "";
+        }}
+      />
+      <input
+        aria-label="레이어 PSD 파일 입력"
+        ref={psdInput}
+        type="file"
+        hidden
+        accept=".psd,image/vnd.adobe.photoshop"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = "";
+          if (file) openPsd(file);
         }}
       />
       <input
@@ -2185,6 +2279,18 @@ export default function App() {
             </span>
           </div>
           <div className={`stage ${busy ? "working" : ""}`} aria-busy={busy ? true : undefined}>
+            {psdSession && (
+              <PsdMappingPanel
+                session={psdSession}
+                busy={!!busy}
+                onChange={(mappings) => setPsdSession((s) => (s ? { ...s, mappings } : s))}
+                onGenerate={generateFromPsd}
+                onCancel={() => {
+                  setPsdSession(null);
+                  notify("PSD 매핑을 취소했습니다. 현재 작업은 그대로입니다.");
+                }}
+              />
+            )}
             {project ? (
               <Viewport
                 project={project}
@@ -2220,21 +2326,28 @@ export default function App() {
               >
                 <div className="welcome-drop-zone">
                   <BrandLoop />
-                  <h1>일러스트 가져오기</h1>
+                  <h1>레이어 PSD 가져오기</h1>
                   <p>
-                    PNG 또는 JPG 파일 한 장을 끌어 놓거나 Ctrl+V로 붙여넣으세요.
+                    파츠별 레이어가 있는 PSD를 열면 레이어를 파츠에 자동으로 맞춰 줍니다.
                     <br />
-                    (복사한 이미지 · 파일 · 파일 경로)
-                    <br />
-                    정면 캐릭터 흉상 (일반 LD · SD 치비) · 최대 2,048px
+                    끌어 놓기 · Ctrl+V(파일 · 파일 경로)도 됩니다. PNG · JPG 한 장도 열 수 있습니다.
                   </p>
                   <button
                     className="primary large"
+                    data-action="open-psd"
+                    disabled={!!busy}
+                    onClick={() => psdInput.current?.click()}
+                  >
+                    <Layers size={18} />
+                    레이어 PSD 열기
+                  </button>
+                  <button
+                    className="text-button"
                     disabled={!!busy}
                     onClick={() => input.current?.click()}
                   >
-                    <ImagePlus size={18} />
-                    파일 선택
+                    <ImagePlus size={14} />
+                    일러스트 한 장(PNG · JPG) 열기
                   </button>
                   <span className="drop-hint">
                     LD/SD 실루엣 매칭 · 모션용 21파츠 분리 · Cubism용 PSD
@@ -3474,6 +3587,7 @@ export default function App() {
                     busy={!!busy}
                     hasProject={!!project}
                     partTextures={projectTextures.partTextures}
+                    missingParts={project?.layerSource?.missingDefaultParts}
                     approved={approved}
                     total={total}
                     onSelectRow={(row) => {
@@ -3760,6 +3874,8 @@ export default function App() {
                         setModal(null);
                         if (nextDrop.kind === "project") {
                           openProjectFile(nextDrop.file, true);
+                        } else if (nextDrop.kind === "psd") {
+                          openPsd(nextDrop.file, true);
                         } else {
                           openImage(nextDrop.file, true);
                         }
@@ -3776,6 +3892,8 @@ export default function App() {
                       setModal(null);
                       if (nextDrop.kind === "project") {
                         openProjectFile(nextDrop.file, true);
+                      } else if (nextDrop.kind === "psd") {
+                        openPsd(nextDrop.file, true);
                       } else {
                         openImage(nextDrop.file, true);
                       }

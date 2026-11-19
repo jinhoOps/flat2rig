@@ -4,7 +4,8 @@ export type Landmarks = Record<LandmarkId, Point>;
 export type LandmarkSource = "model" | "estimated" | "manual";
 export type LandmarkProvenance = Record<LandmarkId, LandmarkSource>;
 export type PartStatus = "draft" | "approved" | "missing";
-export type PartProvenance = "model" | "prompted" | "geometry" | "manual";
+/** `layer` = taken as-is from a layered PSD layer (B1, `src/layerProject.ts`). */
+export type PartProvenance = "model" | "prompted" | "geometry" | "manual" | "layer";
 export type FillKind = "none" | "neighbor" | "external" | "template";
 /** T9: region type of the part's exposure band, from clean inner-seed statistics (Rust
  * `analysis::region_fill`). Separate from `fillKind`, which is the fill *source*. */
@@ -406,6 +407,45 @@ export interface PlaybackSettings {
   shortcuts: Record<string, string>;
 }
 
+/** B1: one PSD layer's mapping as recorded in the project (`LayerMapping` in `src/psdLayers.ts`). */
+export interface LayerSourceMapping {
+  /** Slash path of group names and the layer name, `/모델/눈</눈흰자<`. */
+  path: string;
+  /** Part id, `{S}` template (split into character L/R), or null (unassigned). */
+  target: string | null;
+  include: boolean;
+  /** Only for non-`normal` blend layers: `fold` = applied inside its part, `normal` = composited as normal. */
+  blend?: "fold" | "normal";
+  source: "name" | "group" | "seethrough" | "manual" | "none";
+  /** Original blend mode when not `normal` (never silently rewritten, AGENTS.md 6절). */
+  blendMode?: string;
+  note?: string;
+}
+
+/** B1: where a layer-input project came from (optional schema v3 field; v4 is B6). */
+export interface LayerSourceRecord {
+  version: "psd-layers-v1";
+  /** PSD file name. */
+  file: string;
+  /** SHA-256 of the PSD bytes (hex). */
+  sha256?: string;
+  /** PSD canvas size; the project canvas is the working size (long side ≤ 2048). */
+  width: number;
+  height: number;
+  seeThrough: boolean;
+  /** Face midline x in PSD pixels used for `{S}` L/R splits and its source. */
+  midlineX: number;
+  midlineSource: string;
+  mappings: LayerSourceMapping[];
+  /** Built parts bottom → top with their source layer paths. */
+  parts: { id: string; layers: string[] }[];
+  /** Default part ids with no layer (shown as "없음", never synthesized). */
+  missingDefaultParts: string[];
+  /** Parts whose layers are interleaved with another part's layers in the PSD. */
+  interleaved: { id: string; between: string[] }[];
+  warnings: string[];
+}
+
 export interface Project {
   schemaVersion: 3;
   name: string;
@@ -441,6 +481,8 @@ export interface Project {
   activeExpressionId: string;
   playback: PlaybackSettings;
   createdAt: string;
+  /** B1: set when the project was built from a layered PSD. */
+  layerSource?: LayerSourceRecord;
 }
 export interface Mesh {
   vertices: Point[];

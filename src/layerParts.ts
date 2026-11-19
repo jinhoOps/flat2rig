@@ -476,6 +476,11 @@ function findInterleaved(psd: ParsedPsd, plan: ReturnType<typeof planParts>) {
   return out;
 }
 
+/** Interleaved parts for a mapping, without building pixels (mapping screen). */
+export function interleavedParts(psd: ParsedPsd, mappings: readonly LayerMapping[]) {
+  return findInterleaved(psd, planParts(psd, mappings));
+}
+
 /** Builds part RGBA crops, visible / hidden masks and the composite. */
 export function buildLayerParts(
   psd: ParsedPsd,

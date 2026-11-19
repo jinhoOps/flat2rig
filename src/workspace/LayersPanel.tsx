@@ -11,7 +11,7 @@ import {
   Lock,
   Plus,
 } from "lucide-react";
-import type { BlendMode, HairRole, Part } from "../types";
+import { PART_DEFS, type BlendMode, type HairRole, type Part } from "../types";
 import { isPreservedPart } from "../io";
 import LayerThumb from "./LayerThumb";
 import type { EditTarget, LayerRow, LayerThumbKind } from "./layers";
@@ -38,6 +38,7 @@ const PROVENANCE: Record<string, string> = {
   model: "모델",
   prompted: "클릭 보정",
   manual: "수동",
+  layer: "레이어 PSD",
 };
 
 function diagnosticShort(d: string): string {
@@ -68,6 +69,8 @@ export interface LayersPanelProps {
   busy: boolean;
   hasProject: boolean;
   partTextures: Map<string, HTMLCanvasElement>;
+  /** B1: default parts the layered PSD has no layer for (listed as "없음", never synthesized). */
+  missingParts?: readonly string[];
   approved: number;
   total: number;
   onSelectRow: (row: LayerRow) => void;
@@ -281,6 +284,43 @@ export default function LayersPanel(props: LayersPanelProps) {
               </Fragment>
             );
           })
+        )}
+        {rows.length > 0 && !!props.missingParts?.length && (
+          <>
+            <div className="lp-group" role="listitem">
+              <span className="lp-eye" aria-hidden="true" />
+              <span className="lp-group-name">레이어 없음</span>
+              <span className="lp-group-count">{props.missingParts.length}</span>
+            </div>
+            {props.missingParts.map((id) => {
+              const def = PART_DEFS.find((d) => d[0] === id);
+              return (
+                <div
+                  key={`missing-${id}`}
+                  role="listitem"
+                  className="lp-row is-missing is-absent"
+                  data-part-id={id}
+                  data-absent="true"
+                  title="PSD에 이 파츠의 레이어가 없습니다. 자동으로 채우지 않습니다."
+                >
+                  <span className="lp-eye" aria-hidden="true" />
+                  <span className="lp-thumb is-empty">
+                    <i className="lp-none" aria-hidden="true" />
+                  </span>
+                  <span className="lp-thumb is-empty" />
+                  <span className="lp-thumb is-empty" />
+                  <span className="lp-name">
+                    <strong>
+                      <i className="lp-color" style={{ background: def?.[3] ?? "#999999" }} />
+                      {def?.[1] ?? id}
+                    </strong>
+                    <small>없음 · 레이어 PSD에 없음</small>
+                  </span>
+                  <span className="lp-flags" />
+                </div>
+              );
+            })}
+          </>
         )}
       </div>
       <div className="lp-footer">

@@ -17,6 +17,8 @@ import {
   stageIncludesLayer,
   type ExpressionPreset,
   type HairRole,
+  type LayerSourceMapping,
+  type LayerSourceRecord,
   type Parameters,
   type PartRole,
   type PipelineStage,
@@ -690,6 +692,84 @@ function hydrateAndValidateV3Fields(
   };
 }
 
+const LAYER_SOURCES = ["name", "group", "seethrough", "manual", "none"] as const;
+const MAX_LAYER_SOURCE_ENTRIES = 4096;
+
+/** B1: validates the optional `layerSource` record (PSD layer mapping) of a v3 project. */
+function validateLayerSource(raw: unknown): LayerSourceRecord {
+  const bad = () => new Error("잘못된 레이어 PSD 출처 정보입니다.");
+  const str = (v: unknown, max = 1024): v is string => typeof v === "string" && v.length <= max;
+  const strList = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.length <= MAX_LAYER_SOURCE_ENTRIES && v.every((x) => str(x));
+  if (
+    !isPlainObject(raw) ||
+    raw.version !== "psd-layers-v1" ||
+    !str(raw.file) ||
+    (raw.sha256 !== undefined && !(str(raw.sha256, 64) && /^[0-9a-f]{64}$/.test(raw.sha256))) ||
+    !Number.isInteger(raw.width) ||
+    !Number.isInteger(raw.height) ||
+    (raw.width as number) < 1 ||
+    (raw.height as number) < 1 ||
+    typeof raw.seeThrough !== "boolean" ||
+    typeof raw.midlineX !== "number" ||
+    !Number.isFinite(raw.midlineX) ||
+    !str(raw.midlineSource, 32) ||
+    !Array.isArray(raw.mappings) ||
+    raw.mappings.length > MAX_LAYER_SOURCE_ENTRIES ||
+    !Array.isArray(raw.parts) ||
+    raw.parts.length > MAX_LAYER_SOURCE_ENTRIES ||
+    !strList(raw.missingDefaultParts) ||
+    !Array.isArray(raw.interleaved) ||
+    !strList(raw.warnings)
+  )
+    throw bad();
+  const mappings: LayerSourceMapping[] = raw.mappings.map((m: unknown) => {
+    if (
+      !isPlainObject(m) ||
+      !str(m.path) ||
+      !(m.target === null || str(m.target, 80)) ||
+      typeof m.include !== "boolean" ||
+      (m.blend !== undefined && m.blend !== "fold" && m.blend !== "normal") ||
+      !(LAYER_SOURCES as readonly unknown[]).includes(m.source) ||
+      (m.blendMode !== undefined && !str(m.blendMode, 32)) ||
+      (m.note !== undefined && !str(m.note))
+    )
+      throw bad();
+    return {
+      path: m.path,
+      target: m.target as string | null,
+      include: m.include,
+      ...(m.blend ? { blend: m.blend as "fold" | "normal" } : {}),
+      source: m.source as LayerSourceMapping["source"],
+      ...(m.blendMode ? { blendMode: m.blendMode as string } : {}),
+      ...(m.note ? { note: m.note as string } : {}),
+    };
+  });
+  const parts = raw.parts.map((e: unknown) => {
+    if (!isPlainObject(e) || !str(e.id, 80) || !strList(e.layers)) throw bad();
+    return { id: e.id, layers: e.layers };
+  });
+  const interleaved = raw.interleaved.map((e: unknown) => {
+    if (!isPlainObject(e) || !str(e.id, 80) || !strList(e.between)) throw bad();
+    return { id: e.id, between: e.between };
+  });
+  return {
+    version: "psd-layers-v1",
+    file: raw.file,
+    ...(raw.sha256 ? { sha256: raw.sha256 as string } : {}),
+    width: raw.width as number,
+    height: raw.height as number,
+    seeThrough: raw.seeThrough,
+    midlineX: raw.midlineX,
+    midlineSource: raw.midlineSource,
+    mappings,
+    parts,
+    missingDefaultParts: raw.missingDefaultParts,
+    interleaved,
+    warnings: raw.warnings,
+  };
+}
+
 export function loadProject(bytes: Uint8Array): Project {
   if (bytes.length > MAX_ZIP_FILE_BYTES)
     throw new Error("프로젝트 파일이 너무 큽니다.");
@@ -734,7 +814,7 @@ export function loadProject(bytes: Uint8Array): Project {
   )
     throw new Error("잘못된 프로젝트 정보입니다.");
   const ids = new Set<string>();
-  const validProvenances = ["model", "prompted", "geometry", "manual"];
+  const validProvenances = ["model", "prompted", "geometry", "manual", "layer"];
   const validFillKinds = ["none", "neighbor", "external", "template"];
   // T9 optional fields (schema stays v3: absent = unclassified; older readers ignore them).
   const validFillRegions: readonly string[] = FILL_REGIONS;
@@ -792,9 +872,12 @@ export function loadProject(bytes: Uint8Array): Project {
     return migrateLegacyToV3(p, p.parts as Part[], p.schemaVersion);
   }
   const v3Fields = hydrateAndValidateV3Fields(p, files, p.width, p.height);
+  const layerSource =
+    p.layerSource === undefined ? undefined : validateLayerSource(p.layerSource);
   return {
     ...(p as Project),
     ...v3Fields,
+    ...(layerSource ? { layerSource } : {}),
     schemaVersion: 3,
     revision: 0,
   };

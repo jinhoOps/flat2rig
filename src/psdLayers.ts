@@ -474,6 +474,15 @@ function resolveSide(
   return { target: template.replace("{S}", m.L >= m.R ? "L" : "R"), split: false };
 }
 
+/** Target for a layer the user assigned `target` to: a `{S}` template resolves to the side holding
+ * the layer's pixels, and stays a split template only when the layer really spans both sides. */
+export function resolveLayerTarget(psd: ParsedPsd, path: string, target: string | null, midlineX: number) {
+  if (!target) return null;
+  const node = psd.layers.find((n) => n.path === path);
+  if (!node) return target;
+  return resolveSide(psd, node, target, midlineX).target;
+}
+
 function estimateMidline(
   psd: ParsedPsd,
   classes: Map<string, string | null>,
